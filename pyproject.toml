@@ -1,0 +1,42 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sagasmith-coc-mcp"
+version = "0.1.0"
+description = "Local MCP server for the SagaSmith Call of Cthulhu 7e runtime"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "SagaSmithAI" }]
+dependencies = [
+    "mcp>=1.26.0,<2.0.0",
+    "sagasmith-core[documents]>=0.2.0,<0.3.0",
+    "sagasmith-coc>=0.2.0,<0.3.0",
+]
+
+[project.optional-dependencies]
+dense = ["sentence-transformers>=5.0.0,<6.0.0", "chromadb>=0.6.0,<1.0.0"]
+dev = ["pytest>=9.0.0,<10.0.0", "ruff>=0.1.0"]
+
+[project.scripts]
+sagasmith-coc-mcp = "sagasmith_coc_mcp.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sagasmith_coc_mcp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W"]
+
+[tool.uv.sources]
+sagasmith-core = { path = "../sagasmith-core", editable = true }
+sagasmith-coc = { path = "../sagasmith-coc", editable = true }
