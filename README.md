@@ -67,4 +67,4 @@ pytest
 ruff check .
 ```
 
-代码使用 MIT License。Call of Cthulhu 及相关商业内容归其权利人所有。
+原创代码使用 Apache-2.0。Call of Cthulhu 及相关商业内容归其权利人所有。

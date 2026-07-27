@@ -29,4 +29,4 @@ pytest
 ruff check .
 ```
 
-Code is MIT licensed. Commercial Call of Cthulhu books and scenarios are not distributed by this repository.
+Original code is licensed under Apache-2.0. Commercial Call of Cthulhu books and scenarios are not distributed by this repository.
