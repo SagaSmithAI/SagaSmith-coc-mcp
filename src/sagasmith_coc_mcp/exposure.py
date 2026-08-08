@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, Callable
 from uuid import uuid4
+
+from sagasmith_core.clock import operational_utcnow
 
 from .tool_profiles import CORE_TOOLS, GROUP_BY_ID, TOOL_GROUPS
 
@@ -22,27 +24,40 @@ class Exposure:
     campaign_id: str | None
     phase: str
     loaded_groups: set[str] = field(default_factory=set)
-    remaining_calls: dict[str, int | None] = field(default_factory=dict)
-    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
-    updated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
-    expires_at: datetime = field(default_factory=lambda: datetime.now(UTC) + timedelta(hours=12))
+    created_at: datetime = field(default_factory=operational_utcnow)
+    updated_at: datetime = field(default_factory=operational_utcnow)
+    expires_at: datetime = field(
+        default_factory=lambda: operational_utcnow() + timedelta(hours=12)
+    )
 
 
 class ExposureRegistry:
-    def __init__(self, *, ttl: timedelta = timedelta(hours=12)) -> None:
+    def __init__(
+        self,
+        *,
+        ttl: timedelta = timedelta(hours=12),
+        clock: Callable[[], datetime] = operational_utcnow,
+    ) -> None:
         self._by_id: dict[str, Exposure] = {}
         self._active_by_session: dict[str, str] = {}
         self._ttl = ttl
+        self._clock = clock
+
+    def _now(self) -> datetime:
+        value = self._clock()
+        if value.tzinfo is None:
+            raise ValueError("exposure clock must return a timezone-aware datetime")
+        return value.astimezone(UTC)
 
     def _prune(self) -> None:
-        now = datetime.now(UTC)
+        now = self._now()
         for exposure_id in [key for key, value in self._by_id.items() if value.expires_at <= now]:
             exposure = self._by_id.pop(exposure_id)
             if self._active_by_session.get(exposure.session_key) == exposure_id:
                 self._active_by_session.pop(exposure.session_key, None)
 
     def touch(self, exposure: Exposure) -> Exposure:
-        now = datetime.now(UTC)
+        now = self._now()
         exposure.updated_at = now
         exposure.expires_at = now + self._ttl
         return exposure
@@ -54,13 +69,16 @@ class ExposureRegistry:
         prior = self._active_by_session.get(session_key)
         if prior:
             self._by_id.pop(prior, None)
+        now = self._now()
         exposure = Exposure(
             id=f"exp_{uuid4().hex}",
             session_key=session_key,
             principal_id=principal_id,
             campaign_id=campaign_id,
             phase=phase,
-            expires_at=datetime.now(UTC) + self._ttl,
+            created_at=now,
+            updated_at=now,
+            expires_at=now + self._ttl,
         )
         self._by_id[exposure.id] = exposure
         self._active_by_session[session_key] = exposure.id
@@ -88,15 +106,10 @@ class ExposureRegistry:
         exposure.loaded_groups = {
             group_id for group_id in exposure.loaded_groups if GROUP_BY_ID[group_id].phase == phase
         }
-        exposure.remaining_calls = {
-            group_id: calls
-            for group_id, calls in exposure.remaining_calls.items()
-            if group_id in exposure.loaded_groups
-        }
         self.touch(exposure)
         return True
 
-    def load(self, exposure: Exposure, group_id: str, ttl_calls: int | None = None) -> Exposure:
+    def load(self, exposure: Exposure, group_id: str) -> Exposure:
         group = GROUP_BY_ID.get(group_id)
         if group is None:
             raise ExposureError(f"Unknown tool group: {group_id}")
@@ -106,15 +119,11 @@ class ExposureRegistry:
             raise ExposureError(f"Tool group {group_id!r} requires a campaign-bound exposure.")
         if group.local_only and exposure.principal_id != "system:local":
             raise ExposureError(f"Tool group {group_id!r} is local-only.")
-        if ttl_calls is not None and ttl_calls < 1:
-            raise ExposureError("ttl_calls must be at least 1")
         exposure.loaded_groups.add(group_id)
-        exposure.remaining_calls[group_id] = ttl_calls
         return self.touch(exposure)
 
     def unload(self, exposure: Exposure, group_id: str) -> Exposure:
         exposure.loaded_groups.discard(group_id)
-        exposure.remaining_calls.pop(group_id, None)
         return self.touch(exposure)
 
     def visible_tools(self, exposure: Exposure | None) -> set[str]:
@@ -134,28 +143,7 @@ class ExposureRegistry:
         ]
         if not matching:
             raise ExposureError(f"Tool {tool_id!r} is not exposed for this session.")
-        if all(exposure.remaining_calls.get(group_id) == 0 for group_id in matching):
-            raise ExposureError(f"Tool {tool_id!r} has no remaining exposure calls.")
-
-    def consume_tool(self, exposure: Exposure, tool_id: str) -> bool:
-        matching = sorted(
-            group_id
-            for group_id in exposure.loaded_groups
-            if tool_id in GROUP_BY_ID[group_id].tools
-        )
-        if any(exposure.remaining_calls.get(group_id) is None for group_id in matching):
-            self.touch(exposure)
-            return False
-        for group_id in matching:
-            remaining = exposure.remaining_calls.get(group_id)
-            if remaining is not None:
-                if remaining <= 1:
-                    self.unload(exposure, group_id)
-                else:
-                    exposure.remaining_calls[group_id] = remaining - 1
-                    self.touch(exposure)
-                return True
-        return False
+        self.touch(exposure)
 
     def status(self, exposure: Exposure) -> dict[str, Any]:
         return {

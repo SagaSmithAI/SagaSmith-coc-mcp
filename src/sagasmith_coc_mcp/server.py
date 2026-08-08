@@ -53,11 +53,13 @@ class SessionExposureFastMCP(FastMCP):
         exposure_registry: ExposureRegistry,
         phase_lookup: Any,
         scope_validator: Any,
+        bound_principal_id: str | None = None,
         **kwargs: Any,
     ) -> None:
         self.exposure_registry = exposure_registry
         self._phase_lookup = phase_lookup
         self._scope_validator = scope_validator
+        self._bound_principal_id = bound_principal_id.strip() if bound_principal_id else None
         self._sessions: WeakValueDictionary[str, Any] = WeakValueDictionary()
         self._exposure_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
         super().__init__(*args, **kwargs)
@@ -91,6 +93,18 @@ class SessionExposureFastMCP(FastMCP):
         result["principal_id"] = exposure.principal_id
         return result
 
+    def _bind_configured_principal(
+        self, tool_id: str, arguments: dict[str, Any]
+    ) -> dict[str, Any]:
+        result = dict(arguments)
+        if self._bound_principal_id is None:
+            return result
+        tool = self._tool_manager.get_tool(tool_id)
+        properties = dict((tool.parameters if tool else {}).get("properties") or {})
+        if "principal_id" in properties:
+            result["principal_id"] = self._bound_principal_id
+        return result
+
     async def _refresh(self, session_key: str) -> bool:
         exposure = self.exposure_registry.active(session_key)
         if exposure is None or exposure.campaign_id is None:
@@ -119,20 +133,17 @@ class SessionExposureFastMCP(FastMCP):
         request = self._request_session()
         if request is None:
             return await super().call_tool(name, arguments)
-        session_key, session = request
+        session_key, _ = request
         await self._refresh(session_key)
         exposure = self.exposure_registry.active(session_key)
         if name not in CORE_TOOLS and exposure is None:
             raise ExposureError("Open and load a session exposure before calling domain tools.")
-        bound = dict(arguments)
+        bound = self._bind_configured_principal(name, arguments)
         if exposure is not None and not name.startswith("exposure_"):
             self.exposure_registry.require_tool(exposure, name)
             bound = self._bind_principal(exposure, name, bound)
             self._scope_validator(exposure, name, bound)
         result = await super().call_tool(name, bound)
-        if exposure is not None and name not in CORE_TOOLS:
-            if self.exposure_registry.consume_tool(exposure, name):
-                await session.send_tool_list_changed()
         return result
 
 
@@ -192,6 +203,7 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
         exposure_registry=exposures,
         phase_lookup=authoritative_phase,
         scope_validator=validate_scope,
+        bound_principal_id=config.bound_principal_id,
     )
 
     def visible_character(character: Any, principal_id: str) -> dict[str, Any]:
@@ -673,6 +685,8 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
         campaign_id: str | None = None,
         principal_id: str = "system:local",
     ) -> dict[str, Any]:
+        if config.bound_principal_id is not None:
+            principal_id = config.bound_principal_id
         phase = PROFILE_LOBBY
         if campaign_id:
             access.require_campaign(campaign_id, principal_id)
@@ -714,14 +728,13 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
     async def exposure_load(
         exposure_id: str,
         group_id: str,
-        ttl_calls: int | None = None,
     ) -> dict[str, Any]:
         request = mcp._request_session()
         exposure = exposures.get(exposure_id, request[0] if request else None)
         async with mcp._exposure_lock(exposure.id):
             if exposure.campaign_id:
                 exposures.refresh_phase(exposure, authoritative_phase(exposure.campaign_id))
-            exposures.load(exposure, group_id, ttl_calls)
+            exposures.load(exposure, group_id)
         return exposures.status(exposure)
 
     @mcp.tool()
@@ -752,7 +765,6 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
             result = await mcp._tool_manager.call_tool(
                 tool_id, bound, context=context, convert_result=True
             )
-            exposures.consume_tool(exposure, tool_id)
         return {"tool_id": tool_id, "result": result, "exposure": exposures.status(exposure)}
 
     return mcp

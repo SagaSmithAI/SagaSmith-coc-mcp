@@ -187,11 +187,11 @@ def test_exposure_registry_is_session_and_phase_scoped() -> None:
         campaign_id="campaign:one",
         phase="play",
     )
-    registry.load(alice, "play.investigation", ttl_calls=1)
+    registry.load(alice, "play.investigation")
     assert "coc_resolve" in registry.visible_tools(alice)
     assert "coc_resolve" not in registry.visible_tools(bob)
-    registry.consume_tool(alice, "coc_resolve")
-    assert "coc_resolve" not in registry.visible_tools(alice)
+    registry.require_tool(alice, "coc_resolve")
+    assert "coc_resolve" in registry.visible_tools(alice)
     with pytest.raises(ExposureError):
         registry.load(bob, "lobby.characters")
 

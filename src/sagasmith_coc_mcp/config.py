@@ -17,6 +17,7 @@ class McpConfig:
     database_url: str | None
     coc_skills_dir: Path
     modulegen_skills_dir: Path
+    bound_principal_id: str | None = None
 
     @classmethod
     def from_environment(cls) -> "McpConfig":
@@ -34,6 +35,12 @@ class McpConfig:
                     "SAGASMITH_MODULEGEN_SKILLS_DIR", root / "SagaSmith-module-gen-skills"
                 )
             ).expanduser().resolve(),
+            bound_principal_id=(
+                value.strip()
+                if (value := os.environ.get("SAGASMITH_COC_MCP_BOUND_PRINCIPAL_ID"))
+                and value.strip()
+                else None
+            ),
         )
 
     @property
