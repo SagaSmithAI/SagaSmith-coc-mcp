@@ -57,7 +57,8 @@ PHASE_TOOLS = {
         """
         actor_knowledge_change actor_knowledge_query campaign_change character_change
         branch_change branch_query character_query coc_check coc_dice_roll coc_hp_change
-        coc_resolve coc_sanity_check combat_start memory_change memory_query state_revision
+        chase_action chase_end chase_query chase_start coc_resolve coc_sanity_check
+        combat_start memory_change memory_query state_revision
         module_change module_query
         snapshot_change snapshot_query
         """
@@ -82,7 +83,7 @@ PHASE_DM_TOOLS = {
     PROFILE_PLAY: _names(
         """
         actor_knowledge_change branch_change campaign_change memory_change module_change
-        combat_start snapshot_change snapshot_query state_revision
+        chase_end chase_start combat_start snapshot_change snapshot_query state_revision
         """
     ),
     PROFILE_COMBAT: _names(

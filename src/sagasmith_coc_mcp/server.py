@@ -19,6 +19,17 @@ from sagasmith_coc.content_packages import (
     build_module_content_package,
     validate_coc_content_package,
 )
+from sagasmith_coc.engine.chase_state import (
+    advance_chase_turn,
+    set_effective_mov,
+    take_chase_action,
+)
+from sagasmith_coc.engine.chase_state import (
+    end_chase as close_chase_state,
+)
+from sagasmith_coc.engine.chase_state import (
+    start_chase as build_chase_state,
+)
 from sagasmith_coc.engine.checks.chase import (
     resolve_chase_action,
     resolve_chase_speed_check,
@@ -345,6 +356,29 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
         if not combat.get("active"):
             raise ValueError("campaign has no active combat")
         return campaign, combat
+
+    def active_chase(campaign_id: str) -> tuple[Any, dict[str, Any]]:
+        campaign = campaigns.get(campaign_id)
+        chase = dict(campaign.state.get("chase") or {})
+        if not chase.get("active"):
+            raise ValueError("campaign has no active chase")
+        return campaign, chase
+
+    def chase_view(campaign_id: str, principal_id: str) -> dict[str, Any]:
+        campaign, chase = active_chase(campaign_id)
+        current_actor_id = str(chase.get("current_actor_id") or "")
+        actions: list[str] = []
+        if current_actor_id and can_control_actor(campaign_id, current_actor_id, principal_id):
+            actions.extend(["move", "check", "speed_check", "end_turn"])
+        if is_dm(campaign_id, principal_id):
+            actions.append("end")
+        return {
+            "campaign_id": campaign_id,
+            "campaign_revision": campaign.revision,
+            "phase": PROFILE_PLAY,
+            "chase": deepcopy(chase),
+            "available_actions": actions,
+        }
 
     def combat_view(campaign_id: str, principal_id: str) -> dict[str, Any]:
         campaign, combat = active_combat(campaign_id)
@@ -3222,6 +3256,408 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
         )
         if has_random_draws:
             stream.mark_persisted()
+        return response
+
+    @mcp.tool()
+    def chase_start(
+        campaign_id: str,
+        participants: list[dict[str, Any]],
+        expected_character_revisions: dict[str, int],
+        source: str,
+        expected_revision: int,
+        idempotency_key: str,
+        route: list[dict[str, Any]] | None = None,
+        principal_id: str = LOCAL_SYSTEM_PRINCIPAL_ID,
+    ) -> dict[str, Any]:
+        """Resolve speed checks and atomically start one source-backed chase."""
+
+        require_dm(campaign_id, principal_id)
+        source_value = " ".join(str(source or "").split()).strip()
+        if not source_value or len(source_value) > 500:
+            raise ValueError("source must contain 1 to 500 characters")
+        key = str(idempotency_key or "").strip()
+        if not key:
+            raise ValueError("idempotency_key is required")
+        branch_id = current_branch_id(campaign_id)
+        request = {
+            "operation": "chase_start",
+            "campaign_id": campaign_id,
+            "participants": participants,
+            "expected_character_revisions": expected_character_revisions,
+            "source": source_value,
+            "route": list(route or []),
+            "expected_revision": int(expected_revision),
+        }
+        scope = f"chase-start:{campaign_id}:{branch_id}:{principal_id}"
+        replay = replay_response(scope, key, request)
+        if replay is not None:
+            return replay
+        campaign = require_campaign_revision(campaign_id, int(expected_revision))
+        if authoritative_phase(campaign_id) != PROFILE_PLAY:
+            raise ValueError("chase_start is available only during play")
+        if dict(campaign.state.get("combat") or {}).get("active"):
+            raise ValueError("active combat must end before a chase starts")
+        if dict(campaign.state.get("chase") or {}).get("active"):
+            raise ValueError("campaign already has an active chase")
+        revision_map = {
+            str(actor_id): int(value) for actor_id, value in expected_character_revisions.items()
+        }
+        prepared: list[dict[str, Any]] = []
+        for raw_value in participants:
+            raw = dict(raw_value)
+            actor_id = str(raw.get("actor_id") or "").strip()
+            role = str(raw.get("role") or "").strip()
+            skill_name = str(raw.get("speed_skill_name") or "").strip()
+            if not actor_id or role not in {"pursuer", "fleeing"} or not skill_name:
+                raise ValueError(
+                    "each chase participant requires actor_id, role, and speed_skill_name"
+                )
+            actor = characters.get(actor_id)
+            if actor.campaign_id != campaign_id:
+                raise ValueError("every chase participant must belong to the campaign")
+            if revision_map.get(actor_id) != actor.revision:
+                raise ValueError(
+                    f"character revision conflict for {actor_id}: "
+                    f"expected {revision_map.get(actor_id)}, found {actor.revision}"
+                )
+            sheet = validate_investigator_sheet(dict(actor.sheet))
+            conditions = dict(sheet.get("conditions") or {})
+            if conditions.get("dead") or conditions.get("unconscious"):
+                raise ValueError(f"dead or unconscious actor cannot enter a chase: {actor_id}")
+            skill_values = dict(sheet.get("skills") or {})
+            characteristic_values = dict(sheet.get("characteristics") or {})
+            try:
+                speed_skill = exact_sheet_value(
+                    skill_values,
+                    skill_name,
+                    "speed skill",
+                )
+            except ValueError:
+                speed_skill = exact_sheet_value(
+                    characteristic_values,
+                    skill_name,
+                    "speed characteristic",
+                )
+            prepared.append(
+                {
+                    "actor_id": actor_id,
+                    "name": actor.name,
+                    "role": role,
+                    "base_mov": int(sheet["mov"]),
+                    "dex": int(sheet["characteristics"]["dex"]),
+                    "position": int(raw.get("position", 0)),
+                    "speed_skill_name": skill_name,
+                    "speed_skill": speed_skill,
+                }
+            )
+        if set(revision_map) != {item["actor_id"] for item in prepared}:
+            raise ValueError("expected_character_revisions must exactly match participants")
+        base_slowest = min(int(item["base_mov"]) for item in prepared)
+        stream = CampaignRandomStream.from_campaign_state(
+            campaign_id,
+            campaign.state,
+            operation="chase_start",
+            idempotency_key=key,
+        )
+        speed_checks: dict[str, dict[str, Any]] = {}
+        state_participants: list[dict[str, Any]] = []
+        with use_random_stream(stream):
+            for item in prepared:
+                roll = roll_d100()
+                outcome = resolve_chase_speed_check(
+                    int(roll["total"]),
+                    int(item["speed_skill"]),
+                    int(item["base_mov"]),
+                    base_slowest,
+                    participant_name=str(item["name"]),
+                )
+                speed_checks[str(item["actor_id"])] = {
+                    "skill_name": item["speed_skill_name"],
+                    "skill_value": item["speed_skill"],
+                    "roll": roll,
+                    "outcome": outcome,
+                }
+                state_participants.append(
+                    {
+                        "actor_id": item["actor_id"],
+                        "name": item["name"],
+                        "role": item["role"],
+                        "effective_mov": int(outcome["new_mov"]),
+                        "dex": item["dex"],
+                        "position": item["position"],
+                    }
+                )
+        chase = build_chase_state(
+            state_participants,
+            source=source_value,
+            route=list(route or []),
+        )
+        for actor_id, check in speed_checks.items():
+            check["outcome"]["actions"] = chase["participants"][actor_id]["action_points"]
+        next_state = {
+            **dict(campaign.state),
+            "game_phase": PROFILE_PLAY,
+            "chase": chase,
+            "random_stream": stream.persisted_state(),
+        }
+        response = {
+            "campaign_id": campaign_id,
+            "campaign_revision": campaign.revision + 1,
+            "phase": PROFILE_PLAY,
+            "chase": deepcopy(chase),
+            "speed_checks": speed_checks,
+            "random_stream_receipt": stream.receipt(),
+        }
+        StateMutationService(storage.database).replace(
+            campaign_id,
+            campaign_state=next_state,
+            expected_campaign_revision=campaign.revision,
+            operation="coc.chase.start",
+            actor=principal_id,
+            branch_id=branch_id,
+            idempotency_key=key,
+            idempotency_write=IdempotencyWrite(
+                scope=scope,
+                payload=request,
+                response=response,
+            ),
+        )
+        stream.mark_persisted()
+        return response
+
+    @mcp.tool()
+    def chase_query(
+        campaign_id: str,
+        principal_id: str = LOCAL_SYSTEM_PRINCIPAL_ID,
+    ) -> dict[str, Any]:
+        """Return one authoritative chase and caller-specific legal actions."""
+
+        access.require_campaign(campaign_id, principal_id)
+        return chase_view(campaign_id, principal_id)
+
+    @mcp.tool()
+    def chase_action(
+        action: Literal["move", "check", "speed_check", "end_turn"],
+        campaign_id: str,
+        data: dict[str, Any],
+        expected_revision: int,
+        idempotency_key: str,
+        principal_id: str = LOCAL_SYSTEM_PRINCIPAL_ID,
+    ) -> dict[str, Any]:
+        """Consume chase actions and settle explicit chase checks atomically."""
+
+        data = dict(data or {})
+        actor_id = str(data.get("actor_id") or "").strip()
+        if not actor_id:
+            raise ValueError("data.actor_id is required")
+        actor_access(campaign_id, actor_id, principal_id, control=True)
+        key = str(idempotency_key or "").strip()
+        if not key:
+            raise ValueError("idempotency_key is required")
+        branch_id = current_branch_id(campaign_id)
+        request = {
+            "operation": f"chase_action.{action}",
+            "campaign_id": campaign_id,
+            "data": data,
+            "expected_revision": int(expected_revision),
+        }
+        scope = f"chase-action:{campaign_id}:{branch_id}:{principal_id}:{action}"
+        replay = replay_response(scope, key, request)
+        if replay is not None:
+            return replay
+        campaign, chase = active_chase(campaign_id)
+        if campaign.revision != int(expected_revision):
+            raise ValueError(
+                "campaign revision conflict: "
+                f"expected {expected_revision}, found {campaign.revision}"
+            )
+        if actor_id != str(chase.get("current_actor_id") or ""):
+            raise ValueError("only the current chase actor may act")
+        source_value = " ".join(str(data.get("source") or "").split()).strip()
+        result: dict[str, Any] | None = None
+        stream = None
+        if action == "end_turn":
+            next_chase = advance_chase_turn(chase)
+        elif action == "move":
+            next_chase = take_chase_action(
+                chase,
+                actor_id,
+                action_type="move",
+                cost=int(data.get("cost", 1)),
+                position_change=int(data.get("position_change", 1)),
+                source=source_value,
+            )
+        else:
+            actor = characters.get(actor_id)
+            sheet = validate_investigator_sheet(dict(actor.sheet))
+            skill_name = str(data.get("skill_name") or "").strip()
+            if not skill_name:
+                raise ValueError("data.skill_name is required for chase checks")
+            try:
+                skill_value = exact_sheet_value(
+                    dict(sheet.get("skills") or {}),
+                    skill_name,
+                    "chase skill",
+                )
+            except ValueError:
+                skill_value = exact_sheet_value(
+                    dict(sheet.get("characteristics") or {}),
+                    skill_name,
+                    "chase characteristic",
+                )
+            stream = CampaignRandomStream.from_campaign_state(
+                campaign_id,
+                campaign.state,
+                operation=f"chase_action.{action}",
+                idempotency_key=key,
+            )
+            with use_random_stream(stream):
+                roll = roll_d100(
+                    bonus_dice=int(data.get("bonus_dice", 0)),
+                    penalty_dice=int(data.get("penalty_dice", 0)),
+                )
+                if action == "speed_check":
+                    outcome = resolve_chase_speed_check(
+                        int(roll["total"]),
+                        skill_value,
+                        int(chase["participants"][actor_id]["effective_mov"]),
+                        int(chase["slowest_mov"]),
+                        difficulty=str(data.get("difficulty") or "regular"),
+                        participant_name=actor.name,
+                    )
+                    next_chase = take_chase_action(
+                        chase,
+                        actor_id,
+                        action_type="speed_check",
+                        cost=int(data.get("cost", 1)),
+                        source=source_value,
+                    )
+                    next_chase = set_effective_mov(
+                        next_chase,
+                        actor_id,
+                        int(outcome["new_mov"]),
+                        source=source_value,
+                    )
+                else:
+                    outcome = resolve_skill_check(
+                        int(roll["total"]),
+                        skill_value,
+                        difficulty=str(data.get("difficulty") or "regular"),
+                        bonus_dice=int(data.get("bonus_dice", 0)),
+                        penalty_dice=int(data.get("penalty_dice", 0)),
+                        skill_name=skill_name,
+                        investigator_name=actor.name,
+                    )
+                    position_change = int(
+                        data.get(
+                            "success_position_change"
+                            if outcome["success"]
+                            else "failure_position_change",
+                            0,
+                        )
+                    )
+                    next_chase = take_chase_action(
+                        chase,
+                        actor_id,
+                        action_type=str(data.get("action_type") or "check"),
+                        cost=int(data.get("cost", 1)),
+                        position_change=position_change,
+                        source=source_value,
+                    )
+                result = {
+                    "skill_name": skill_name,
+                    "skill_value": skill_value,
+                    "roll": roll,
+                    "outcome": outcome,
+                }
+        next_state = {**dict(campaign.state), "chase": next_chase}
+        if stream is not None:
+            next_state["random_stream"] = stream.persisted_state()
+        response = {
+            "campaign_id": campaign_id,
+            "campaign_revision": campaign.revision + 1,
+            "phase": PROFILE_PLAY,
+            "chase": deepcopy(next_chase),
+            "resolution": result,
+            **({"random_stream_receipt": stream.receipt()} if stream is not None else {}),
+        }
+        StateMutationService(storage.database).replace(
+            campaign_id,
+            campaign_state=next_state,
+            expected_campaign_revision=campaign.revision,
+            operation=f"coc.chase.{action}",
+            actor=principal_id,
+            branch_id=branch_id,
+            idempotency_key=key,
+            idempotency_write=IdempotencyWrite(
+                scope=scope,
+                payload=request,
+                response=response,
+            ),
+        )
+        if stream is not None:
+            stream.mark_persisted()
+        return response
+
+    @mcp.tool()
+    def chase_end(
+        campaign_id: str,
+        outcome: Literal["escaped", "caught", "abandoned", "other"],
+        source: str,
+        expected_revision: int,
+        idempotency_key: str,
+        principal_id: str = LOCAL_SYSTEM_PRINCIPAL_ID,
+    ) -> dict[str, Any]:
+        """Close one active chase with a source-explicit outcome."""
+
+        require_dm(campaign_id, principal_id)
+        source_value = " ".join(str(source or "").split()).strip()
+        if not source_value or len(source_value) > 500:
+            raise ValueError("source must contain 1 to 500 characters")
+        key = str(idempotency_key or "").strip()
+        if not key:
+            raise ValueError("idempotency_key is required")
+        branch_id = current_branch_id(campaign_id)
+        request = {
+            "operation": "chase_end",
+            "campaign_id": campaign_id,
+            "outcome": outcome,
+            "source": source_value,
+            "expected_revision": int(expected_revision),
+        }
+        scope = f"chase-end:{campaign_id}:{branch_id}:{principal_id}"
+        replay = replay_response(scope, key, request)
+        if replay is not None:
+            return replay
+        campaign, chase = active_chase(campaign_id)
+        if campaign.revision != int(expected_revision):
+            raise ValueError(
+                "campaign revision conflict: "
+                f"expected {expected_revision}, found {campaign.revision}"
+            )
+        ended = close_chase_state(chase, outcome=outcome, source=source_value)
+        next_state = {**dict(campaign.state), "game_phase": PROFILE_PLAY, "chase": ended}
+        response = {
+            "campaign_id": campaign_id,
+            "campaign_revision": campaign.revision + 1,
+            "phase": PROFILE_PLAY,
+            "outcome": outcome,
+            "chase": deepcopy(ended),
+        }
+        StateMutationService(storage.database).replace(
+            campaign_id,
+            campaign_state=next_state,
+            expected_campaign_revision=campaign.revision,
+            operation="coc.chase.end",
+            actor=principal_id,
+            branch_id=branch_id,
+            idempotency_key=key,
+            idempotency_write=IdempotencyWrite(
+                scope=scope,
+                payload=request,
+                response=response,
+            ),
+        )
         return response
 
     @mcp.tool()

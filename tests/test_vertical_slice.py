@@ -1839,6 +1839,234 @@ def test_combat_start_order_move_join_end_and_restart_are_authoritative(tmp_path
     asyncio.run(verify_restart())
 
 
+def test_chase_is_atomic_actor_scoped_combat_exclusive_and_restartable(tmp_path) -> None:
+    config = McpConfig(
+        home=tmp_path / "home",
+        database_url=None,
+        coc_skills_dir=tmp_path / "coc",
+        modulegen_skills_dir=tmp_path / "modulegen",
+    )
+    server = create_server(config)
+
+    async def exercise() -> tuple[str, dict]:
+        campaign = await call(
+            server,
+            "campaign_change",
+            {
+                "action": "create",
+                "data": {
+                    "name": "Chase case",
+                    "idempotency_key": "chase-campaign",
+                    "state": {"random_stream": initial_random_stream("chase-case-seed")},
+                },
+            },
+        )
+        fleeing = await call(
+            server,
+            "character_change",
+            {
+                "action": "create",
+                "campaign_id": campaign["id"],
+                "data": {
+                    "name": "Fleeing Investigator",
+                    "sheet": {
+                        "characteristics": {"con": 100, "dex": 60},
+                        "mov": 9,
+                        "skills": {"Climb": 100},
+                    },
+                },
+            },
+        )
+        pursuer = await call(
+            server,
+            "character_change",
+            {
+                "action": "create",
+                "campaign_id": campaign["id"],
+                "data": {
+                    "name": "Pursuing Cultist",
+                    "character_type": "npc",
+                    "sheet": {"characteristics": {"con": 100, "dex": 40}, "mov": 7},
+                },
+            },
+        )
+        await call(
+            server,
+            "campaign_change",
+            {
+                "action": "grant_campaign",
+                "campaign_id": campaign["id"],
+                "data": {"target_principal_id": "player:fleeing", "role": "player"},
+            },
+        )
+        await call(
+            server,
+            "campaign_change",
+            {
+                "action": "grant_actor",
+                "campaign_id": campaign["id"],
+                "data": {
+                    "target_principal_id": "player:fleeing",
+                    "actor_id": fleeing["id"],
+                },
+            },
+        )
+        play = await call(
+            server,
+            "campaign_change",
+            {
+                "action": "set_phase",
+                "campaign_id": campaign["id"],
+                "data": {"phase": "play", "expected_revision": campaign["revision"]},
+            },
+        )
+        start_arguments = {
+            "campaign_id": campaign["id"],
+            "participants": [
+                {
+                    "actor_id": fleeing["id"],
+                    "role": "fleeing",
+                    "position": 2,
+                    "speed_skill_name": "con",
+                },
+                {
+                    "actor_id": pursuer["id"],
+                    "role": "pursuer",
+                    "position": 0,
+                    "speed_skill_name": "con",
+                },
+            ],
+            "expected_character_revisions": {
+                fleeing["id"]: fleeing["revision"],
+                pursuer["id"]: pursuer["revision"],
+            },
+            "source": "A source-backed pursuit begins.",
+            "route": [
+                {
+                    "id": "road",
+                    "index": 0,
+                    "title": "Coastal Road",
+                    "source": "scene:coastal-road",
+                },
+                {
+                    "id": "fence",
+                    "index": 3,
+                    "title": "Fence",
+                    "kind": "barrier",
+                    "source": "scene:fence",
+                },
+            ],
+            "expected_revision": play["revision"],
+            "idempotency_key": "chase-start",
+        }
+        started = await call(server, "chase_start", start_arguments)
+        assert await call(server, "chase_start", start_arguments) == started
+        assert started["chase"]["current_actor_id"] == fleeing["id"]
+        assert started["random_stream_receipt"]["draw_count"] == 4
+        assert (
+            started["chase"]["participants"][fleeing["id"]]["action_points"]
+            >= started["chase"]["participants"][pursuer["id"]]["action_points"]
+        )
+        player_view = await call(
+            server,
+            "chase_query",
+            {"campaign_id": campaign["id"], "principal_id": "player:fleeing"},
+        )
+        assert {"move", "check", "speed_check", "end_turn"} <= set(player_view["available_actions"])
+        with pytest.raises(Exception, match="active chase"):
+            await call(
+                server,
+                "combat_start",
+                {
+                    "campaign_id": campaign["id"],
+                    "participants": [
+                        {
+                            "actor_id": fleeing["id"],
+                            "side": "investigators",
+                            "position": [0, 0],
+                        },
+                        {
+                            "actor_id": pursuer["id"],
+                            "side": "opposition",
+                            "position": [1, 0],
+                        },
+                    ],
+                    "expected_character_revisions": {
+                        fleeing["id"]: fleeing["revision"],
+                        pursuer["id"]: pursuer["revision"],
+                    },
+                    "positioning_mode": "grid",
+                    "source": "Invalid overlapping combat.",
+                    "expected_revision": started["campaign_revision"],
+                    "idempotency_key": "combat-during-chase",
+                },
+            )
+        check_arguments = {
+            "action": "check",
+            "campaign_id": campaign["id"],
+            "data": {
+                "actor_id": fleeing["id"],
+                "skill_name": "Climb",
+                "action_type": "barrier",
+                "difficulty": "regular",
+                "cost": 1,
+                "success_position_change": 1,
+                "failure_position_change": 0,
+                "source": "The route requires crossing the sourced fence barrier.",
+            },
+            "expected_revision": started["campaign_revision"],
+            "idempotency_key": "fence-check",
+            "principal_id": "player:fleeing",
+        }
+        checked = await call(server, "chase_action", check_arguments)
+        assert await call(server, "chase_action", check_arguments) == checked
+        assert checked["resolution"]["skill_name"] == "Climb"
+        assert checked["random_stream_receipt"]["draw_count"] == 2
+        assert checked["chase"]["participants"][fleeing["id"]]["position"] == 3
+        ended_turn = await call(
+            server,
+            "chase_action",
+            {
+                "action": "end_turn",
+                "campaign_id": campaign["id"],
+                "data": {"actor_id": fleeing["id"]},
+                "expected_revision": checked["campaign_revision"],
+                "idempotency_key": "fleeing-end-turn",
+                "principal_id": "player:fleeing",
+            },
+        )
+        assert ended_turn["chase"]["current_actor_id"] == pursuer["id"]
+        ended = await call(
+            server,
+            "chase_end",
+            {
+                "campaign_id": campaign["id"],
+                "outcome": "escaped",
+                "source": "The investigator reached the sourced safe location.",
+                "expected_revision": ended_turn["campaign_revision"],
+                "idempotency_key": "chase-end",
+            },
+        )
+        assert ended["chase"]["active"] is False
+        assert ended["outcome"] == "escaped"
+        return campaign["id"], ended
+
+    campaign_id, ended = asyncio.run(exercise())
+    restarted = create_server(config)
+
+    async def verify_restart() -> None:
+        campaign = await call(
+            restarted,
+            "campaign_query",
+            {"action": "get", "campaign_id": campaign_id},
+        )
+        assert campaign["revision"] == ended["campaign_revision"]
+        assert campaign["state"]["chase"]["outcome"] == "escaped"
+        assert campaign["state"]["chase"]["active"] is False
+
+    asyncio.run(verify_restart())
+
+
 def test_branch_snapshot_and_revision_recovery_are_guarded_and_replayable(tmp_path) -> None:
     config = McpConfig(
         home=tmp_path / "home",

@@ -43,6 +43,8 @@ combat_start -> combat_query
 
 A real stdio-host regression covers Lobby → Play → Combat → Play. After each phase change the host refreshes the native list, observes the old tools disappear, and directly loads and calls the next legal phase tools.
 
+Chases stay within Play and use `chase_start/query/action/end`, with strict mutual exclusion against Combat. At chase start, MCP reads an explicitly named CON, Drive Auto, or Pack-defined skill from each sheet, resolves speed checks from the campaign stream, then derives per-round action points from the slowest effective MOV. `chase_action` owns DEX order, action-point consumption, route position, obstacle checks, and round resets. A Pack or Agent must explicitly supply the sourced position effects of success and failure; MCP does not guess narrative terrain. Players can act only for controlled actors, start/end remain Keeper-only, and every random/state transition has revision and exact-idempotency receipts.
+
 ## Module Pack authoring
 
 CoC scenarios use the unified `sagasmith.content-package` schema version 2 lifecycle:
