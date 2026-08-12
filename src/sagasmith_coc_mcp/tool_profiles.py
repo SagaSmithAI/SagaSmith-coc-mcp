@@ -48,7 +48,7 @@ PHASE_TOOLS = {
         """
         actor_knowledge_change actor_knowledge_query campaign_change character_change
         character_query coc_check coc_dice_roll coc_resolve memory_change memory_query
-        module_change module_query
+        content_pack module_change module_draft module_query
         snapshot_change snapshot_query
         """
     ),
@@ -71,8 +71,8 @@ PHASE_TOOLS = {
 PHASE_DM_TOOLS = {
     PROFILE_LOBBY: _names(
         """
-        actor_knowledge_change character_change memory_change module_change
-        snapshot_change
+        actor_knowledge_change character_change content_pack memory_change module_change
+        module_draft snapshot_change
         """
     ),
     PROFILE_PLAY: _names(

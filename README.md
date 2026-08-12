@@ -2,38 +2,39 @@
 
 [中文](README.md) · [English](README-en.md) · [平台总览](https://github.com/SagaSmithAI/.github/blob/main/profile/README.md)
 
-**SagaSmithAI 的 Call of Cthulhu 7e 本地 MCP 服务。** 它把 `sagasmith-core` 的战役、分支记忆、角色知识、Snapshot 与模组能力，以及 `sagasmith-coc` 的 d100、SAN、战斗和追逐判定，收敛到一个可被任何 MCP Agent 使用的服务端边界。
+SagaSmithAI 的 Call of Cthulhu 7e 本地权威 MCP 服务。它把 `sagasmith-core` 的战役持久化、分支记忆、角色知识、快照、模组检索和统一 Content Pack，与 `sagasmith-coc` 的 d100、理智、战斗、追逐和可重放随机流整合为一个原生 MCP 边界。
 
-## 为什么是独立 MCP
+## 运行时边界
 
-- **状态归 MCP 所有**：SQLite 与导入产物都位于 `.sagasmith-coc-mcp/`，不依赖某个 Agent 的工作目录。
-- **Exposure 在服务端**：每个原生 MCP session 独立维护已加载原生工具、TTL 与 Lobby/Play/Combat 阶段，不要求 Agent 复制工具分类。
-- **角色知识真正隔离**：PC、NPC、怪物的 belief/rumor/false belief 分别按 actor 与 branch 保存；玩家只能读取或修改被授权角色。
-- **随机流与结果同一事务**：`coc_dice_roll`、`coc_check` 和可能掷伤害骰的 `coc_resolve` 从战役随机流取值，并将位置、收据、revision 与幂等回放响应原子提交；纯计算不写状态。
-- **Keeper 信息不外泄**：玩家的模组索引与搜索只返回 `visibility=player` 的 handout 场景。
+- MCP 负责权威战役状态、权限、revision、幂等性、随机流收据和随机判定的原子提交。
+- 每个 MCP session 独立维护原生工具 exposure；Lobby、Play、Combat 策略还会在调用时再次校验。
+- Host 必须响应 `tools/list_changed` 并刷新原生 schema；没有固定工具全集、文本模拟或 `exposure_call` fallback。
+- Agent 负责解释来源和作出模组特有的语义决策；最终 Pack 保留这些决定的来源证据。
 
-```mermaid
-flowchart LR
-    A[Agent / CoC Skills] --> E[Session Exposure]
-    E --> M[SagaSmith CoC MCP]
-    M --> C[sagasmith-core]
-    M --> R[sagasmith-coc]
-    C --> D[(SQLite · branches · actor knowledge)]
-```
-
-## 工具阶段
-
-服务端为每个工具保存唯一的阶段、角色、是否需要战役和是否仅限本机策略。Agent 通过一个 `exposure` facade 搜索并增删需要的原生工具；阶段或恢复操作变化时，服务端裁剪非法工具并发送 `tools/list_changed`。
-
-Agent 首次只会看到目录级核心工具。标准流程是：
+原生能力加载流程：
 
 ```text
-exposure(open) → exposure(search) → exposure(set) → native domain tool
+exposure(open) -> exposure(search) -> exposure(set) -> native domain tool
 ```
 
-Host 必须支持原生动态工具列表刷新；不再提供固定全集、文本模拟或 `exposure_call` fallback。
+## Module Pack 创作流程
 
-## 快速开始
+CoC 模组使用统一的 `sagasmith.content-package` schema v2：
+
+```text
+module_draft(start)
+  -> module_draft(evidence)
+  -> module_draft(edit, operation="package")
+  -> module_draft(finalize)
+  -> content_pack(import)
+  -> content_pack(activate)
+```
+
+`start` 接受导入白名单中的 PDF、Markdown、文本 `source_path`，或生成内容的 `name` 加 `content`。机械导入只产生未激活草稿。游玩配置和目录决策必须引用 `evidence` 返回的原样来源收据。终结需要 Agent 显式确认，并生成不可静默修改的 `.sagasmith-pack`；只有从该最终档重新导入的模块才能激活。
+
+商业规则书和模组始终保留在本地。用 `SAGASMITH_COC_MCP_MODULE_IMPORT_ROOTS` 配置允许读取的来源根目录，多个路径使用系统路径分隔符。仓库不分发原书、抽取文本或原书资产。
+
+## 启动
 
 ```bash
 pip install -e "../sagasmith-core[documents]"
@@ -42,15 +43,13 @@ pip install -e .
 sagasmith-coc-mcp
 ```
 
-默认状态目录：`./.sagasmith-coc-mcp/`。可用 `SAGASMITH_COC_MCP_HOME` 指定路径，并用 `SAGASMITH_COC_SKILLS_DIR`、`SAGASMITH_MODULEGEN_SKILLS_DIR` 接入 Skills 生态。
+状态默认位于 `.sagasmith-coc-mcp/`。主要配置项：
 
-## 安全边界
-
-- 创建战役时创建 owner membership；新增玩家需 Keeper 显式 grant campaign 与 actor。
-- owner/DM 可管理全部角色；玩家只能访问明确授权的 actor private state。
-- Exposure 同时绑定 MCP session、principal、campaign 与阶段，不能跨会话或跨战役复用。
-- `combat.active=true` 时进入 Combat；非 Keeper 不能直接写角色卡，以免绕过判定与行动边界。
-- 商业规则书和模组不随仓库发布；仅导入你有权使用的内容。
+- `SAGASMITH_COC_MCP_HOME`
+- `SAGASMITH_COC_MCP_MODULE_IMPORT_ROOTS`
+- `SAGASMITH_COC_SKILLS_DIR`
+- `SAGASMITH_MODULEGEN_SKILLS_DIR`
+- `SAGASMITH_COC_MCP_BOUND_PRINCIPAL_ID`
 
 ## 开发
 
@@ -60,4 +59,4 @@ pytest
 ruff check .
 ```
 
-原创代码使用 Apache-2.0。Call of Cthulhu 及相关商业内容归其权利人所有。
+原创代码采用 Apache-2.0。Call of Cthulhu 及相关商业内容的权利归各自权利人所有。

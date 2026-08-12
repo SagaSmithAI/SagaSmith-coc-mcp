@@ -23,6 +23,65 @@ async def call(server, name: str, arguments: dict):
     return result.get("result", result) if isinstance(result, dict) else result
 
 
+def synthetic_pack_decisions(receipt: dict, *, title: str = "Synthetic Case") -> dict:
+    return {
+        "manifest": {
+            "title": title,
+            "classification": "scenario",
+            "compatibility": {
+                "editions": ["7e"],
+                "required_capabilities": ["module_pack_v2"],
+            },
+            "play_profile": {
+                "investigator_count": {
+                    "minimum": 1,
+                    "maximum": 4,
+                    "source_refs": [receipt],
+                },
+                "ruleset": {
+                    "supported": ["classic"],
+                    "recommended": "classic",
+                    "source_refs": [receipt],
+                },
+                "era": {"value": "1920s", "source_refs": [receipt]},
+                "estimated_sessions": {
+                    "minimum": 1,
+                    "maximum": 1,
+                    "source_refs": [receipt],
+                },
+                "pregenerated_characters": {
+                    "available": False,
+                    "applicability": "None",
+                    "source_refs": [receipt],
+                },
+                "solo_play": {"supported": False, "source_refs": [receipt]},
+            },
+            "continuity": {
+                "series_id": None,
+                "order": None,
+                "continues_from": None,
+                "state_policy": {},
+            },
+            "activation": {"mode": "campaign_attach", "default_active": False},
+        },
+        "catalogs": {
+            "clues": [{"id": "clue:synthetic", "source_refs": [receipt]}],
+            "handouts": [],
+            "encounters": [],
+            "hazards": [],
+            "tomes": [],
+            "spells": [],
+            "mechanics": [],
+        },
+        "narrative": {
+            "dossiers": [],
+            "endings": [{"id": "ending:resolved", "trigger": "resolve the case"}],
+        },
+        "metadata": {"license": "private", "attribution": "Synthetic test"},
+        "version": "1.0.0",
+    }
+
+
 def test_coc_mcp_persists_campaign_modules_and_actor_knowledge(tmp_path) -> None:
     config = McpConfig(
         home=tmp_path / "home",
@@ -116,20 +175,170 @@ def test_coc_mcp_persists_campaign_modules_and_actor_knowledge(tmp_path) -> None
                     "principal_id": "player:bob",
                 },
             )
+        draft = await call(
+            server,
+            "module_draft",
+            {
+                "action": "start",
+                "campaign_id": campaign_id,
+                "data": {
+                    "name": "haunting.md",
+                    "source_key": "haunting.md",
+                    "title": "The Haunting",
+                    "content": (
+                        "# Boston\n## Corbitt House\nTwo investigators arrive in the 1920s. "
+                        "A hidden clue waits upstairs.\n## Ending\nThe case is solved."
+                    ),
+                },
+                "idempotency_key": "haunting-draft",
+            },
+        )
+        assert draft["status"] == "editing"
+        draft_replay = await call(
+            server,
+            "module_draft",
+            {
+                "action": "start",
+                "campaign_id": campaign_id,
+                "data": {
+                    "name": "haunting.md",
+                    "source_key": "haunting.md",
+                    "title": "The Haunting",
+                    "content": (
+                        "# Boston\n## Corbitt House\nTwo investigators arrive in the 1920s. "
+                        "A hidden clue waits upstairs.\n## Ending\nThe case is solved."
+                    ),
+                },
+                "idempotency_key": "haunting-draft",
+            },
+        )
+        assert draft_replay == draft
+        evidence = await call(
+            server,
+            "module_draft",
+            {
+                "action": "evidence",
+                "campaign_id": campaign_id,
+                "data": {"job_id": draft["job_id"]},
+            },
+        )
+        receipt = evidence["evidence"][0]["source_ref"]
+        decisions = {
+            "manifest": {
+                "title": "The Haunting",
+                "classification": "scenario",
+                "compatibility": {
+                    "editions": ["7e"],
+                    "required_capabilities": ["module_pack_v2"],
+                },
+                "play_profile": {
+                    "investigator_count": {
+                        "minimum": 2,
+                        "maximum": 2,
+                        "source_refs": [receipt],
+                    },
+                    "ruleset": {
+                        "supported": ["classic"],
+                        "recommended": "classic",
+                        "source_refs": [receipt],
+                    },
+                    "era": {"value": "1920s", "source_refs": [receipt]},
+                    "estimated_sessions": {
+                        "minimum": 1,
+                        "maximum": 1,
+                        "source_refs": [receipt],
+                    },
+                    "pregenerated_characters": {
+                        "available": False,
+                        "applicability": "None",
+                        "source_refs": [receipt],
+                    },
+                    "solo_play": {"supported": False, "source_refs": [receipt]},
+                },
+                "continuity": {
+                    "series_id": None,
+                    "order": None,
+                    "continues_from": None,
+                    "state_policy": {},
+                },
+                "activation": {"mode": "campaign_attach", "default_active": False},
+            },
+            "catalogs": {
+                "clues": [{"id": "clue:hidden", "source_refs": [receipt]}],
+                "handouts": [],
+                "encounters": [],
+                "hazards": [],
+                "tomes": [],
+                "spells": [],
+                "mechanics": [],
+            },
+            "narrative": {
+                "dossiers": [],
+                "endings": [{"id": "ending:solved", "trigger": "solve the case"}],
+            },
+            "metadata": {"license": "private", "attribution": "Synthetic test"},
+            "version": "1.0.0",
+        }
+        edited = await call(
+            server,
+            "module_draft",
+            {
+                "action": "edit",
+                "campaign_id": campaign_id,
+                "data": {
+                    "job_id": draft["job_id"],
+                    "operation": "package",
+                    **decisions,
+                },
+                "expected_revision": draft["job"]["revision"],
+                "idempotency_key": "haunting-decisions",
+            },
+        )
+        finalized = await call(
+            server,
+            "module_draft",
+            {
+                "action": "finalize",
+                "campaign_id": campaign_id,
+                "data": {
+                    "job_id": draft["job_id"],
+                    "package_id": "coc7e.module.haunting.synthetic",
+                    "confirmation": {"confirmed": True, "note": "Reviewed all source facts."},
+                },
+                "expected_revision": edited["job"]["revision"],
+                "idempotency_key": "haunting-finalize",
+            },
+        )
+        campaign_revision = (
+            await call(
+                server,
+                "campaign_query",
+                {"action": "get", "campaign_id": campaign_id},
+            )
+        )["revision"]
         imported = await call(
             server,
-            "module_change",
+            "content_pack",
             {
                 "action": "import",
                 "campaign_id": campaign_id,
-                "data": {
-                    "source_key": "haunting.md",
-                    "title": "The Haunting",
-                    "content": "# Boston\n## Corbitt House\nA hidden clue waits upstairs.",
-                },
+                "data": {"artifact": finalized["artifact"]},
+                "expected_revision": campaign_revision,
+                "idempotency_key": "haunting-pack-import",
             },
         )
-        assert imported["scenes"] >= 1
+        activated = await call(
+            server,
+            "content_pack",
+            {
+                "action": "activate",
+                "campaign_id": campaign_id,
+                "data": {"module_id": imported["module_id"]},
+                "expected_revision": campaign_revision,
+                "idempotency_key": "haunting-pack-activate",
+            },
+        )
+        assert activated["activation"]["active"] is True
         scenes = await call(
             server,
             "module_query",
@@ -179,6 +388,231 @@ def test_coc_mcp_persists_campaign_modules_and_actor_knowledge(tmp_path) -> None
         assert values["knowledge"][0]["proposition"].endswith("attic.")
 
     asyncio.run(verify_restart())
+
+
+def test_module_draft_pack_round_trip_is_finalized_replayable_and_cross_campaign(
+    tmp_path,
+) -> None:
+    config = McpConfig(
+        home=tmp_path / "home",
+        database_url=None,
+        coc_skills_dir=tmp_path / "coc",
+        modulegen_skills_dir=tmp_path / "modulegen",
+    )
+    server = create_server(config)
+
+    async def author() -> tuple[str, str, str, dict]:
+        campaign = await call(
+            server,
+            "campaign_change",
+            {
+                "action": "create",
+                "data": {"name": "Authoring", "idempotency_key": "authoring-campaign"},
+            },
+        )
+        draft_args = {
+            "action": "start",
+            "campaign_id": campaign["id"],
+            "data": {
+                "name": "lantern.md",
+                "title": "The Lantern Case",
+                "source_key": "lantern.md",
+                "content": (
+                    "# The Lantern Case\n## Arrival\nOne to four investigators arrive in "
+                    "Arkham in the 1920s.\n## Ending\nThe investigators resolve the case."
+                ),
+            },
+            "idempotency_key": "lantern-start",
+        }
+        draft = await call(server, "module_draft", draft_args)
+        assert await call(server, "module_draft", draft_args) == draft
+        evidence = await call(
+            server,
+            "module_draft",
+            {
+                "action": "evidence",
+                "campaign_id": campaign["id"],
+                "data": {"job_id": draft["job_id"], "query": "investigators"},
+            },
+        )
+        receipt = evidence["evidence"][0]["source_ref"]
+        edit_args = {
+            "action": "edit",
+            "campaign_id": campaign["id"],
+            "data": {
+                "job_id": draft["job_id"],
+                "operation": "package",
+                **synthetic_pack_decisions(receipt, title="The Lantern Case"),
+            },
+            "expected_revision": draft["job"]["revision"],
+            "idempotency_key": "lantern-edit",
+        }
+        edited = await call(server, "module_draft", edit_args)
+        assert await call(server, "module_draft", edit_args) == edited
+        finalize_args = {
+            "action": "finalize",
+            "campaign_id": campaign["id"],
+            "data": {
+                "job_id": draft["job_id"],
+                "package_id": "coc7e.module.lantern-case",
+                "include_package": True,
+                "confirmation": {
+                    "confirmed": True,
+                    "note": "Reviewed scenes, profile, clue, ending, and source evidence.",
+                },
+            },
+            "expected_revision": edited["job"]["revision"],
+            "idempotency_key": "lantern-finalize",
+        }
+        finalized = await call(server, "module_draft", finalize_args)
+        assert await call(server, "module_draft", finalize_args) == finalized
+        assert finalized["package"]["schema_version"] == 2
+        with pytest.raises(Exception, match="mechanically imported draft"):
+            await call(
+                server,
+                "module_draft",
+                {
+                    **edit_args,
+                    "expected_revision": finalized["job"]["revision"],
+                    "idempotency_key": "edit-finalized",
+                },
+            )
+        return (
+            campaign["id"],
+            draft["job_id"],
+            finalized["artifact"],
+            finalized["package"],
+        )
+
+    authoring_id, job_id, artifact, package = asyncio.run(author())
+    restarted = create_server(config)
+
+    async def import_elsewhere() -> None:
+        persisted = await call(
+            restarted,
+            "module_draft",
+            {
+                "action": "get",
+                "campaign_id": authoring_id,
+                "data": {"job_id": job_id},
+            },
+        )
+        assert persisted["job"]["state"] == "compiled"
+        inspected = await call(
+            restarted,
+            "content_pack",
+            {
+                "action": "get",
+                "campaign_id": authoring_id,
+                "data": {"artifact": artifact},
+            },
+        )
+        assert inspected["package"]["checksum"] == package["checksum"]
+        campaign = await call(
+            restarted,
+            "campaign_change",
+            {
+                "action": "create",
+                "data": {"name": "Playback", "idempotency_key": "playback-campaign"},
+            },
+        )
+        import_args = {
+            "action": "import",
+            "campaign_id": campaign["id"],
+            "data": {"artifact": artifact},
+            "expected_revision": campaign["revision"],
+            "idempotency_key": "lantern-import",
+        }
+        with pytest.raises(Exception, match="campaign revision conflict"):
+            await call(
+                restarted,
+                "content_pack",
+                {**import_args, "expected_revision": campaign["revision"] + 1},
+            )
+        imported = await call(restarted, "content_pack", import_args)
+        assert await call(restarted, "content_pack", import_args) == imported
+        assert imported["activated"] is False
+        activate_args = {
+            "action": "activate",
+            "campaign_id": campaign["id"],
+            "data": {"module_id": imported["module_id"]},
+            "expected_revision": campaign["revision"],
+            "idempotency_key": "lantern-activate",
+        }
+        activated = await call(restarted, "content_pack", activate_args)
+        assert await call(restarted, "content_pack", activate_args) == activated
+        assert activated["activation"]["active"] is True
+        listed = await call(
+            restarted,
+            "content_pack",
+            {"action": "list", "campaign_id": campaign["id"]},
+        )
+        assert [item["id"] for item in listed["packs"]] == [imported["module_id"]]
+        with pytest.raises(Exception, match="deactivate or replace"):
+            await call(
+                restarted,
+                "content_pack",
+                {
+                    "action": "remove",
+                    "campaign_id": campaign["id"],
+                    "data": {"module_id": imported["module_id"]},
+                    "expected_revision": campaign["revision"],
+                    "idempotency_key": "remove-active",
+                },
+            )
+
+    asyncio.run(import_elsewhere())
+
+
+def test_module_source_path_must_be_inside_configured_import_roots(tmp_path) -> None:
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    allowed_source = allowed / "case.md"
+    allowed_source.write_text("# Case\n## Scene\nEvidence.\n", encoding="utf-8")
+    outside_source = tmp_path / "outside.md"
+    outside_source.write_text("# Outside\n## Scene\nNo.\n", encoding="utf-8")
+    config = McpConfig(
+        home=tmp_path / "home",
+        database_url=None,
+        coc_skills_dir=tmp_path / "coc",
+        modulegen_skills_dir=tmp_path / "modulegen",
+        module_import_roots=(allowed,),
+    )
+    server = create_server(config)
+
+    async def exercise() -> None:
+        campaign = await call(
+            server,
+            "campaign_change",
+            {
+                "action": "create",
+                "data": {"name": "Sources", "idempotency_key": "sources-campaign"},
+            },
+        )
+        staged = await call(
+            server,
+            "module_draft",
+            {
+                "action": "start",
+                "campaign_id": campaign["id"],
+                "data": {"source_path": str(allowed_source)},
+                "idempotency_key": "allowed-source",
+            },
+        )
+        assert staged["job"]["artifact_checksum"]
+        with pytest.raises(Exception, match="outside configured import roots"):
+            await call(
+                server,
+                "module_draft",
+                {
+                    "action": "start",
+                    "campaign_id": campaign["id"],
+                    "data": {"source_path": str(outside_source)},
+                    "idempotency_key": "outside-source",
+                },
+            )
+
+    asyncio.run(exercise())
 
 
 def test_random_roll_is_atomic_idempotent_and_persists_across_restart(tmp_path) -> None:
@@ -315,6 +749,41 @@ def test_stdio_client_can_discover_load_and_call(tmp_path) -> None:
                     },
                 )
                 assert not created.isError
+                campaign_id = json.loads(created.content[0].text)["id"]
+                rebound = await session.call_tool(
+                    "exposure",
+                    {"action": "open", "campaign_id": campaign_id},
+                )
+                assert not rebound.isError
+                found = await session.call_tool(
+                    "exposure",
+                    {"action": "search", "query": "module draft"},
+                )
+                matches = json.loads(found.content[0].text)["matches"]
+                assert [item["tool_id"] for item in matches] == ["module_draft"]
+                loaded = await session.call_tool(
+                    "exposure",
+                    {
+                        "action": "set",
+                        "add_tool_ids": ["module_draft", "content_pack"],
+                    },
+                )
+                assert not loaded.isError
+                visible = {item.name for item in (await session.list_tools()).tools}
+                assert {"module_draft", "content_pack"} <= visible
+                staged = await session.call_tool(
+                    "module_draft",
+                    {
+                        "action": "start",
+                        "campaign_id": campaign_id,
+                        "data": {
+                            "name": "stdio-case.md",
+                            "content": "# Case\n## Scene\nEvidence.\n",
+                        },
+                        "idempotency_key": "stdio-draft",
+                    },
+                )
+                assert not staged.isError
 
     asyncio.run(exercise())
 

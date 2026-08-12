@@ -18,10 +18,21 @@ class McpConfig:
     coc_skills_dir: Path
     modulegen_skills_dir: Path
     bound_principal_id: str | None = None
+    module_import_roots: tuple[Path, ...] = ()
 
     @classmethod
     def from_environment(cls) -> "McpConfig":
         root = _workspace_root()
+        raw_module_roots = os.environ.get("SAGASMITH_COC_MCP_MODULE_IMPORT_ROOTS")
+        module_roots = (
+            tuple(
+                Path(value.strip()).expanduser().resolve()
+                for value in raw_module_roots.split(os.pathsep)
+                if value.strip()
+            )
+            if raw_module_roots is not None
+            else (root / "test_pdfs",)
+        )
         return cls(
             home=Path(os.environ.get("SAGASMITH_COC_MCP_HOME", root / ".sagasmith-coc-mcp"))
             .expanduser()
@@ -45,6 +56,7 @@ class McpConfig:
                 and value.strip()
                 else None
             ),
+            module_import_roots=tuple(path.resolve() for path in module_roots),
         )
 
     @property
@@ -55,6 +67,24 @@ class McpConfig:
     def modules_dir(self) -> Path:
         return self.home / "artifacts" / "modules"
 
+    @property
+    def content_packages_dir(self) -> Path:
+        return self.home / "artifacts" / "content-packages"
+
+    @property
+    def module_assets_dir(self) -> Path:
+        return self.home / "artifacts" / "module-assets"
+
+    @property
+    def normalized_modules_dir(self) -> Path:
+        return self.home / "artifacts" / "normalized-modules"
+
     def prepare(self) -> None:
-        self.database_path.parent.mkdir(parents=True, exist_ok=True)
-        self.modules_dir.mkdir(parents=True, exist_ok=True)
+        for directory in (
+            self.database_path.parent,
+            self.modules_dir,
+            self.content_packages_dir,
+            self.module_assets_dir,
+            self.normalized_modules_dir,
+        ):
+            directory.mkdir(parents=True, exist_ok=True)

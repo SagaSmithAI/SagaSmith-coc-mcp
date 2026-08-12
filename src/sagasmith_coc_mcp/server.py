@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 from dataclasses import asdict
+from pathlib import Path
 from typing import Any, Literal
 from uuid import uuid4
 from weakref import WeakValueDictionary
 
 from mcp.server.fastmcp import FastMCP
+from sagasmith_coc.content_packages import (
+    build_module_content_package,
+    validate_coc_content_package,
+)
 from sagasmith_coc.engine.checks.chase import (
     resolve_chase_action,
     resolve_chase_speed_check,
@@ -32,6 +38,7 @@ from sagasmith_core import (
     CharacterService,
     IdempotencyService,
     IdempotencyWrite,
+    ImportJobService,
     MemoryService,
     ModuleService,
     SnapshotService,
@@ -175,6 +182,7 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
     memories = MemoryService(storage.database)
     knowledge = ActorKnowledgeService(storage.database)
     modules = ModuleService(storage.database)
+    import_jobs = ImportJobService(storage.database)
     snapshots = SnapshotService(storage.database)
     idempotency = IdempotencyService(storage.database)
     default_local_principal(storage.database)
@@ -263,6 +271,108 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
             campaign_id, actor_id, principal_id, control=control, private=not control
         )
 
+    def require_lobby(campaign_id: str, operation: str) -> None:
+        phase = authoritative_phase(campaign_id)
+        if phase != PROFILE_LOBBY:
+            raise ValueError(
+                f"{operation} is available only during lobby; current phase is {phase}"
+            )
+
+    def require_write_contract(
+        expected_revision: int | None, idempotency_key: str | None
+    ) -> tuple[int, str]:
+        if expected_revision is None:
+            raise ValueError("expected_revision is required for this mutation")
+        key = str(idempotency_key or "").strip()
+        if not key:
+            raise ValueError("idempotency_key is required for this mutation")
+        return int(expected_revision), key
+
+    def import_job_handle(job: Any) -> dict[str, Any]:
+        result = dict(job.result or {})
+        finalized = dict(result.get("finalized_package") or {})
+        return {
+            "job_id": job.id,
+            "state": job.state,
+            "resumable": not bool(finalized),
+            "artifact": job.artifact,
+            "artifact_checksum": job.artifact_checksum,
+            "source_key": str(dict(job.payload or {}).get("source_key") or job.artifact),
+            "title": str(dict(job.payload or {}).get("title") or ""),
+            "module_id": job.module_id or "",
+            "revision": job.revision,
+            "pack_decision_fields": sorted(dict(result.get("pack_draft") or {})),
+            "finalized_artifact": str(finalized.get("artifact") or ""),
+            "finalized_pack_id": str(dict(finalized.get("summary") or {}).get("id") or ""),
+        }
+
+    def import_job_view(job: Any) -> dict[str, Any]:
+        value = asdict(job)
+        finalized = dict(dict(value.get("result") or {}).get("finalized_package") or {})
+        if finalized:
+            finalized.pop("package", None)
+            value["result"] = {
+                **dict(value.get("result") or {}),
+                "finalized_package": finalized,
+            }
+        return value
+
+    def require_module_job(campaign_id: str, job_id: str) -> Any:
+        job = import_jobs.get(job_id)
+        if job.campaign_id != campaign_id or job.kind != "module":
+            raise LookupError(job_id)
+        return job
+
+    def replay_response(scope: str, key: str, payload: dict[str, Any]) -> dict[str, Any] | None:
+        replay = idempotency.lookup(scope, key, payload)
+        if replay is None:
+            return None
+        if replay.response is None:
+            raise RuntimeError("idempotency replay has no stored response")
+        return dict(replay.response)
+
+    def remember_response(
+        scope: str,
+        key: str,
+        payload: dict[str, Any],
+        response: dict[str, Any],
+        *,
+        campaign_id: str,
+    ) -> dict[str, Any]:
+        remembered = idempotency.remember(
+            scope,
+            key,
+            payload,
+            response,
+            campaign_id=campaign_id,
+        )
+        if remembered.response is None:
+            raise RuntimeError("idempotency write has no stored response")
+        return dict(remembered.response)
+
+    def module_archive(
+        campaign_id: str, module_id: str
+    ) -> tuple[dict[str, Any], dict[str, bytes], dict[str, Any]]:
+        matches = [
+            item
+            for item in modules.list_assets(campaign_id, module_id)
+            if str(dict(item.get("metadata") or {}).get("asset_kind") or "")
+            == "content_package_archive"
+        ]
+        if len(matches) != 1:
+            if not matches:
+                raise LookupError(f"module {module_id} has no finalized Pack archive")
+            raise ValueError("module has multiple authoritative content Pack archives")
+        artifact = str(dict(matches[0].get("metadata") or {}).get("content_archive_artifact") or "")
+        if not artifact:
+            raise ValueError("module content Pack archive metadata is incomplete")
+        package, blobs = storage.read_content_archive(artifact=artifact)
+        return (
+            validate_coc_content_package(package),
+            blobs,
+            storage.write_content_archive(package, blobs),
+        )
+
     def authoritative_random_resolution(
         *,
         campaign_id: str,
@@ -341,6 +451,20 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
                 "random draws and their stream receipt commit atomically; "
                 "pure calculations do not mutate state"
             ),
+            "content_pack": {
+                "format": "sagasmith.content-package",
+                "schema_version": 2,
+                "kinds": ["module"],
+                "draft_stages": [
+                    "module_draft(start)",
+                    "module_draft(evidence)",
+                    "module_draft(edit:package)",
+                    "module_draft(finalize)",
+                    "content_pack(import)",
+                    "content_pack(activate)",
+                ],
+                "finalization": "explicit Agent confirmation; finalized archive is immutable",
+            },
             "tool_catalog": tool_catalog(),
         }
 
@@ -467,8 +591,10 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
     ) -> dict[str, Any]:
         membership = access.require_campaign(campaign_id, principal_id)
         if action == "create":
-            character_type = str(data.get("character_type") or "pc")
-            if character_type != "pc" and membership.role not in {"owner", "dm"}:
+            character_type = str(data.get("character_type") or "investigator")
+            if character_type not in {"investigator", "npc", "creature"}:
+                raise ValueError("character_type must be investigator, npc, or creature")
+            if character_type != "investigator" and membership.role not in {"owner", "dm"}:
                 raise PermissionError("only the Keeper may create NPCs or creatures")
             name = str(data.get("name") or "").strip()
             if not name:
@@ -512,6 +638,699 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
                 expected_revision=int(data.get("expected_revision", current.revision)),
             )
         )
+
+    @mcp.tool()
+    def module_draft(
+        action: Literal["start", "get", "evidence", "edit", "finalize"],
+        campaign_id: str,
+        data: dict[str, Any] | None = None,
+        expected_revision: int | None = None,
+        idempotency_key: str | None = None,
+        principal_id: str = "system:local",
+    ) -> dict[str, Any]:
+        """Create, inspect, evidence-review, edit, and finalize one CoC Module Pack draft."""
+
+        require_dm(campaign_id, principal_id)
+        require_lobby(campaign_id, f"module_draft({action})")
+        data = dict(data or {})
+        if action == "get":
+            if data.get("job_id"):
+                job = require_module_job(campaign_id, str(data["job_id"]))
+                return {"job": import_job_view(job)}
+            return {
+                "order": "newest_first",
+                "jobs": [
+                    import_job_handle(item) for item in import_jobs.list(campaign_id, kind="module")
+                ],
+            }
+
+        if action == "start":
+            key = str(idempotency_key or "").strip()
+            if not key:
+                raise ValueError("idempotency_key is required to start a module draft")
+            source_path = data.get("source_path")
+            generated_fields = {"name", "content"}.intersection(data)
+            if source_path is not None and generated_fields:
+                raise ValueError("start accepts either source_path or name+content, not both")
+            if source_path is None and generated_fields != {"name", "content"}:
+                raise ValueError("start requires source_path or both name and content")
+            request = {
+                "operation": "start_module_draft",
+                "source_path": str(source_path or ""),
+                "name": str(data.get("name") or ""),
+                "content": str(data.get("content") or ""),
+                "title": str(data.get("title") or ""),
+                "source_key": str(data.get("source_key") or ""),
+            }
+            scope = f"module-draft-start:{campaign_id}:{principal_id}"
+            replay = replay_response(scope, key, request)
+            if replay is not None:
+                return replay
+            if source_path is not None:
+                stored = storage.stage_module(str(source_path))
+                default_name = Path(str(source_path)).name
+            else:
+                stored = storage.stage_text_module(str(data["name"]), str(data["content"]))
+                default_name = str(data["name"])
+            artifact = str(stored["artifact"])
+            title = str(data.get("title") or Path(default_name).stem).strip()
+            source_key = str(data.get("source_key") or default_name).strip()
+            if not title or not source_key:
+                raise ValueError("module title and source_key must not be empty")
+
+            create_payload = {
+                "artifact": artifact,
+                "checksum": stored["checksum"],
+                "title": title,
+                "source_key": source_key,
+            }
+            create_scope = f"module-draft-job:{campaign_id}:{principal_id}:create"
+            create_key = f"{key}:create"
+            created_replay = replay_response(create_scope, create_key, create_payload)
+            if created_replay is None:
+                job = import_jobs.create(
+                    campaign_id=campaign_id,
+                    kind="module",
+                    artifact=artifact,
+                    artifact_checksum=str(stored["checksum"]),
+                    payload={"title": title, "source_key": source_key},
+                    idempotency_key=create_key,
+                    idempotency_write=IdempotencyWrite(
+                        scope=create_scope,
+                        payload=create_payload,
+                        response=lambda value: {"job_id": value.id},
+                    ),
+                )
+            else:
+                job = require_module_job(campaign_id, str(created_replay["job_id"]))
+
+            source = storage.artifact_module_path(job.artifact)
+            inspection = modules.preview_path(
+                source,
+                parser=parser,
+                document_cache_dir=config.normalized_modules_dir,
+                expected_checksum=job.artifact_checksum,
+            )
+            inspect_payload = {
+                "job_id": job.id,
+                "artifact_checksum": job.artifact_checksum,
+                "parser_profile": inspection.get("parser_profile"),
+                "parser_version": inspection.get("parser_version"),
+            }
+            inspect_scope = f"module-draft-job:{campaign_id}:{job.id}:inspect"
+            inspect_key = f"{key}:inspect"
+            inspected_replay = replay_response(inspect_scope, inspect_key, inspect_payload)
+            if inspected_replay is None:
+                job = import_jobs.record_inspection(
+                    job.id,
+                    inspection,
+                    expected_revision=job.revision,
+                    idempotency_key=inspect_key,
+                    idempotency_write=IdempotencyWrite(
+                        scope=inspect_scope,
+                        payload=inspect_payload,
+                        response=lambda value: {"job_id": value.id},
+                    ),
+                )
+            else:
+                job = require_module_job(campaign_id, str(inspected_replay["job_id"]))
+
+            validation = {
+                "valid": not bool(inspection.get("errors")),
+                "errors": list(inspection.get("errors") or []),
+                "warnings": list(inspection.get("warnings") or []),
+            }
+            validate_payload = {"job_id": job.id, "inspection": inspection}
+            validate_scope = f"module-draft-job:{campaign_id}:{job.id}:validate"
+            validate_key = f"{key}:validate"
+            validated_replay = replay_response(validate_scope, validate_key, validate_payload)
+            if validated_replay is None:
+                job = import_jobs.record_validation(
+                    job.id,
+                    validation,
+                    expected_revision=job.revision,
+                    idempotency_key=validate_key,
+                    idempotency_write=IdempotencyWrite(
+                        scope=validate_scope,
+                        payload=validate_payload,
+                        response=lambda value: {"job_id": value.id},
+                    ),
+                )
+            else:
+                job = require_module_job(campaign_id, str(validated_replay["job_id"]))
+
+            if validation["valid"]:
+                ingest_payload = {
+                    "job_id": job.id,
+                    "artifact_checksum": job.artifact_checksum,
+                    "source_key": source_key,
+                    "title": title,
+                }
+                ingest_scope = f"module-draft-job:{campaign_id}:{job.id}:ingest"
+                ingest_key = f"{key}:ingest"
+                ingest_replay = replay_response(ingest_scope, ingest_key, ingest_payload)
+                if ingest_replay is None:
+                    imported = modules.ingest_path(
+                        campaign_id=campaign_id,
+                        path=source,
+                        source_key=source_key,
+                        logical_source_key=source_key,
+                        title=title,
+                        parser=parser,
+                        activate=False,
+                        document_cache_dir=config.normalized_modules_dir,
+                        expected_checksum=job.artifact_checksum,
+                        idempotency_key=ingest_key,
+                        idempotency_write=IdempotencyWrite(
+                            scope=ingest_scope,
+                            payload=ingest_payload,
+                            response=lambda value: {
+                                "module_id": value.module_id,
+                                "scenes": value.scenes,
+                                "chunks": value.chunks,
+                            },
+                        ),
+                    )
+                    import_result = {
+                        "module_id": imported.module_id,
+                        "scenes": imported.scenes,
+                        "chunks": imported.chunks,
+                    }
+                else:
+                    import_result = ingest_replay
+                record_payload = {"job_id": job.id, **import_result}
+                record_scope = f"module-draft-job:{campaign_id}:{job.id}:record-import"
+                record_key = f"{key}:record-import"
+                record_replay = replay_response(record_scope, record_key, record_payload)
+                if record_replay is None:
+                    job = import_jobs.record_result(
+                        job.id,
+                        {
+                            "mechanical_import": deepcopy(import_result),
+                            "pack_draft": {},
+                            "pack_edit_history": [],
+                        },
+                        state="imported",
+                        module_id=str(import_result["module_id"]),
+                        expected_revision=job.revision,
+                        idempotency_key=record_key,
+                        idempotency_write=IdempotencyWrite(
+                            scope=record_scope,
+                            payload=record_payload,
+                            response=lambda value: {"job_id": value.id},
+                        ),
+                    )
+                else:
+                    job = require_module_job(campaign_id, str(record_replay["job_id"]))
+                response = {
+                    "job_id": job.id,
+                    "job": import_job_view(job),
+                    "inspection": inspection,
+                    "validation": validation,
+                    "module_id": job.module_id,
+                    "status": "editing",
+                }
+            else:
+                response = {
+                    "job_id": job.id,
+                    "job": import_job_view(job),
+                    "inspection": inspection,
+                    "validation": validation,
+                    "status": "needs_repair",
+                }
+            return remember_response(scope, key, request, response, campaign_id=campaign_id)
+
+        job_id = str(data.get("job_id") or "").strip()
+        if not job_id:
+            raise ValueError("data.job_id is required")
+        job = require_module_job(campaign_id, job_id)
+        if action == "evidence":
+            if not job.module_id:
+                raise ValueError("chunk evidence requires a mechanically imported draft")
+            chunks = modules.list_chunks(
+                campaign_id,
+                job.module_id,
+                scene_id=(str(data["scene_id"]) if data.get("scene_id") else None),
+            )
+            query = str(data.get("query") or "").strip().casefold()
+            page = data.get("page")
+            if page is not None and (
+                isinstance(page, bool) or not isinstance(page, int) or page < 1
+            ):
+                raise ValueError("data.page must be a positive integer")
+            if query:
+                chunks = [
+                    item
+                    for item in chunks
+                    if query
+                    in "\n".join(
+                        [
+                            *[str(value) for value in item.get("heading_path") or []],
+                            str(item.get("content") or ""),
+                        ]
+                    ).casefold()
+                ]
+            if page is not None:
+                chunks = [
+                    item
+                    for item in chunks
+                    if isinstance(item.get("page_start"), int)
+                    and isinstance(item.get("page_end"), int)
+                    and int(item["page_start"]) <= page <= int(item["page_end"])
+                ]
+            limit = data.get("limit", 100)
+            if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 500:
+                raise ValueError("data.limit must be an integer between 1 and 500")
+            source_key = str(dict(job.payload or {}).get("source_key") or job.artifact)
+            evidence = []
+            for item in chunks[:limit]:
+                note_subject = " / ".join(str(value) for value in item.get("heading_path") or [])
+                evidence.append(
+                    {
+                        **deepcopy(item),
+                        "source_ref": {
+                            "source_key": source_key,
+                            "page": item.get("page_start"),
+                            "chunk_hash": str(item.get("content_hash") or ""),
+                            "note": f"Agent-reviewed source evidence: {note_subject or 'module'}",
+                        },
+                    }
+                )
+            return {"job_id": job.id, "evidence": evidence}
+
+        revision, key = require_write_contract(expected_revision, idempotency_key)
+        if action == "edit":
+            if job.state != "imported" or not job.module_id:
+                raise ValueError("module Pack decisions require a mechanically imported draft")
+            if dict(job.result or {}).get("finalized_package"):
+                raise ValueError("a finalized module draft is immutable")
+            if str(data.get("operation") or "") != "package":
+                raise ValueError("data.operation must be package")
+            allowed = {"catalogs", "dependencies", "manifest", "metadata", "narrative", "version"}
+            decisions = {key: deepcopy(data[key]) for key in allowed if key in data}
+            unsupported = sorted(set(data) - allowed - {"job_id", "operation", "note"})
+            if unsupported:
+                raise ValueError(
+                    "module Pack edit has unsupported fields: " + ", ".join(unsupported)
+                )
+            if not decisions:
+                raise ValueError("module Pack edit requires at least one decision field")
+            request = {
+                "operation": "edit_module_pack",
+                "job_id": job.id,
+                "expected_revision": revision,
+                "decisions": decisions,
+                "note": str(data.get("note") or "").strip(),
+            }
+            scope = f"module-draft-edit:{campaign_id}:{job.id}:{principal_id}"
+            replay = replay_response(scope, key, request)
+            if replay is not None:
+                return replay
+            prior = dict(job.result or {})
+            draft = {**dict(prior.get("pack_draft") or {}), **decisions}
+            history = [
+                *list(prior.get("pack_edit_history") or []),
+                {
+                    "revision": job.revision + 1,
+                    "editor": principal_id,
+                    "note": request["note"],
+                    "fields": sorted(decisions),
+                },
+            ]
+            updated = import_jobs.record_result(
+                job.id,
+                {**prior, "pack_draft": draft, "pack_edit_history": history},
+                state="imported",
+                module_id=job.module_id,
+                expected_revision=revision,
+                idempotency_key=key,
+                idempotency_write=IdempotencyWrite(
+                    scope=scope,
+                    payload=request,
+                    response=lambda value: {
+                        "job": import_job_view(value),
+                        "pack_draft": deepcopy(draft),
+                    },
+                ),
+            )
+            return {"job": import_job_view(updated), "pack_draft": draft}
+
+        if action != "finalize":
+            raise ValueError(f"unsupported module_draft action: {action}")
+        saved = dict(dict(job.result or {}).get("pack_draft") or {})
+        final_data = {**saved, **{key: deepcopy(value) for key, value in data.items()}}
+        confirmation = final_data.get("confirmation")
+        if not isinstance(confirmation, dict) or set(confirmation) != {"confirmed", "note"}:
+            raise ValueError("module draft confirmation requires exactly confirmed and note")
+        note = str(confirmation.get("note") or "").strip()
+        if confirmation.get("confirmed") is not True or not note or len(note) > 2000:
+            raise ValueError("the Agent must explicitly confirm finalization with a note")
+        request = {
+            "operation": "finalize_module_draft",
+            "job_id": job.id,
+            "expected_revision": revision,
+            **{key: value for key, value in final_data.items()},
+        }
+        scope = f"module-draft-finalize:{campaign_id}:{job.id}:{principal_id}"
+        replay = replay_response(scope, key, request)
+        if replay is not None:
+            return replay
+        if job.state != "imported" or not job.module_id:
+            raise ValueError("module draft must complete mechanical import before finalization")
+        metadata = {
+            **dict(final_data.get("metadata") or {}),
+            "agent_finalization": {"confirmed": True, "reviewer": principal_id, "note": note},
+            "authoring_review": {
+                "schema_version": 1,
+                "draft_kind": "module",
+                "draft_revision": job.revision,
+                "package_edit_history": deepcopy(
+                    dict(job.result or {}).get("pack_edit_history") or []
+                ),
+            },
+        }
+        package_id = str(final_data.get("package_id") or final_data.get("id") or "").strip()
+        if not package_id:
+            raise ValueError("data.package_id is required")
+        archive_blobs: dict[str, bytes] = {}
+        descriptor = modules.export_content_descriptor(
+            campaign_id,
+            job.module_id,
+            package_id=package_id,
+            version=str(final_data.get("version") or "1.0.0"),
+            metadata=metadata,
+            dependencies=list(final_data.get("dependencies") or []),
+            manifest=dict(final_data.get("manifest") or {}),
+            catalogs=dict(final_data.get("catalogs") or {}),
+            narrative=dict(final_data.get("narrative") or {}),
+            asset_loader=storage.read_managed_asset,
+            blob_sink=lambda checksum, content: archive_blobs.__setitem__(checksum, content),
+        )
+        package, blobs = build_module_content_package(descriptor, archive_blobs)
+        stored = storage.write_content_archive(package, blobs)
+        finalized = {
+            "artifact": stored["artifact"],
+            "summary": {
+                "id": package["id"],
+                "version": package["version"],
+                "checksum": package["checksum"],
+                "scenes": len(package["content"]["scene_atlas"]),
+                "actors": len(package["actors"]),
+                "assets": len(package["assets"]),
+            },
+            "confirmation": metadata["agent_finalization"],
+        }
+        public_finalized = {
+            **finalized,
+            **({"package": package} if final_data.get("include_package") is True else {}),
+        }
+        updated = import_jobs.record_result(
+            job.id,
+            {**dict(job.result or {}), "finalized_package": finalized},
+            state="compiled",
+            module_id=job.module_id,
+            expected_revision=revision,
+            idempotency_key=key,
+            idempotency_write=IdempotencyWrite(
+                scope=scope,
+                payload=request,
+                response=lambda value: {"job": import_job_view(value), **public_finalized},
+            ),
+        )
+        return {"job": import_job_view(updated), **public_finalized}
+
+    @mcp.tool()
+    def content_pack(
+        action: Literal["list", "get", "import", "export", "activate", "remove"],
+        campaign_id: str,
+        data: dict[str, Any] | None = None,
+        expected_revision: int | None = None,
+        idempotency_key: str | None = None,
+        principal_id: str = "system:local",
+    ) -> dict[str, Any]:
+        """Inspect and manage finalized CoC Module Pack archives."""
+
+        require_dm(campaign_id, principal_id)
+        data = dict(data or {})
+        if action not in {"list", "get"}:
+            require_lobby(campaign_id, f"content_pack({action})")
+        if action == "list":
+            return {
+                "packs": [
+                    item
+                    for item in modules.list(campaign_id, include_retired=True)
+                    if str(item.get("parser_profile") or "") == "content-package"
+                ],
+                "finalized_drafts": [
+                    import_job_handle(item)
+                    for item in import_jobs.list(campaign_id, kind="module")
+                    if dict(item.result or {}).get("finalized_package")
+                ],
+            }
+        if action == "get":
+            choices = [name for name in ("artifact", "source_path") if data.get(name)]
+            if choices:
+                if len(choices) != 1:
+                    raise ValueError("provide exactly one of data.artifact or data.source_path")
+                package, _blobs = storage.read_content_archive(
+                    artifact=(str(data["artifact"]) if choices[0] == "artifact" else None),
+                    source_path=(data["source_path"] if choices[0] == "source_path" else None),
+                )
+                return {"package": validate_coc_content_package(package)}
+            module_id = str(data.get("module_id") or "").strip()
+            if not module_id:
+                raise ValueError("data.module_id is required")
+            package, _blobs, artifact = module_archive(campaign_id, module_id)
+            return {
+                "module": next(
+                    item
+                    for item in modules.list(campaign_id, include_retired=True)
+                    if str(item.get("id") or item.get("module_id") or "") == module_id
+                ),
+                "artifact": artifact,
+                **({"package": package} if data.get("include_package") is True else {}),
+            }
+        if action == "export":
+            module_id = str(data.get("module_id") or "").strip()
+            if not module_id:
+                raise ValueError("data.module_id is required")
+            package, _blobs, artifact = module_archive(campaign_id, module_id)
+            return {
+                **artifact,
+                "summary": {
+                    "id": package["id"],
+                    "version": package["version"],
+                    "scenes": len(package["content"]["scene_atlas"]),
+                    "actors": len(package["actors"]),
+                    "assets": len(package["assets"]),
+                },
+                **({"package": package} if data.get("include_package") is True else {}),
+            }
+
+        revision, key = require_write_contract(expected_revision, idempotency_key)
+        campaign = campaigns.get(campaign_id)
+        if campaign.revision != revision:
+            raise ValueError(
+                f"campaign revision conflict: expected {revision}, found {campaign.revision}"
+            )
+        if action == "import":
+            choices = [name for name in ("artifact", "source_path") if data.get(name)]
+            if len(choices) != 1:
+                raise ValueError("provide exactly one of data.artifact or data.source_path")
+            request = {
+                "operation": "import_content_pack",
+                "artifact": str(data.get("artifact") or ""),
+                "source_path": str(data.get("source_path") or ""),
+                "expected_revision": revision,
+            }
+            scope = f"content-pack-import:{campaign_id}:{principal_id}"
+            replay = replay_response(scope, key, request)
+            if replay is not None:
+                return replay
+            package, blobs = storage.read_content_archive(
+                artifact=(str(data["artifact"]) if choices[0] == "artifact" else None),
+                source_path=(data["source_path"] if choices[0] == "source_path" else None),
+            )
+            package = validate_coc_content_package(package)
+            if package["kind"] != "module" or package["system_id"] != "coc7e":
+                raise ValueError("content package must be a coc7e module")
+            managed = storage.write_content_archive(package, blobs)
+            imported = modules.import_content_package(
+                campaign_id,
+                package,
+                blobs,
+                activate=False,
+                asset_writer=storage.store_content_module_asset,
+            )
+            modules.register_asset(
+                campaign_id=campaign_id,
+                module_id=str(imported["module_id"]),
+                source_path=str((config.content_packages_dir / managed["artifact"]).resolve()),
+                media_type="application/vnd.sagasmith.content-package+zip",
+                checksum=str(managed["archive_checksum"]),
+                metadata={
+                    "asset_kind": "content_package_archive",
+                    "content_package_id": package["id"],
+                    "content_package_version": package["version"],
+                    "content_package_checksum": package["checksum"],
+                    "content_archive_artifact": managed["artifact"],
+                },
+            )
+            actor_map: dict[str, str] = {}
+            binding_ids: list[str] = []
+            module_key = str(package["sources"][0]["source_key"])
+            for actor in package["actors"]:
+                bindings = list(actor.get("bindings") or [])
+                preset = any(
+                    str(binding.get("binding_kind") or "") == "preset_pc" for binding in bindings
+                )
+                character = characters.import_content_actor(
+                    actor,
+                    campaign_id=None if preset else campaign_id,
+                    principal_id=principal_id,
+                    idempotency_key=f"{key}:actor:{actor['id']}",
+                )
+                actor_map[str(actor["id"])] = character.id
+                effective = bindings or [
+                    {
+                        "kind": "module",
+                        "module_key": module_key,
+                        "binding_kind": "preset_pc" if preset else "cast",
+                        "role": "",
+                    }
+                ]
+                for binding in effective:
+                    scene_key = str(binding.get("scene_key") or "")
+                    saved = modules.bind_actor(
+                        campaign_id=campaign_id,
+                        module_id=str(imported["module_id"]),
+                        character_id=character.id,
+                        actor_card_id=str(actor["id"]),
+                        binding_kind=str(binding.get("binding_kind") or "cast"),
+                        role=str(binding.get("role") or ""),
+                        scene_id=(str(imported["scene_map"][scene_key]) if scene_key else None),
+                        metadata={
+                            **dict(binding.get("metadata") or {}),
+                            "content_package_checksum": package["checksum"],
+                            "content_actor_version": actor["version"],
+                            "content_actor_provenance": deepcopy(actor.get("provenance") or {}),
+                        },
+                    )
+                    binding_ids.append(str(saved["id"]))
+            response = {
+                **{key: value for key, value in imported.items() if key != "actors"},
+                "actor_map": actor_map,
+                "actor_binding_ids": binding_ids,
+                "artifact": managed,
+                "activated": False,
+            }
+            return remember_response(scope, key, request, response, campaign_id=campaign_id)
+
+        module_id = str(data.get("module_id") or "").strip()
+        if not module_id:
+            raise ValueError("data.module_id is required")
+        module = next(
+            (
+                item
+                for item in modules.list(campaign_id, include_retired=True)
+                if str(item.get("id") or item.get("module_id") or "") == module_id
+            ),
+            None,
+        )
+        if module is None:
+            raise LookupError(module_id)
+        if str(module.get("parser_profile") or "") != "content-package":
+            raise ValueError("only a module imported from a finalized Pack may be managed here")
+        if action == "activate":
+            raw_remaps = data.get("progress_remaps") or []
+            if not isinstance(raw_remaps, list):
+                raise ValueError("data.progress_remaps must be an array")
+            scene_map = {
+                str(item.get("stable_key") or ""): str(item.get("scene_id") or "")
+                for item in modules.scene_index(campaign_id, module_id=module_id)
+            }
+            remap_targets: dict[str, str] = {}
+            rulings: list[dict[str, str]] = []
+            for index, raw in enumerate(raw_remaps):
+                if not isinstance(raw, dict) or set(raw) != {
+                    "from_scene_id",
+                    "to_scene_key",
+                    "reason",
+                }:
+                    raise ValueError(
+                        f"progress_remaps[{index}] requires exactly from_scene_id, "
+                        "to_scene_key, reason"
+                    )
+                source_id = str(raw["from_scene_id"]).strip()
+                target_key = str(raw["to_scene_key"]).strip()
+                reason = str(raw["reason"]).strip()
+                if not source_id or target_key not in scene_map or not reason or len(reason) > 1000:
+                    raise ValueError(f"progress_remaps[{index}] is not a valid Agent remap")
+                if source_id in remap_targets:
+                    raise ValueError("progress_remaps contains duplicate from_scene_id values")
+                remap_targets[source_id] = scene_map[target_key]
+                rulings.append(
+                    {
+                        "from_scene_id": source_id,
+                        "to_scene_key": target_key,
+                        "to_scene_id": scene_map[target_key],
+                        "reason": reason,
+                        "resolver": "agent",
+                    }
+                )
+            request = {
+                "operation": "activate_content_module",
+                "module_id": module_id,
+                "expected_revision": revision,
+                "progress_remaps": rulings,
+            }
+            scope = f"content-pack-activate:{campaign_id}:{principal_id}"
+            replay = replay_response(scope, key, request)
+            if replay is not None:
+                return replay
+            activation = modules.activate_candidate(
+                campaign_id,
+                module_id,
+                progress_remaps=remap_targets,
+                idempotency_key=key,
+                idempotency_write=IdempotencyWrite(
+                    scope=scope,
+                    payload=request,
+                    response=lambda value: {
+                        "activation": {
+                            **dict(value),
+                            "progress_remap_rulings": deepcopy(rulings),
+                        }
+                    },
+                ),
+            )
+            return {
+                "activation": {
+                    **dict(activation),
+                    "progress_remap_rulings": rulings,
+                }
+            }
+        if action == "remove":
+            if bool(module.get("active")):
+                raise ValueError("deactivate or replace the active module before removal")
+            request = {
+                "operation": "remove_content_module",
+                "module_id": module_id,
+                "expected_revision": revision,
+            }
+            scope = f"content-pack-remove:{campaign_id}:{principal_id}"
+            replay = replay_response(scope, key, request)
+            if replay is not None:
+                return replay
+            modules.delete(campaign_id, module_id)
+            return remember_response(
+                scope,
+                key,
+                request,
+                {"module_id": module_id, "removed": True},
+                campaign_id=campaign_id,
+            )
+        raise ValueError(f"unsupported content_pack action: {action}")
 
     @mcp.tool()
     def module_query(
@@ -559,28 +1378,12 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
 
     @mcp.tool()
     def module_change(
-        action: Literal["import", "set_progress"],
+        action: Literal["set_progress"],
         campaign_id: str,
         data: dict[str, Any],
         principal_id: str = "system:local",
     ) -> dict[str, Any]:
         require_dm(campaign_id, principal_id)
-        if action == "import":
-            content = str(data.get("content") or "")
-            title = str(data.get("title") or "").strip()
-            source_key = str(data.get("source_key") or "").strip()
-            if not all((content, title, source_key)):
-                raise ValueError("data.content, data.title and data.source_key are required")
-            artifact = storage.write_module(source_key, content)
-            result = modules.ingest(
-                campaign_id=campaign_id,
-                source_key=source_key,
-                title=title,
-                content=content,
-                parser=parser,
-                source_path=str(artifact),
-            )
-            return asdict(result)
         scene_id = str(data.get("scene_id") or "")
         if not scene_id:
             raise ValueError("data.scene_id is required")

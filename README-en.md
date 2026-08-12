@@ -2,11 +2,37 @@
 
 [中文](README.md) · [English](README-en.md) · [Platform overview](https://github.com/SagaSmithAI/.github/blob/main/profile/README.md)
 
-The local MCP boundary for SagaSmithAI's Call of Cthulhu 7e stack. It combines campaign persistence, branch-aware memory, per-actor knowledge, snapshots and scenario indexes from `sagasmith-core` with the d100, sanity, combat and chase resolvers from `sagasmith-coc`.
+The local authoritative MCP server for SagaSmithAI's Call of Cthulhu 7e stack. It combines campaign persistence, branch-aware memory, per-actor knowledge, snapshots, module retrieval, and unified Content Packs from `sagasmith-core` with CoC d100, sanity, combat, chase, and replayable random-stream mechanics from `sagasmith-coc`.
 
-Its progressive exposure manager is server-owned and session-scoped. Every MCP client gets an independent Lobby, Play or Combat capability set. Exposure is bound to a principal and campaign, while explicit actor grants protect private investigator and NPC state.
+## Runtime boundary
 
-Resolution and mutation are intentionally separate: `coc_resolve` returns a rules result, and a subsequent explicit write updates SAN, HP or another character field. Player-facing module queries reveal only `visibility=player` scenes.
+- MCP owns campaign state, authorization, revisions, idempotency, random-stream receipts, and atomic random resolution.
+- Each MCP session owns an independent native tool exposure. Lobby, Play, and Combat policies are enforced again at call time.
+- Hosts must refresh native schemas after `tools/list_changed`. There is no fixed-superset, text imitation, or `exposure_call` fallback.
+- The Agent owns source interpretation and scenario-specific semantic decisions. Finalized Pack decisions retain source evidence.
+
+The native capability flow is:
+
+```text
+exposure(open) -> exposure(search) -> exposure(set) -> native domain tool
+```
+
+## Module Pack authoring
+
+CoC scenarios use the unified `sagasmith.content-package` schema version 2 lifecycle:
+
+```text
+module_draft(start)
+  -> module_draft(evidence)
+  -> module_draft(edit, operation="package")
+  -> module_draft(finalize)
+  -> content_pack(import)
+  -> content_pack(activate)
+```
+
+`start` accepts either an allowlisted PDF/Markdown/text `source_path` or generated `name` plus `content`. Mechanical import creates an inactive draft. Pack profile and catalog decisions must use the exact source receipts returned by `evidence`. Finalization requires an explicit Agent confirmation and writes an immutable `.sagasmith-pack` archive. Only a module re-imported from that finalized archive may be activated.
+
+Commercial rulebooks and scenarios remain local. Configure allowed source roots with `SAGASMITH_COC_MCP_MODULE_IMPORT_ROOTS`, separated by the platform path separator. Source books and extracted assets are never bundled in this repository.
 
 ## Run
 
@@ -17,9 +43,13 @@ pip install -e .
 sagasmith-coc-mcp
 ```
 
-State defaults to `.sagasmith-coc-mcp/`. Configure `SAGASMITH_COC_MCP_HOME`, `SAGASMITH_COC_SKILLS_DIR`, and `SAGASMITH_MODULEGEN_SKILLS_DIR` when embedding the server in another Agent runtime.
+State defaults to `.sagasmith-coc-mcp/`. The main configuration variables are:
 
-The capability flow is `exposure(open) → exposure(search) → exposure(set) → native domain tool`. Hosts must refresh native tool schemas; there is no fixed-superset, text imitation, or `exposure_call` fallback. `coc_dice_roll`, `coc_check`, and random `coc_resolve` operations atomically commit the campaign random-stream position, receipt, revision, and idempotent replay response.
+- `SAGASMITH_COC_MCP_HOME`
+- `SAGASMITH_COC_MCP_MODULE_IMPORT_ROOTS`
+- `SAGASMITH_COC_SKILLS_DIR`
+- `SAGASMITH_MODULEGEN_SKILLS_DIR`
+- `SAGASMITH_COC_MCP_BOUND_PRINCIPAL_ID`
 
 ## Development
 
@@ -29,4 +59,4 @@ pytest
 ruff check .
 ```
 
-Original code is licensed under Apache-2.0. Commercial Call of Cthulhu books and scenarios are not distributed by this repository.
+Original code is licensed under Apache-2.0. Call of Cthulhu and related commercial content remain the property of their respective rights holders.
