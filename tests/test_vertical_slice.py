@@ -2387,6 +2387,33 @@ def test_stdio_client_can_discover_load_and_call(tmp_path) -> None:
                     {"action": "open", "campaign_id": campaign_id},
                 )
                 assert not rebound.isError
+                listed_skills = await session.call_tool(
+                    "skill_query",
+                    {"action": "list", "campaign_id": campaign_id},
+                )
+                assert not listed_skills.isError
+                skill_ids = {
+                    item["id"]
+                    for item in json.loads(listed_skills.content[0].text)["skills"]
+                }
+                assert {
+                    "coc.full",
+                    "coc.full.skills.coc7-keeper",
+                    "coc.full.skills.coc7-campaign-manager",
+                    "modulegen.root",
+                } <= skill_ids
+                loaded_skill = await session.call_tool(
+                    "skill_query",
+                    {
+                        "action": "read",
+                        "campaign_id": campaign_id,
+                        "skill_id": "coc.full",
+                    },
+                )
+                assert not loaded_skill.isError
+                skill_content = json.loads(loaded_skill.content[0].text)["content"]
+                assert "sagasmith_coc MCP" in skill_content
+                assert "sagasmith-coc --json" not in skill_content
                 found = await session.call_tool(
                     "exposure",
                     {"action": "search", "query": "module draft"},
