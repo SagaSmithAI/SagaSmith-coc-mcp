@@ -9,6 +9,8 @@ from pathlib import Path
 import pytest
 from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
+from pypdf import PdfWriter
+from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 
 from sagasmith_coc_mcp.config import McpConfig
 from sagasmith_coc_mcp.exposure import ExposureError, ExposureRegistry
@@ -21,6 +23,36 @@ async def call(server, name: str, arguments: dict):
     if hasattr(result, "model_dump"):
         result = result.model_dump()
     return result.get("result", result) if isinstance(result, dict) else result
+
+
+def write_text_pdf(path: Path, lines: list[str]) -> None:
+    """Write a small extractable PDF without adding a test-only runtime dependency."""
+
+    writer = PdfWriter()
+    page = writer.add_blank_page(width=400, height=300)
+    font = DictionaryObject(
+        {
+            NameObject("/Type"): NameObject("/Font"),
+            NameObject("/Subtype"): NameObject("/Type1"),
+            NameObject("/BaseFont"): NameObject("/Helvetica"),
+        }
+    )
+    font_ref = writer._add_object(font)
+    page[NameObject("/Resources")] = DictionaryObject(
+        {NameObject("/Font"): DictionaryObject({NameObject("/F1"): font_ref})}
+    )
+    commands = ["BT /F1 12 Tf 20 260 Td"]
+    for index, line in enumerate(lines):
+        escaped = line.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+        if index:
+            commands.append("0 -20 Td")
+        commands.append(f"({escaped}) Tj")
+    commands.append("ET")
+    content = DecodedStreamObject()
+    content.set_data(" ".join(commands).encode("latin-1"))
+    page[NameObject("/Contents")] = writer._add_object(content)
+    with path.open("wb") as stream:
+        writer.write(stream)
 
 
 def synthetic_pack_decisions(receipt: dict, *, title: str = "Synthetic Case") -> dict:
@@ -609,6 +641,281 @@ def test_module_source_path_must_be_inside_configured_import_roots(tmp_path) -> 
                     "campaign_id": campaign["id"],
                     "data": {"source_path": str(outside_source)},
                     "idempotency_key": "outside-source",
+                },
+            )
+
+    asyncio.run(exercise())
+
+
+def test_module_draft_content_asset_and_actor_edits_enter_final_pack(tmp_path) -> None:
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    handout = allowed / "handout.txt"
+    handout.write_text("The lantern bears the Marsh family mark.", encoding="utf-8")
+    config = McpConfig(
+        home=tmp_path / "home",
+        database_url=None,
+        coc_skills_dir=tmp_path / "coc",
+        modulegen_skills_dir=tmp_path / "modulegen",
+        module_import_roots=(allowed,),
+    )
+    server = create_server(config)
+
+    async def exercise() -> None:
+        campaign = await call(
+            server,
+            "campaign_change",
+            {
+                "action": "create",
+                "data": {"name": "Draft edits", "idempotency_key": "edits-campaign"},
+            },
+        )
+        npc = await call(
+            server,
+            "character_change",
+            {
+                "action": "create",
+                "campaign_id": campaign["id"],
+                "data": {
+                    "name": "Mr Marsh",
+                    "character_type": "npc",
+                    "sheet": {"pow": 55},
+                },
+            },
+        )
+        draft = await call(
+            server,
+            "module_draft",
+            {
+                "action": "start",
+                "campaign_id": campaign["id"],
+                "data": {
+                    "name": "marsh-case.md",
+                    "title": "The Marsh Case",
+                    "content": (
+                        "# The Marsh Case\n## Study\nOne to four investigators search the "
+                        "1920s study. The lantern bears a family mark.\n"
+                        "## Ending\nThe investigators resolve the case."
+                    ),
+                },
+                "idempotency_key": "edits-start",
+            },
+        )
+        evidence = await call(
+            server,
+            "module_draft",
+            {
+                "action": "evidence",
+                "campaign_id": campaign["id"],
+                "data": {"job_id": draft["job_id"], "query": "lantern"},
+            },
+        )
+        chunk = evidence["evidence"][0]
+        content_args = {
+            "action": "edit",
+            "campaign_id": campaign["id"],
+            "data": {
+                "job_id": draft["job_id"],
+                "operation": "content",
+                "scene_id": chunk["scene_id"],
+                "content_key": "clue:lantern-mark",
+                "content_kind": "clue",
+                "normalized_content": "The lantern bears the Marsh family mark.",
+                "source_chunk_ids": [chunk["id"]],
+                "observation": "Transcribed the clue from the source chunk.",
+            },
+            "expected_revision": draft["job"]["revision"],
+            "idempotency_key": "edits-content",
+        }
+        content_edit = await call(server, "module_draft", content_args)
+        assert await call(server, "module_draft", content_args) == content_edit
+        asset_args = {
+            "action": "edit",
+            "campaign_id": campaign["id"],
+            "data": {
+                "job_id": draft["job_id"],
+                "operation": "asset",
+                "source_path": str(handout),
+                "asset_kind": "handout",
+                "scene_id": chunk["scene_id"],
+                "title": "Lantern Mark",
+            },
+            "expected_revision": content_edit["job"]["revision"],
+            "idempotency_key": "edits-asset",
+        }
+        asset_edit = await call(server, "module_draft", asset_args)
+        assert await call(server, "module_draft", asset_args) == asset_edit
+        actor_args = {
+            "action": "edit",
+            "campaign_id": campaign["id"],
+            "data": {
+                "job_id": draft["job_id"],
+                "operation": "actor",
+                "character_id": npc["id"],
+                "actor_card_id": "coc7e.actor.mr-marsh",
+                "binding_kind": "cast",
+                "role": "witness",
+                "scene_id": chunk["scene_id"],
+            },
+            "expected_revision": asset_edit["job"]["revision"],
+            "idempotency_key": "edits-actor",
+        }
+        actor_edit = await call(server, "module_draft", actor_args)
+        assert await call(server, "module_draft", actor_args) == actor_edit
+        package_edit = await call(
+            server,
+            "module_draft",
+            {
+                "action": "edit",
+                "campaign_id": campaign["id"],
+                "data": {
+                    "job_id": draft["job_id"],
+                    "operation": "package",
+                    **synthetic_pack_decisions(chunk["source_ref"], title="The Marsh Case"),
+                },
+                "expected_revision": actor_edit["job"]["revision"],
+                "idempotency_key": "edits-package",
+            },
+        )
+        finalized = await call(
+            server,
+            "module_draft",
+            {
+                "action": "finalize",
+                "campaign_id": campaign["id"],
+                "data": {
+                    "job_id": draft["job_id"],
+                    "package_id": "coc7e.module.marsh-case",
+                    "include_package": True,
+                    "confirmation": {
+                        "confirmed": True,
+                        "note": "Reviewed content, handout, cast, profile, and ending.",
+                    },
+                },
+                "expected_revision": package_edit["job"]["revision"],
+                "idempotency_key": "edits-finalize",
+            },
+        )
+        package = finalized["package"]
+        assert [actor["id"] for actor in package["actors"]] == ["coc7e.actor.mr-marsh"]
+        assert package["content_reviews"][0]["kind"] == "clue"
+        assert any(asset["kind"] == "handout" for asset in package["assets"])
+        stored = await call(
+            server,
+            "module_draft",
+            {
+                "action": "evidence",
+                "campaign_id": campaign["id"],
+                "data": {"job_id": draft["job_id"], "kind": "reviews"},
+            },
+        )
+        assert stored["reviews"][0]["content_key"] == "clue:lantern-mark"
+
+    asyncio.run(exercise())
+
+
+def test_pdf_page_evidence_and_source_text_revision_are_checksum_bound(tmp_path) -> None:
+    imports = tmp_path / "imports"
+    imports.mkdir()
+    source = imports / "review.pdf"
+    write_text_pdf(
+        source,
+        [
+            "# Lantern Case",
+            "## Sceen",
+            "One investigator finds a clue in the 1920s study.",
+            "## Ending",
+            "The case is resolved.",
+        ],
+    )
+    config = McpConfig(
+        home=tmp_path / "home",
+        database_url=None,
+        coc_skills_dir=tmp_path / "coc",
+        modulegen_skills_dir=tmp_path / "modulegen",
+        module_import_roots=(imports,),
+    )
+    server = create_server(config)
+
+    async def exercise() -> None:
+        campaign = await call(
+            server,
+            "campaign_change",
+            {
+                "action": "create",
+                "data": {"name": "PDF review", "idempotency_key": "pdf-campaign"},
+            },
+        )
+        draft = await call(
+            server,
+            "module_draft",
+            {
+                "action": "start",
+                "campaign_id": campaign["id"],
+                "data": {"source_path": str(source)},
+                "idempotency_key": "pdf-start",
+            },
+        )
+        page = await call(
+            server,
+            "module_draft",
+            {
+                "action": "evidence",
+                "campaign_id": campaign["id"],
+                "data": {
+                    "job_id": draft["job_id"],
+                    "kind": "page",
+                    "page_number": 1,
+                    "scale": 1.0,
+                },
+            },
+        )
+        assert page["source_checksum"] == draft["job"]["artifact_checksum"]
+        assert Path(page["image"]["managed_path"]).read_bytes().startswith(b"\x89PNG")
+        assert "Sceen" in page["normalized"]["text"]
+        review_args = {
+            "action": "edit",
+            "campaign_id": campaign["id"],
+            "data": {
+                "job_id": draft["job_id"],
+                "operation": "source_text",
+                "page_number": 1,
+                "base_text_sha256": page["normalized"]["text_sha256"],
+                "replacements": [{"old": "Sceen", "new": "Scene"}],
+                "rationale": "Correct a bounded heading transcription typo.",
+                "evidence_basis": "agent_context",
+                "review_method": "agent",
+            },
+            "expected_revision": draft["job"]["revision"],
+            "idempotency_key": "pdf-source-review",
+        }
+        reviewed = await call(server, "module_draft", review_args)
+        assert await call(server, "module_draft", review_args) == reviewed
+        assert reviewed["review"]["source_checksum"] == page["source_checksum"]
+        assert reviewed["module_id"] != draft["module_id"]
+        corrected = await call(
+            server,
+            "module_draft",
+            {
+                "action": "evidence",
+                "campaign_id": campaign["id"],
+                "data": {"job_id": draft["job_id"], "query": "Scene"},
+            },
+        )
+        assert corrected["evidence"]
+        assert any("Scene" in item["content"] for item in corrected["evidence"])
+        with pytest.raises(Exception, match="base_text_sha256"):
+            await call(
+                server,
+                "module_draft",
+                {
+                    **review_args,
+                    "data": {
+                        **review_args["data"],
+                        "base_text_sha256": "0" * 64,
+                    },
+                    "expected_revision": reviewed["job"]["revision"],
+                    "idempotency_key": "pdf-forged-base",
                 },
             )
 

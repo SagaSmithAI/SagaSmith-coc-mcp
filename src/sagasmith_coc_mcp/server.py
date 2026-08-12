@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import re
 from copy import deepcopy
 from dataclasses import asdict
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Literal
 from uuid import uuid4
@@ -43,7 +46,12 @@ from sagasmith_core import (
     ModuleService,
     SnapshotService,
     StateMutationService,
+    apply_document_page_revisions,
     default_local_principal,
+    extract_pdf_page_text,
+    normalize_document,
+    normalized_document_page_text,
+    render_pdf_page,
 )
 from sagasmith_core.access import LOCAL_SYSTEM_PRINCIPAL_ID
 from sagasmith_core.modules import MarkdownModuleParser
@@ -322,6 +330,12 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
         if job.campaign_id != campaign_id or job.kind != "module":
             raise LookupError(job_id)
         return job
+
+    def import_page_revisions(job: Any) -> list[dict[str, Any]]:
+        revisions = dict(job.inspection or {}).get("page_revisions", [])
+        if not isinstance(revisions, list):
+            raise RuntimeError("module inspection page_revisions must be an array")
+        return [deepcopy(dict(item)) for item in revisions if isinstance(item, dict)]
 
     def replay_response(scope: str, key: str, payload: dict[str, Any]) -> dict[str, Any] | None:
         replay = idempotency.lookup(scope, key, payload)
@@ -866,7 +880,120 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
         job = require_module_job(campaign_id, job_id)
         if action == "evidence":
             if not job.module_id:
-                raise ValueError("chunk evidence requires a mechanically imported draft")
+                raise ValueError("module evidence requires a mechanically imported draft")
+            evidence_kind = str(
+                data.get("kind") or ("page" if data.get("page_number") else "chunks")
+            )
+            if evidence_kind == "page":
+                page_number = data.get("page_number")
+                if (
+                    isinstance(page_number, bool)
+                    or not isinstance(page_number, int)
+                    or page_number < 1
+                ):
+                    raise ValueError("data.page_number must be a positive integer")
+                source = storage.artifact_module_path(job.artifact)
+                if source.suffix.casefold() != ".pdf":
+                    raise ValueError("page evidence requires a staged PDF")
+                scale = float(data.get("scale", 1.5))
+                rendered = render_pdf_page(source, page_number, scale=scale)
+                if rendered.source_checksum != job.artifact_checksum:
+                    raise RuntimeError("rendered PDF no longer matches the staged checksum")
+                document = normalize_document(
+                    source,
+                    cache_dir=config.normalized_modules_dir,
+                    expected_checksum=job.artifact_checksum,
+                )
+                document = apply_document_page_revisions(document, import_page_revisions(job))
+                normalized_text = normalized_document_page_text(document, page_number)
+                native_text = extract_pdf_page_text(source, page_number)
+                target = storage.store_rendered_module_page(
+                    module_id=job.module_id,
+                    source_checksum=rendered.source_checksum,
+                    page_number=rendered.page_number,
+                    scale=rendered.scale,
+                    checksum=rendered.checksum,
+                    content=rendered.content,
+                )
+                asset = modules.register_asset(
+                    campaign_id=campaign_id,
+                    module_id=job.module_id,
+                    source_path=str(target),
+                    media_type=rendered.media_type,
+                    checksum=rendered.checksum,
+                    metadata={
+                        "kind": "rendered_page",
+                        "asset_kind": "rendered_page",
+                        "source_checksum": rendered.source_checksum,
+                        "source_page": rendered.page_number,
+                        "page_count": rendered.page_count,
+                        "width": rendered.width,
+                        "height": rendered.height,
+                        "scale": rendered.scale,
+                    },
+                )
+                page_receipts = []
+                source_key = str(dict(job.payload or {}).get("source_key") or job.artifact)
+                for item in modules.list_chunks(campaign_id, job.module_id):
+                    page_start = item.get("page_start")
+                    page_end = item.get("page_end")
+                    if (
+                        isinstance(page_start, int)
+                        and isinstance(page_end, int)
+                        and page_start <= page_number <= page_end
+                    ):
+                        page_receipts.append(
+                            {
+                                "chunk_id": item["id"],
+                                "source_ref": {
+                                    "source_key": source_key,
+                                    "page": page_number,
+                                    "chunk_hash": str(item.get("content_hash") or ""),
+                                    "note": "Agent-reviewed source evidence from rendered page",
+                                },
+                            }
+                        )
+                return {
+                    "campaign_id": campaign_id,
+                    "job_id": job.id,
+                    "module_id": job.module_id,
+                    "artifact": job.artifact,
+                    "source_checksum": rendered.source_checksum,
+                    "page_number": rendered.page_number,
+                    "page_count": rendered.page_count,
+                    "width": rendered.width,
+                    "height": rendered.height,
+                    "scale": rendered.scale,
+                    "image": {
+                        "asset_id": asset["id"],
+                        "managed_path": str(target),
+                        "media_type": rendered.media_type,
+                        "checksum": rendered.checksum,
+                    },
+                    "normalized": {
+                        "text": normalized_text[:50000],
+                        "text_sha256": hashlib.sha256(normalized_text.encode("utf-8")).hexdigest(),
+                        "truncated": len(normalized_text) > 50000,
+                    },
+                    "native_text": {
+                        "text": native_text[:50000],
+                        "text_sha256": hashlib.sha256(native_text.encode("utf-8")).hexdigest(),
+                        "truncated": len(native_text) > 50000,
+                    },
+                    "citation_candidates": page_receipts,
+                }
+            if evidence_kind not in {"chunks", "assets", "reviews"}:
+                raise ValueError("data.kind must be page, chunks, assets, or reviews")
+            if evidence_kind == "assets":
+                return {
+                    "job_id": job.id,
+                    "assets": modules.list_assets(campaign_id, job.module_id),
+                }
+            if evidence_kind == "reviews":
+                return {
+                    "job_id": job.id,
+                    "reviews": modules.list_content_reviews(campaign_id, job.module_id),
+                }
             chunks = modules.list_chunks(
                 campaign_id,
                 job.module_id,
@@ -920,46 +1047,531 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
 
         revision, key = require_write_contract(expected_revision, idempotency_key)
         if action == "edit":
+            operation = str(data.get("operation") or "").strip()
+            if operation == "source_text":
+                request = {
+                    "operation": "edit_module_source_text",
+                    "job_id": job.id,
+                    "expected_revision": revision,
+                    "data": {
+                        field: deepcopy(value)
+                        for field, value in data.items()
+                        if field not in {"job_id", "operation"}
+                    },
+                }
+                scope = f"module-draft-edit:{campaign_id}:{job.id}:{principal_id}"
+                replay = replay_response(scope, key, request)
+                if replay is not None:
+                    return replay
+                if dict(job.result or {}).get("finalized_package") or job.state == "compiled":
+                    raise ValueError("a finalized module draft is immutable")
+                inspect_scope = f"{scope}:source-text-inspect"
+                inspect_key = f"{key}:inspect"
+                inspected_replay = replay_response(inspect_scope, inspect_key, request)
+                if inspected_replay is None:
+                    if job.state not in {"imported", "failed"} or not job.module_id:
+                        raise ValueError(
+                            "source text review requires an imported or failed PDF draft"
+                        )
+                    if job.revision != revision:
+                        raise ValueError(
+                            f"import job revision conflict: expected {revision}, "
+                            f"found {job.revision}"
+                        )
+                    source = storage.artifact_module_path(job.artifact)
+                    if source.suffix.casefold() != ".pdf":
+                        raise ValueError("source_text review requires a staged PDF")
+                    page_number = data.get("page_number")
+                    if (
+                        isinstance(page_number, bool)
+                        or not isinstance(page_number, int)
+                        or page_number < 1
+                    ):
+                        raise ValueError("data.page_number must be a positive integer")
+                    rationale = str(data.get("rationale") or "").strip()
+                    if not 1 <= len(rationale) <= 2000:
+                        raise ValueError("data.rationale must contain 1 to 2000 characters")
+                    evidence_basis = str(data.get("evidence_basis") or "")
+                    if evidence_basis not in {"agent_context", "rendered_page"}:
+                        raise ValueError(
+                            "data.evidence_basis must be agent_context or rendered_page"
+                        )
+                    review_method = str(data.get("review_method") or "agent")
+                    if review_method not in {"agent", "human"}:
+                        raise ValueError("data.review_method must be agent or human")
+                    document = normalize_document(
+                        source,
+                        cache_dir=config.normalized_modules_dir,
+                        expected_checksum=job.artifact_checksum,
+                    )
+                    current_revisions = import_page_revisions(job)
+                    document = apply_document_page_revisions(document, current_revisions)
+                    page_text = normalized_document_page_text(document, page_number)
+                    base_checksum = hashlib.sha256(page_text.encode("utf-8")).hexdigest()
+                    if str(data.get("base_text_sha256") or "") != base_checksum:
+                        raise ValueError(
+                            "data.base_text_sha256 does not match the current normalized page"
+                        )
+                    raw_replacements = data.get("replacements")
+                    if (
+                        not isinstance(raw_replacements, list)
+                        or not 1 <= len(raw_replacements) <= 128
+                    ):
+                        raise ValueError("data.replacements must contain 1 to 128 entries")
+                    replacements: list[dict[str, str]] = []
+                    empty_recovery = (
+                        not page_text.strip()
+                        and len(raw_replacements) == 1
+                        and isinstance(raw_replacements[0], dict)
+                        and str(raw_replacements[0].get("old", "")) == ""
+                    )
+                    for index, raw in enumerate(raw_replacements):
+                        if not isinstance(raw, dict) or set(raw) != {"old", "new"}:
+                            raise ValueError(
+                                f"data.replacements[{index}] must contain exactly old and new"
+                            )
+                        old = str(raw["old"])
+                        new = str(raw["new"])
+                        maximum_new = 50000 if empty_recovery else 500
+                        if (
+                            (not old and not empty_recovery)
+                            or not new
+                            or old == new
+                            or len(old) > 500
+                            or len(new) > maximum_new
+                        ):
+                            raise ValueError(f"data.replacements[{index}] is invalid")
+                        if not empty_recovery and page_text.count(old) != 1:
+                            raise ValueError(
+                                f"data.replacements[{index}].old must match exactly once"
+                            )
+                        if evidence_basis == "agent_context":
+                            if re.findall(r"\d+", old) != re.findall(r"\d+", new):
+                                raise ValueError(
+                                    "agent_context transcription repair cannot alter numbers"
+                                )
+                            old_key = re.sub(r"\s+", "", old).casefold()
+                            new_key = re.sub(r"\s+", "", new).casefold()
+                            if (
+                                not old_key
+                                or not new_key
+                                or SequenceMatcher(None, old_key, new_key).ratio() < 0.8
+                            ):
+                                raise ValueError(
+                                    "agent_context repair exceeds the bounded text correction"
+                                )
+                        replacements.append({"old": old, "new": new})
+                    evidence: dict[str, Any] = {
+                        "basis": evidence_basis,
+                        "normalized_text_sha256": base_checksum,
+                        "native_text_sha256": hashlib.sha256(
+                            extract_pdf_page_text(source, page_number).encode("utf-8")
+                        ).hexdigest(),
+                    }
+                    if evidence_basis == "rendered_page":
+                        scale = float(data.get("scale", 1.5))
+                        rendered = render_pdf_page(source, page_number, scale=scale)
+                        if data.get("rendered_image_checksum") != rendered.checksum:
+                            raise ValueError(
+                                "data.rendered_image_checksum does not match rendered evidence"
+                            )
+                        evidence["rendered_image_checksum"] = rendered.checksum
+                        evidence["render_scale"] = rendered.scale
+                    source_revision = {
+                        "source_checksum": job.artifact_checksum,
+                        "page_number": page_number,
+                        "base_text_sha256": base_checksum,
+                        "replacements": replacements,
+                        "reviewer": principal_id,
+                        "review_method": review_method,
+                        "rationale": rationale,
+                        "evidence": evidence,
+                    }
+                    page_revisions = [*current_revisions, source_revision]
+                    inspection = modules.preview_path(
+                        source,
+                        parser=parser,
+                        document_cache_dir=config.normalized_modules_dir,
+                        expected_checksum=job.artifact_checksum,
+                        page_revisions=page_revisions,
+                    )
+                    inspection["page_revisions"] = deepcopy(page_revisions)
+                    job = import_jobs.record_inspection(
+                        job.id,
+                        inspection,
+                        expected_revision=revision,
+                        idempotency_key=inspect_key,
+                        idempotency_write=IdempotencyWrite(
+                            scope=inspect_scope,
+                            payload=request,
+                            response=lambda value: {"job_id": value.id},
+                        ),
+                    )
+                else:
+                    job = require_module_job(campaign_id, str(inspected_replay["job_id"]))
+                    inspection = deepcopy(job.inspection)
+                    page_revisions = import_page_revisions(job)
+                    source_revision = deepcopy(page_revisions[-1])
+
+                validation = {
+                    "valid": bool(inspection.get("valid", not inspection.get("errors"))),
+                    "errors": list(inspection.get("errors") or []),
+                    "warnings": list(inspection.get("warnings") or []),
+                }
+                validate_scope = f"{scope}:source-text-validate"
+                validate_key = f"{key}:validate"
+                validated_replay = replay_response(validate_scope, validate_key, request)
+                if validated_replay is None:
+                    if not validation["valid"]:
+                        failed = import_jobs.record_validation(
+                            job.id,
+                            validation,
+                            state="failed",
+                            expected_revision=job.revision,
+                            idempotency_key=key,
+                            idempotency_write=IdempotencyWrite(
+                                scope=scope,
+                                payload=request,
+                                response=lambda value: {
+                                    "job": import_job_view(value),
+                                    "review": deepcopy(source_revision),
+                                    "inspection": deepcopy(inspection),
+                                    "validation": deepcopy(validation),
+                                    "status": "needs_repair",
+                                },
+                            ),
+                        )
+                        return {
+                            "job": import_job_view(failed),
+                            "review": source_revision,
+                            "inspection": inspection,
+                            "validation": validation,
+                            "status": "needs_repair",
+                        }
+                    job = import_jobs.record_validation(
+                        job.id,
+                        validation,
+                        expected_revision=job.revision,
+                        idempotency_key=validate_key,
+                        idempotency_write=IdempotencyWrite(
+                            scope=validate_scope,
+                            payload=request,
+                            response=lambda value: {"job_id": value.id},
+                        ),
+                    )
+                else:
+                    job = require_module_job(campaign_id, str(validated_replay["job_id"]))
+
+                ingest_scope = f"{scope}:source-text-ingest"
+                ingest_key = f"{key}:ingest"
+                ingested_replay = replay_response(ingest_scope, ingest_key, request)
+                if ingested_replay is None:
+                    values = dict(job.payload or {})
+                    imported = modules.ingest_path(
+                        campaign_id=campaign_id,
+                        path=storage.artifact_module_path(job.artifact),
+                        source_key=str(values.get("source_key") or job.artifact),
+                        logical_source_key=str(values.get("source_key") or job.artifact),
+                        title=str(values.get("title") or job.artifact),
+                        parser=parser,
+                        activate=False,
+                        document_cache_dir=config.normalized_modules_dir,
+                        expected_checksum=job.artifact_checksum,
+                        page_revisions=page_revisions,
+                        idempotency_key=ingest_key,
+                        idempotency_write=IdempotencyWrite(
+                            scope=ingest_scope,
+                            payload=request,
+                            response=lambda value: {
+                                "module_id": value.module_id,
+                                "scenes": value.scenes,
+                                "chunks": value.chunks,
+                            },
+                        ),
+                    )
+                    mechanical_import = {
+                        "module_id": imported.module_id,
+                        "scenes": imported.scenes,
+                        "chunks": imported.chunks,
+                    }
+                else:
+                    mechanical_import = ingested_replay
+                prior = dict(job.result or {})
+                result_value = {
+                    **prior,
+                    "mechanical_import": deepcopy(mechanical_import),
+                    "source_text_revisions": deepcopy(page_revisions),
+                    "pack_draft": {},
+                    "pack_edit_history": [],
+                    "content_review_ids": [],
+                    "asset_ids": [],
+                    "actor_binding_ids": [],
+                    "draft_edit_history": [
+                        *list(prior.get("draft_edit_history") or []),
+                        {
+                            "revision": job.revision + 1,
+                            "editor": principal_id,
+                            "operation": "source_text",
+                            "note": str(source_revision["rationale"]),
+                            "invalidated_fields": [
+                                "pack_draft",
+                                "content_reviews",
+                                "assets",
+                                "actor_bindings",
+                            ],
+                        },
+                    ],
+                }
+                public = {
+                    "review": source_revision,
+                    "inspection": inspection,
+                    "validation": validation,
+                    "module_id": mechanical_import["module_id"],
+                    "status": "editing",
+                }
+                public_response = deepcopy(public)
+                updated = import_jobs.record_result(
+                    job.id,
+                    result_value,
+                    state="imported",
+                    module_id=str(mechanical_import["module_id"]),
+                    expected_revision=job.revision,
+                    idempotency_key=key,
+                    idempotency_write=IdempotencyWrite(
+                        scope=scope,
+                        payload=request,
+                        response=lambda value: {
+                            "job": import_job_view(value),
+                            **deepcopy(public_response),
+                        },
+                    ),
+                )
+                return {"job": import_job_view(updated), **public}
+
             if job.state != "imported" or not job.module_id:
-                raise ValueError("module Pack decisions require a mechanically imported draft")
+                raise ValueError("module edits require a mechanically imported draft")
             if dict(job.result or {}).get("finalized_package"):
                 raise ValueError("a finalized module draft is immutable")
-            if str(data.get("operation") or "") != "package":
-                raise ValueError("data.operation must be package")
-            allowed = {"catalogs", "dependencies", "manifest", "metadata", "narrative", "version"}
-            decisions = {key: deepcopy(data[key]) for key in allowed if key in data}
-            unsupported = sorted(set(data) - allowed - {"job_id", "operation", "note"})
-            if unsupported:
-                raise ValueError(
-                    "module Pack edit has unsupported fields: " + ", ".join(unsupported)
-                )
-            if not decisions:
-                raise ValueError("module Pack edit requires at least one decision field")
+            if operation not in {"content", "asset", "actor", "package"}:
+                raise ValueError("data.operation must be content, asset, actor, or package")
             request = {
-                "operation": "edit_module_pack",
+                "operation": f"edit_module_{operation}",
                 "job_id": job.id,
                 "expected_revision": revision,
-                "decisions": decisions,
-                "note": str(data.get("note") or "").strip(),
+                "data": {
+                    field: deepcopy(value)
+                    for field, value in data.items()
+                    if field not in {"job_id", "operation"}
+                },
             }
             scope = f"module-draft-edit:{campaign_id}:{job.id}:{principal_id}"
             replay = replay_response(scope, key, request)
             if replay is not None:
                 return replay
             prior = dict(job.result or {})
-            draft = {**dict(prior.get("pack_draft") or {}), **decisions}
-            history = [
-                *list(prior.get("pack_edit_history") or []),
-                {
-                    "revision": job.revision + 1,
-                    "editor": principal_id,
-                    "note": request["note"],
-                    "fields": sorted(decisions),
-                },
+            edit_record = {
+                "revision": job.revision + 1,
+                "editor": principal_id,
+                "operation": operation,
+                "note": str(data.get("note") or data.get("observation") or "").strip(),
+            }
+            operation_history = [
+                *list(prior.get("draft_edit_history") or []),
+                edit_record,
             ]
+
+            if operation == "content":
+                allowed_kinds = {
+                    "coc7e_statblock",
+                    "clue",
+                    "handout",
+                    "map_transcription",
+                    "scenario_table",
+                    "tome",
+                    "spell",
+                    "custom",
+                }
+                content_kind = str(data.get("content_kind") or "custom").strip()
+                if content_kind not in allowed_kinds:
+                    raise ValueError("data.content_kind is not a supported CoC review kind")
+                service_payload = {
+                    "module_id": job.module_id,
+                    "scene_id": str(data.get("scene_id") or ""),
+                    "content_key": str(data.get("content_key") or ""),
+                    "content_kind": content_kind,
+                    "normalized_content": str(data.get("normalized_content") or ""),
+                    "source_asset_id": data.get("source_asset_id"),
+                    "page_number": data.get("page_number"),
+                    "source_chunk_ids": list(data.get("source_chunk_ids") or []),
+                    "observation": str(data.get("observation") or ""),
+                    "metadata": dict(data.get("metadata") or {}),
+                }
+                service_scope = f"{scope}:content"
+                service_key = f"{key}:content"
+                saved = replay_response(service_scope, service_key, service_payload)
+                if saved is None:
+                    review = modules.review_content(
+                        campaign_id=campaign_id,
+                        reviewer=principal_id,
+                        idempotency_key=service_key,
+                        idempotency_write=IdempotencyWrite(
+                            scope=service_scope,
+                            payload=service_payload,
+                            response=lambda value: {"review": value},
+                        ),
+                        **service_payload,
+                    )
+                else:
+                    review = dict(saved["review"])
+                review_ids = list(prior.get("content_review_ids") or [])
+                if review["id"] not in review_ids:
+                    review_ids.append(review["id"])
+                result_value = {
+                    **prior,
+                    "content_review_ids": review_ids,
+                    "draft_edit_history": operation_history,
+                }
+                public = {"review": review}
+            elif operation == "asset":
+                source_path = str(data.get("source_path") or "").strip()
+                asset_kind = str(data.get("asset_kind") or "").strip()
+                if not source_path or not 1 <= len(asset_kind) <= 80:
+                    raise ValueError("asset edit requires source_path and asset_kind")
+                scene_id = str(data.get("scene_id") or "").strip() or None
+                if scene_id:
+                    scene = modules.read_scene(campaign_id, scene_id)
+                    if scene["module_id"] != job.module_id:
+                        raise ValueError("asset scene_id does not belong to the draft module")
+                staged = storage.stage_module_asset(job.module_id, source_path)
+                service_payload = {
+                    "module_id": job.module_id,
+                    "source_checksum": staged["checksum"],
+                    "asset_kind": asset_kind,
+                    "scene_id": scene_id,
+                    "location_key": data.get("location_key"),
+                    "title": data.get("title"),
+                    "metadata": dict(data.get("metadata") or {}),
+                }
+                service_scope = f"{scope}:asset"
+                service_key = f"{key}:asset"
+                saved = replay_response(service_scope, service_key, service_payload)
+                if saved is None:
+                    asset_metadata = {
+                        **service_payload["metadata"],
+                        "kind": asset_kind,
+                        "asset_kind": asset_kind,
+                        "source_name": Path(source_path).name,
+                        **({"scene_id": scene_id} if scene_id else {}),
+                        **(
+                            {"location_key": str(data["location_key"])}
+                            if data.get("location_key")
+                            else {}
+                        ),
+                        **({"title": str(data["title"])} if data.get("title") else {}),
+                    }
+                    asset = modules.register_asset(
+                        campaign_id=campaign_id,
+                        module_id=job.module_id,
+                        source_path=staged["path"],
+                        media_type=staged["media_type"],
+                        checksum=staged["checksum"],
+                        metadata=asset_metadata,
+                        idempotency_key=service_key,
+                        idempotency_write=IdempotencyWrite(
+                            scope=service_scope,
+                            payload=service_payload,
+                            response=lambda value: {"asset": value},
+                        ),
+                    )
+                else:
+                    asset = dict(saved["asset"])
+                asset_ids = list(prior.get("asset_ids") or [])
+                if asset["id"] not in asset_ids:
+                    asset_ids.append(asset["id"])
+                result_value = {
+                    **prior,
+                    "asset_ids": asset_ids,
+                    "draft_edit_history": operation_history,
+                }
+                public = {
+                    "asset": asset,
+                    "artifact": {
+                        field: value for field, value in staged.items() if field != "path"
+                    },
+                }
+            elif operation == "actor":
+                character_id = str(data.get("character_id") or "").strip()
+                actor_card_id = str(data.get("actor_card_id") or "").strip()
+                binding_kind = str(data.get("binding_kind") or "").strip()
+                if not character_id or not actor_card_id or not binding_kind:
+                    raise ValueError(
+                        "actor edit requires character_id, actor_card_id, and binding_kind"
+                    )
+                character = characters.get(character_id)
+                if character.system_id != "coc7e" or character.character_type not in {
+                    "investigator",
+                    "npc",
+                    "creature",
+                }:
+                    raise ValueError("module actor must be a valid CoC actor")
+                binding = modules.bind_actor(
+                    campaign_id=campaign_id,
+                    module_id=job.module_id,
+                    character_id=character_id,
+                    actor_card_id=actor_card_id,
+                    binding_kind=binding_kind,
+                    role=str(data.get("role") or ""),
+                    scene_id=(str(data["scene_id"]) if data.get("scene_id") else None),
+                    metadata=dict(data.get("metadata") or {}),
+                )
+                binding_ids = list(prior.get("actor_binding_ids") or [])
+                if binding["id"] not in binding_ids:
+                    binding_ids.append(binding["id"])
+                result_value = {
+                    **prior,
+                    "actor_binding_ids": binding_ids,
+                    "draft_edit_history": operation_history,
+                }
+                public = {"binding": binding}
+            else:
+                allowed = {
+                    "catalogs",
+                    "dependencies",
+                    "manifest",
+                    "metadata",
+                    "narrative",
+                    "version",
+                }
+                decisions = {field: deepcopy(data[field]) for field in allowed if field in data}
+                unsupported = sorted(set(data) - allowed - {"job_id", "operation", "note"})
+                if unsupported:
+                    raise ValueError(
+                        "module Pack edit has unsupported fields: " + ", ".join(unsupported)
+                    )
+                if not decisions:
+                    raise ValueError("module Pack edit requires at least one decision field")
+                draft = {**dict(prior.get("pack_draft") or {}), **decisions}
+                package_history = [
+                    *list(prior.get("pack_edit_history") or []),
+                    {
+                        "revision": job.revision + 1,
+                        "editor": principal_id,
+                        "note": str(data.get("note") or "").strip(),
+                        "fields": sorted(decisions),
+                    },
+                ]
+                result_value = {
+                    **prior,
+                    "pack_draft": draft,
+                    "pack_edit_history": package_history,
+                    "draft_edit_history": operation_history,
+                }
+                public = {"pack_draft": draft}
+
+            public_response = deepcopy(public)
             updated = import_jobs.record_result(
                 job.id,
-                {**prior, "pack_draft": draft, "pack_edit_history": history},
+                result_value,
                 state="imported",
                 module_id=job.module_id,
                 expected_revision=revision,
@@ -969,11 +1581,11 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
                     payload=request,
                     response=lambda value: {
                         "job": import_job_view(value),
-                        "pack_draft": deepcopy(draft),
+                        **deepcopy(public_response),
                     },
                 ),
             )
-            return {"job": import_job_view(updated), "pack_draft": draft}
+            return {"job": import_job_view(updated), **public}
 
         if action != "finalize":
             raise ValueError(f"unsupported module_draft action: {action}")

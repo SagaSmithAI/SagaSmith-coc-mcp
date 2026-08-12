@@ -30,7 +30,7 @@ module_draft(start)
   -> content_pack(activate)
 ```
 
-`start` 接受导入白名单中的 PDF、Markdown、文本 `source_path`，或生成内容的 `name` 加 `content`。机械导入只产生未激活草稿。游玩配置和目录决策必须引用 `evidence` 返回的原样来源收据。终结需要 Agent 显式确认，并生成不可静默修改的 `.sagasmith-pack`；只有从该最终档重新导入的模块才能激活。
+`start` 接受导入白名单中的 PDF、Markdown、文本 `source_path`，或生成内容的 `name` 加 `content`。机械导入只产生未激活草稿。`evidence` 提供有界文本块、受管 PDF 页面渲染收据、资产和内容审阅；`edit` 支持 checksum 绑定的 PDF 文本修订、CoC 内容审阅、白名单资产、演员绑定和 Pack 决策。修改来源文本会创建新的未激活机械版本，并使下游草稿决定失效。游玩配置和目录决策必须引用 `evidence` 返回的原样来源收据。终结需要 Agent 显式确认，并生成不可静默修改的 `.sagasmith-pack`；只有从该最终档重新导入的模块才能激活。
 
 商业规则书和模组始终保留在本地。用 `SAGASMITH_COC_MCP_MODULE_IMPORT_ROOTS` 配置允许读取的来源根目录，多个路径使用系统路径分隔符。仓库不分发原书、抽取文本或原书资产。
 
