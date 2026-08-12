@@ -739,6 +739,58 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
             return value
         raise PermissionError("players may read only party or an owned player scene scope")
 
+    def investigation_ledger(state: dict[str, Any]) -> dict[str, Any]:
+        raw = dict(state.get("investigation_checks") or {})
+        pending = dict(raw.get("pending") or {})
+        history = list(raw.get("history") or [])
+        return {"schema_version": 1, "pending": pending, "history": history}
+
+    def investigation_actions(campaign: Any, pending: dict[str, Any]) -> list[str]:
+        outcome = dict(pending.get("outcome") or {})
+        actions = ["settle"]
+        if (
+            bool(campaign.settings.get("spending_luck", False))
+            and outcome.get("luck_options")
+            and not pending.get("decision")
+        ):
+            actions.append("spend_luck")
+        if bool(outcome.get("push_eligible")) and not pending.get("decision"):
+            actions.append("push")
+        return actions
+
+    def investigation_trait(
+        sheet: dict[str, Any], trait_kind: str, trait_name: str
+    ) -> tuple[str, str, int]:
+        kind = str(trait_kind or "skill").strip().casefold()
+        name = str(trait_name or "").strip()
+        if kind == "luck":
+            if name and name.casefold() != "luck":
+                raise ValueError("a luck roll must use trait_name='Luck'")
+            return "luck", "Luck", int(sheet["luck"])
+        if not name:
+            raise ValueError("data.trait_name is required")
+        if kind == "skill":
+            return kind, name, exact_sheet_value(dict(sheet.get("skills") or {}), name, "skill")
+        if kind == "characteristic":
+            return (
+                kind,
+                name,
+                exact_sheet_value(
+                    dict(sheet.get("characteristics") or {}),
+                    name,
+                    "characteristic",
+                ),
+            )
+        raise ValueError("trait_kind must be skill, characteristic, or luck")
+
+    def require_investigation_play(campaign_id: str) -> Any:
+        campaign = campaigns.get(campaign_id)
+        if authoritative_phase(campaign_id) != PROFILE_PLAY:
+            raise ValueError("investigation checks are available only during play")
+        if bool(dict(campaign.state.get("chase") or {}).get("active", False)):
+            raise ValueError("use chase_action for checks while a chase is active")
+        return campaign
+
     def require_campaign_revision(campaign_id: str, expected_revision: int) -> Any:
         campaign = campaigns.get(campaign_id)
         if campaign.revision != expected_revision:
@@ -942,6 +994,10 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
                     "phase must be lobby or play; combat is derived from combat.active"
                 )
             current = campaigns.get(campaign_id)
+            if phase == PROFILE_LOBBY and investigation_ledger(dict(current.state))["pending"]:
+                raise ValueError(
+                    "settle or abort pending investigation checks before returning to lobby"
+                )
             state = {**dict(current.state), "game_phase": phase}
             return asdict(
                 campaigns.update(
@@ -3297,77 +3353,449 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
         )
 
     @mcp.tool()
-    def coc_check(
+    def investigation_query(
         campaign_id: str,
-        skill_name: str,
-        difficulty: Literal["regular", "hard", "extreme"],
-        expected_revision: int,
-        idempotency_key: str,
-        actor_id: str | None = None,
-        threshold: int | None = None,
-        bonus_dice: int = 0,
-        penalty_dice: int = 0,
-        pushed: bool = False,
+        actor_id: str,
+        view: Literal["pending", "history"] = "pending",
+        limit: int = 20,
         principal_id: str = LOCAL_SYSTEM_PRINCIPAL_ID,
     ) -> dict[str, Any]:
-        """Roll and resolve one source-explicit CoC check from campaign randomness."""
+        """Read one actor's pending or settled investigation checks."""
 
-        resolved_threshold = threshold
-        actor_name = ""
-        if actor_id is not None:
-            actor_access(campaign_id, actor_id, principal_id, control=True)
-            actor = characters.get(actor_id)
-            actor_name = actor.name
-            sheet = validate_investigator_sheet(dict(actor.sheet))
-            folded_name = skill_name.casefold()
-            skill_matches = [
-                int(value)
-                for name, value in dict(sheet.get("skills") or {}).items()
-                if str(name).casefold() == folded_name
-            ]
-            characteristic_matches = [
-                int(value)
-                for name, value in dict(sheet.get("characteristics") or {}).items()
-                if str(name).casefold() == folded_name
-            ]
-            matches = skill_matches or characteristic_matches
-            if not matches:
-                raise ValueError(f"actor sheet has no skill or characteristic {skill_name!r}")
-            resolved_threshold = matches[0]
-        if resolved_threshold is None:
-            raise ValueError("threshold or actor_id is required")
-        payload = {
+        actor_access(campaign_id, actor_id, principal_id)
+        campaign = campaigns.get(campaign_id)
+        ledger = investigation_ledger(dict(campaign.state))
+        if view == "pending":
+            pending = deepcopy(dict(ledger["pending"]).get(actor_id))
+            if pending is not None:
+                pending["available_actions"] = investigation_actions(campaign, pending)
+            return {
+                "campaign_id": campaign_id,
+                "campaign_revision": campaign.revision,
+                "actor_id": actor_id,
+                "pending": pending,
+            }
+        values = [
+            deepcopy(item)
+            for item in list(ledger["history"])
+            if str(dict(item).get("actor_id") or "") == actor_id
+        ]
+        return {
+            "campaign_id": campaign_id,
+            "campaign_revision": campaign.revision,
             "actor_id": actor_id,
-            "skill_name": skill_name,
-            "threshold": int(resolved_threshold),
-            "difficulty": difficulty,
-            "bonus_dice": bonus_dice,
-            "penalty_dice": penalty_dice,
-            "pushed": pushed,
+            "history": values[-max(1, min(int(limit), 100)) :],
         }
 
-        def resolve() -> dict[str, Any]:
-            rolled = roll_d100(bonus_dice=bonus_dice, penalty_dice=penalty_dice)
-            outcome = resolve_skill_check(
-                d100_total=int(rolled["total"]),
-                threshold=int(resolved_threshold),
-                difficulty=difficulty,
-                bonus_dice=bonus_dice,
-                penalty_dice=penalty_dice,
-                skill_name=skill_name,
-                investigator_name=actor_name,
-            )
-            return {"roll": rolled, "outcome": outcome, "pushed": pushed}
+    @mcp.tool()
+    def investigation_check(
+        action: Literal["open", "spend_luck", "push", "settle", "abort"],
+        campaign_id: str,
+        actor_id: str,
+        data: dict[str, Any],
+        expected_revision: int,
+        expected_character_revision: int,
+        idempotency_key: str,
+        principal_id: str = LOCAL_SYSTEM_PRINCIPAL_ID,
+    ) -> dict[str, Any]:
+        """Run a resumable source-explicit check with human Luck/Push choices."""
 
-        return authoritative_random_resolution(
-            campaign_id=campaign_id,
-            principal_id=principal_id,
-            operation="coc_check",
-            payload=payload,
-            expected_revision=expected_revision,
-            idempotency_key=idempotency_key,
-            resolve=resolve,
+        actor_access(campaign_id, actor_id, principal_id, control=True)
+        campaign = campaigns.get(campaign_id)
+        actor = characters.get(actor_id)
+        key = str(idempotency_key or "").strip()
+        if not key:
+            raise ValueError("idempotency_key is required")
+        data = deepcopy(dict(data or {}))
+        branch_id = current_branch_id(campaign_id)
+        request = {
+            "action": action,
+            "campaign_id": campaign_id,
+            "actor_id": actor_id,
+            "data": data,
+            "expected_revision": int(expected_revision),
+            "expected_character_revision": int(expected_character_revision),
+            "branch_id": branch_id,
+        }
+        scope = f"investigation-check:{campaign_id}:{branch_id}:{actor_id}:{principal_id}:{action}"
+        replay = replay_response(scope, key, request)
+        if replay is not None:
+            return replay
+        campaign = require_investigation_play(campaign_id)
+        if campaign.revision != int(expected_revision):
+            raise ValueError(
+                "campaign revision conflict: "
+                f"expected {expected_revision}, found {campaign.revision}"
+            )
+        if actor.revision != int(expected_character_revision):
+            raise ValueError(
+                "character revision conflict: "
+                f"expected {expected_character_revision}, found {actor.revision}"
+            )
+        sheet = validate_investigator_sheet(dict(actor.sheet))
+        ledger = investigation_ledger(dict(campaign.state))
+        pending_by_actor = dict(ledger["pending"])
+        pending = deepcopy(pending_by_actor.get(actor_id))
+
+        if action == "open":
+            if pending is not None:
+                raise ValueError("actor already has a pending investigation check")
+            source = " ".join(str(data.get("source") or "").split()).strip()
+            goal = " ".join(str(data.get("goal") or "").split()).strip()
+            if not source or len(source) > 500:
+                raise ValueError("data.source must contain 1 to 500 characters")
+            if not goal or len(goal) > 500:
+                raise ValueError("data.goal must contain 1 to 500 characters")
+            trait_kind, trait_name, threshold = investigation_trait(
+                sheet,
+                str(data.get("trait_kind") or "skill"),
+                str(data.get("trait_name") or ""),
+            )
+            difficulty = str(data.get("difficulty") or "regular")
+            bonus_dice = int(data.get("bonus_dice", 0))
+            penalty_dice = int(data.get("penalty_dice", 0))
+            check_id = hashlib.sha256(
+                f"{campaign_id}:{branch_id}:{actor_id}:{key}".encode()
+            ).hexdigest()[:24]
+            stream = CampaignRandomStream.from_campaign_state(
+                campaign_id,
+                campaign.state,
+                operation="investigation_check.open",
+                idempotency_key=key,
+            )
+            with use_random_stream(stream):
+                roll = roll_d100(bonus_dice=bonus_dice, penalty_dice=penalty_dice)
+                outcome = resolve_skill_check(
+                    int(roll["total"]),
+                    threshold,
+                    difficulty=difficulty,
+                    bonus_dice=bonus_dice,
+                    penalty_dice=penalty_dice,
+                    skill_name=trait_name,
+                    investigator_name=actor.name,
+                    roll_kind=trait_kind,
+                )
+            pending = {
+                "id": check_id,
+                "actor_id": actor_id,
+                "actor_revision": actor.revision,
+                "source": source,
+                "goal": goal,
+                "trait_kind": trait_kind,
+                "trait_name": trait_name,
+                "threshold": threshold,
+                "difficulty": difficulty,
+                "bonus_dice": bonus_dice,
+                "penalty_dice": penalty_dice,
+                "roll": roll,
+                "outcome": outcome,
+                "decision": None,
+            }
+            pending_by_actor[actor_id] = pending
+            next_ledger = {**ledger, "pending": pending_by_actor}
+            next_state = {
+                **dict(campaign.state),
+                "investigation_checks": next_ledger,
+                "random_stream": stream.persisted_state(),
+            }
+            response = {
+                "campaign_id": campaign_id,
+                "campaign_revision": campaign.revision + 1,
+                "character_revision": actor.revision,
+                "pending": {
+                    **deepcopy(pending),
+                    "available_actions": investigation_actions(campaign, pending),
+                },
+                "random_stream_receipt": stream.receipt(),
+            }
+            StateMutationService(storage.database).replace(
+                campaign_id,
+                campaign_state=next_state,
+                expected_campaign_revision=campaign.revision,
+                operation="coc.investigation.check.open",
+                actor=principal_id,
+                branch_id=branch_id,
+                idempotency_key=key,
+                idempotency_write=IdempotencyWrite(
+                    scope=scope,
+                    payload=request,
+                    response=response,
+                ),
+            )
+            stream.mark_persisted()
+            return response
+
+        if pending is None:
+            raise ValueError("actor has no pending investigation check")
+        if str(data.get("check_id") or "") != str(pending["id"]):
+            raise ValueError("data.check_id does not match the pending check")
+        if int(pending["actor_revision"]) != actor.revision:
+            raise ValueError("actor changed while the investigation check was pending")
+
+        if action == "spend_luck":
+            if not bool(campaign.settings.get("spending_luck", False)):
+                raise ValueError("this campaign has not enabled optional Spending Luck")
+            if "spend_luck" not in investigation_actions(campaign, pending):
+                raise ValueError("the pending check cannot spend Luck")
+            spent = int(data.get("luck_spent", 0))
+            if spent <= 0 or spent > int(sheet["luck"]):
+                raise ValueError("luck_spent must be positive and no greater than current Luck")
+            outcome = resolve_skill_check(
+                int(dict(pending["roll"])["total"]),
+                int(pending["threshold"]),
+                difficulty=str(pending["difficulty"]),
+                bonus_dice=int(pending["bonus_dice"]),
+                penalty_dice=int(pending["penalty_dice"]),
+                luck_spent=spent,
+                skill_name=str(pending["trait_name"]),
+                investigator_name=actor.name,
+                roll_kind=str(pending["trait_kind"]),
+            )
+            next_sheet = dict(sheet)
+            next_sheet["luck"] = int(sheet["luck"]) - spent
+            next_sheet["luck_events"] = [
+                *list(sheet.get("luck_events") or [])[-499:],
+                {
+                    "check_id": pending["id"],
+                    "source": pending["source"],
+                    "spent": spent,
+                    "before": int(sheet["luck"]),
+                    "after": int(sheet["luck"]) - spent,
+                },
+            ]
+            pending = {
+                **pending,
+                "actor_revision": actor.revision + 1,
+                "outcome": outcome,
+                "decision": {"kind": "spend_luck", "spent": spent},
+            }
+            pending_by_actor[actor_id] = pending
+            next_state = {
+                **dict(campaign.state),
+                "investigation_checks": {**ledger, "pending": pending_by_actor},
+            }
+            response = {
+                "campaign_id": campaign_id,
+                "campaign_revision": campaign.revision + 1,
+                "character_revision": actor.revision + 1,
+                "pending": {**deepcopy(pending), "available_actions": ["settle"]},
+            }
+            StateMutationService(storage.database).replace(
+                campaign_id,
+                campaign_state=next_state,
+                character_updates=[
+                    CharacterStateUpdate(
+                        character_id=actor_id,
+                        sheet=validate_investigator_sheet(next_sheet),
+                        notes=dict(actor.notes),
+                        expected_revision=actor.revision,
+                    )
+                ],
+                expected_campaign_revision=campaign.revision,
+                operation="coc.investigation.check.spend_luck",
+                actor=principal_id,
+                branch_id=branch_id,
+                idempotency_key=key,
+                idempotency_write=IdempotencyWrite(
+                    scope=scope,
+                    payload=request,
+                    response=response,
+                ),
+            )
+            return response
+
+        if action == "push":
+            if "push" not in investigation_actions(campaign, pending):
+                raise ValueError("the pending check cannot be pushed")
+            justification = " ".join(str(data.get("justification") or "").split()).strip()
+            consequence = " ".join(
+                str(data.get("failure_consequence") or "").split()
+            ).strip()
+            if not justification or len(justification) > 500:
+                raise ValueError("data.justification must contain 1 to 500 characters")
+            if not consequence or len(consequence) > 500:
+                raise ValueError(
+                    "data.failure_consequence must contain 1 to 500 characters"
+                )
+            trait_kind, trait_name, threshold = investigation_trait(
+                sheet,
+                str(data.get("trait_kind") or pending["trait_kind"]),
+                str(data.get("trait_name") or pending["trait_name"]),
+            )
+            if trait_kind not in {"skill", "characteristic"}:
+                raise ValueError("a pushed roll must use a skill or characteristic")
+            difficulty = str(data.get("difficulty") or pending["difficulty"])
+            bonus_dice = int(data.get("bonus_dice", pending["bonus_dice"]))
+            penalty_dice = int(data.get("penalty_dice", pending["penalty_dice"]))
+            stream = CampaignRandomStream.from_campaign_state(
+                campaign_id,
+                campaign.state,
+                operation="investigation_check.push",
+                idempotency_key=key,
+            )
+            with use_random_stream(stream):
+                roll = roll_d100(bonus_dice=bonus_dice, penalty_dice=penalty_dice)
+                outcome = resolve_skill_check(
+                    int(roll["total"]),
+                    threshold,
+                    difficulty=difficulty,
+                    bonus_dice=bonus_dice,
+                    penalty_dice=penalty_dice,
+                    skill_name=trait_name,
+                    investigator_name=actor.name,
+                    pushed=True,
+                    roll_kind=trait_kind,
+                )
+            pending = {
+                **pending,
+                "trait_kind": trait_kind,
+                "trait_name": trait_name,
+                "threshold": threshold,
+                "difficulty": difficulty,
+                "bonus_dice": bonus_dice,
+                "penalty_dice": penalty_dice,
+                "roll": roll,
+                "outcome": outcome,
+                "decision": {
+                    "kind": "push",
+                    "justification": justification,
+                    "failure_consequence": consequence,
+                },
+            }
+            pending_by_actor[actor_id] = pending
+            next_state = {
+                **dict(campaign.state),
+                "investigation_checks": {**ledger, "pending": pending_by_actor},
+                "random_stream": stream.persisted_state(),
+            }
+            response = {
+                "campaign_id": campaign_id,
+                "campaign_revision": campaign.revision + 1,
+                "character_revision": actor.revision,
+                "pending": {**deepcopy(pending), "available_actions": ["settle"]},
+                "random_stream_receipt": stream.receipt(),
+            }
+            StateMutationService(storage.database).replace(
+                campaign_id,
+                campaign_state=next_state,
+                expected_campaign_revision=campaign.revision,
+                operation="coc.investigation.check.push",
+                actor=principal_id,
+                branch_id=branch_id,
+                idempotency_key=key,
+                idempotency_write=IdempotencyWrite(
+                    scope=scope,
+                    payload=request,
+                    response=response,
+                ),
+            )
+            stream.mark_persisted()
+            return response
+
+        if action == "abort":
+            require_dm(campaign_id, principal_id)
+            reason = " ".join(str(data.get("reason") or "").split()).strip()
+            if not reason or len(reason) > 500:
+                raise ValueError("data.reason must contain 1 to 500 characters")
+            receipt = {
+                **pending,
+                "status": "aborted",
+                "abort_reason": reason,
+                "sequence": len(ledger["history"]) + 1,
+            }
+            pending_by_actor.pop(actor_id)
+            history = [*list(ledger["history"])[-499:], receipt]
+            next_state = {
+                **dict(campaign.state),
+                "investigation_checks": {
+                    **ledger,
+                    "pending": pending_by_actor,
+                    "history": history,
+                },
+            }
+            response = {
+                "campaign_id": campaign_id,
+                "campaign_revision": campaign.revision + 1,
+                "character_revision": actor.revision,
+                "receipt": deepcopy(receipt),
+            }
+            StateMutationService(storage.database).replace(
+                campaign_id,
+                campaign_state=next_state,
+                expected_campaign_revision=campaign.revision,
+                operation="coc.investigation.check.abort",
+                actor=principal_id,
+                branch_id=branch_id,
+                idempotency_key=key,
+                idempotency_write=IdempotencyWrite(
+                    scope=scope,
+                    payload=request,
+                    response=response,
+                ),
+            )
+            return response
+
+        outcome = dict(pending["outcome"])
+        receipt = {
+            **pending,
+            "status": "settled",
+            "sequence": len(ledger["history"]) + 1,
+        }
+        pending_by_actor.pop(actor_id)
+        history = [*list(ledger["history"])[-499:], receipt]
+        next_state = {
+            **dict(campaign.state),
+            "investigation_checks": {
+                **ledger,
+                "pending": pending_by_actor,
+                "history": history,
+            },
+        }
+        character_updates = []
+        next_character_revision = actor.revision
+        if bool(outcome.get("development_eligible")) and str(pending["trait_kind"]) == "skill":
+            next_sheet = dict(sheet)
+            development = dict(next_sheet.get("development") or {})
+            checked = [str(item) for item in development.get("checked_skills") or []]
+            if str(pending["trait_name"]) not in checked:
+                development["checked_skills"] = [*checked, str(pending["trait_name"])]
+                next_sheet["development"] = development
+                character_updates = [
+                    CharacterStateUpdate(
+                        character_id=actor_id,
+                        sheet=validate_investigator_sheet(next_sheet),
+                        notes=dict(actor.notes),
+                        expected_revision=actor.revision,
+                    )
+                ]
+                next_character_revision += 1
+        response = {
+            "campaign_id": campaign_id,
+            "campaign_revision": campaign.revision + 1,
+            "character_revision": next_character_revision,
+            "receipt": deepcopy(receipt),
+            "continuity_required": True,
+            "continuity_instruction": (
+                "Use memory_change(action='commit') to record the Agent-decided clue, "
+                "audience, knowledge, consequence, and source-specific facts."
+            ),
+        }
+        StateMutationService(storage.database).replace(
+            campaign_id,
+            campaign_state=next_state,
+            character_updates=character_updates,
+            expected_campaign_revision=campaign.revision,
+            operation="coc.investigation.check.settle",
+            actor=principal_id,
+            branch_id=branch_id,
+            idempotency_key=key,
+            idempotency_write=IdempotencyWrite(
+                scope=scope,
+                payload=request,
+                response=response,
+            ),
         )
+        return response
 
     @mcp.tool()
     def coc_sanity_check(
@@ -3708,6 +4136,8 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
             raise ValueError("active combat must end before a chase starts")
         if dict(campaign.state.get("chase") or {}).get("active"):
             raise ValueError("campaign already has an active chase")
+        if investigation_ledger(dict(campaign.state))["pending"]:
+            raise ValueError("settle or abort pending investigation checks before a chase")
         revision_map = {
             str(actor_id): int(value) for actor_id, value in expected_character_revisions.items()
         }
@@ -4112,6 +4542,8 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
             raise ValueError("combat_start is available only during play")
         if dict(campaign.state.get("chase") or {}).get("active"):
             raise ValueError("active chase must end before combat starts")
+        if investigation_ledger(dict(campaign.state))["pending"]:
+            raise ValueError("settle or abort pending investigation checks before combat")
         normalized: list[dict[str, Any]] = []
         revision_map = {
             str(actor_id): int(value) for actor_id, value in expected_character_revisions.items()

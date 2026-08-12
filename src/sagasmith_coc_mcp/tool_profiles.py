@@ -47,7 +47,7 @@ PHASE_TOOLS = {
     PROFILE_LOBBY: _names(
         """
         actor_knowledge_change actor_knowledge_query campaign_change character_change
-        branch_change branch_query character_query coc_check coc_dice_roll coc_resolve
+        branch_change branch_query character_query coc_dice_roll coc_resolve
         campaign_event continuity_context memory_change memory_query state_revision
         content_pack module_change module_draft module_query
         snapshot_change snapshot_query
@@ -56,17 +56,17 @@ PHASE_TOOLS = {
     PROFILE_PLAY: _names(
         """
         actor_knowledge_change actor_knowledge_query campaign_change character_change
-        branch_change branch_query character_query coc_check coc_dice_roll coc_hp_change
+        branch_change branch_query character_query coc_dice_roll coc_hp_change
         chase_action chase_end chase_query chase_start coc_resolve coc_sanity_check
         combat_start campaign_event continuity_context memory_change memory_query state_revision
-        module_change module_query
+        investigation_check investigation_query module_change module_query
         snapshot_change snapshot_query
         """
     ),
     PROFILE_COMBAT: _names(
         """
         actor_knowledge_query branch_change branch_query character_change character_query
-        coc_check coc_dice_roll coc_hp_change coc_resolve coc_sanity_check combat_action
+        coc_dice_roll coc_hp_change coc_resolve coc_sanity_check combat_action
         combat_attack combat_end combat_query continuity_context module_query snapshot_change
         snapshot_query state_revision
         """

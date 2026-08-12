@@ -52,6 +52,10 @@ combat_start -> combat_query
 
 客观 `memory_query` 和全部连续性写入只对 Keeper 开放，玩家不能借客观事实账本绕过线索、秘密、错误信念或分队边界。Combat 期间保留安全的连续性读取，但关闭时间线与记忆写入，回到 Play 后再恢复；真实 stdio 回归验证这些原生工具随阶段 schema 正确出现和消失。
 
+来源明确的调查检定使用 `investigation_check(open|spend_luck|push|settle|abort)` 与 `investigation_query`。MCP 从角色 sheet 读取精确命名的技能、特征或 Luck，使用战役随机流掷骰，并持久化尚未完成的人类选择。Spending Luck 必须由战役设置显式启用，精确花费与角色 revision 原子结算；孤注一掷必须给出新的行动方式和 Keeper 预告的失败代价，第二次掷骰后不能再花 Luck。待决选择可跨重启恢复，并会阻止进入 Combat、Chase 或返回 Lobby，直到结算或由 Keeper 中止；成功技能只标记一次，留待会后成长。
+
+检定不会猜测线索含义或受众。`settle` 返回机械收据，再由 Agent 通过 `memory_change(action="commit")` 落账来源特定的叙述、客观事实、逐角色知识和孤注一掷失败代价。显然或不可缺少的线索完全绕过检定，直接使用连续性结算，不能因连续坏骰阻断模组。
+
 ## Module Pack 创作流程
 
 CoC 模组使用统一的 `sagasmith.content-package` schema v2：

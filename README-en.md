@@ -53,6 +53,10 @@ Investigation continuity uses three distinct ledgers instead of treating narrati
 
 Objective `memory_query` and all continuity writes are Keeper-only. Players cannot use the objective fact ledger to bypass clue, secret, false-belief, or split-party boundaries. Continuity remains available during Combat as a safe read, while chronology and memory writes close until Play resumes. Real stdio coverage verifies these native tools are added and removed with the phase-specific schema.
 
+Source-backed investigation checks use `investigation_check(open|spend_luck|push|settle|abort)` plus `investigation_query`. The MCP reads the exact named skill, characteristic, or Luck value from the actor sheet, rolls from the campaign stream, and persists the unresolved human choice. Optional Spending Luck must be enabled in campaign settings; the exact Luck cost and actor revision settle atomically. A Push requires an explicit new approach and Keeper failure consequence, rolls a second time, and can never be adjusted with Luck. Pending choices survive restart and block Combat, Chase, or return to Lobby until settled or Keeper-aborted. Successful skills are marked once for later development.
+
+Checks do not invent clue meaning or audience. `settle` returns the mechanical receipt and directs the Agent to record source-specific narration, objective facts, actor knowledge, and pushed-failure consequences through `memory_change(action="commit")`. An obvious or indispensable clue bypasses the check entirely and uses that continuity settlement directly, so repeated poor dice cannot deadlock the scenario.
+
 ## Module Pack authoring
 
 CoC scenarios use the unified `sagasmith.content-package` schema version 2 lifecycle:

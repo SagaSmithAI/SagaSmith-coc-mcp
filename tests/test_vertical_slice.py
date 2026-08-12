@@ -2503,10 +2503,58 @@ def test_stdio_client_can_discover_load_and_call(tmp_path) -> None:
                     "exposure",
                     {
                         "action": "set",
-                        "add_tool_ids": ["campaign_event", "continuity_context"],
+                        "add_tool_ids": [
+                            "campaign_event",
+                            "continuity_context",
+                            "investigation_check",
+                            "investigation_query",
+                        ],
                     },
                 )
                 assert not continuity_loaded.isError
+                opened_check_result = await session.call_tool(
+                    "investigation_check",
+                    {
+                        "action": "open",
+                        "campaign_id": campaign_id,
+                        "actor_id": investigator["id"],
+                        "data": {
+                            "trait_kind": "characteristic",
+                            "trait_name": "dex",
+                            "goal": "Cross the rain-slick porch without falling.",
+                            "source": "Stdio synthetic source-backed investigation check.",
+                        },
+                        "expected_revision": play_value["revision"],
+                        "expected_character_revision": investigator["revision"],
+                        "idempotency_key": "stdio-investigation-open",
+                    },
+                )
+                assert not opened_check_result.isError
+                opened_check = json.loads(opened_check_result.content[0].text)
+                queried_check = await session.call_tool(
+                    "investigation_query",
+                    {"campaign_id": campaign_id, "actor_id": investigator["id"]},
+                )
+                assert not queried_check.isError
+                assert json.loads(queried_check.content[0].text)["pending"]["id"] == (
+                    opened_check["pending"]["id"]
+                )
+                settled_check_result = await session.call_tool(
+                    "investigation_check",
+                    {
+                        "action": "settle",
+                        "campaign_id": campaign_id,
+                        "actor_id": investigator["id"],
+                        "data": {"check_id": opened_check["pending"]["id"]},
+                        "expected_revision": opened_check["campaign_revision"],
+                        "expected_character_revision": opened_check["character_revision"],
+                        "idempotency_key": "stdio-investigation-settle",
+                    },
+                )
+                assert not settled_check_result.isError
+                settled_check = json.loads(settled_check_result.content[0].text)
+                play_value["revision"] = settled_check["campaign_revision"]
+                investigator["revision"] = settled_check["character_revision"]
                 recorded = await session.call_tool(
                     "campaign_event",
                     {
@@ -2563,6 +2611,8 @@ def test_stdio_client_can_discover_load_and_call(tmp_path) -> None:
                 assert "combat_start" not in combat_tools
                 assert "campaign_event" not in combat_tools
                 assert "continuity_context" in combat_tools
+                assert "investigation_check" not in combat_tools
+                assert "investigation_query" not in combat_tools
                 combat_loaded = await session.call_tool(
                     "exposure",
                     {
