@@ -11,6 +11,7 @@ from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 from pypdf import PdfWriter
 from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
+from sagasmith_coc.random_stream import initial_random_stream
 from sagasmith_core import ModuleService
 
 from sagasmith_coc_mcp.config import McpConfig
@@ -1465,6 +1466,379 @@ def test_hp_changes_commit_major_wound_dying_and_first_aid_transitions(tmp_path)
     asyncio.run(exercise())
 
 
+def test_combat_start_order_move_join_end_and_restart_are_authoritative(tmp_path) -> None:
+    config = McpConfig(
+        home=tmp_path / "home",
+        database_url=None,
+        coc_skills_dir=tmp_path / "coc",
+        modulegen_skills_dir=tmp_path / "modulegen",
+    )
+    server = create_server(config)
+
+    async def exercise() -> tuple[str, dict]:
+        campaign = await call(
+            server,
+            "campaign_change",
+            {
+                "action": "create",
+                "data": {
+                    "name": "Combat case",
+                    "idempotency_key": "combat-campaign",
+                    "state": {"random_stream": initial_random_stream("combat-case-seed")},
+                },
+            },
+        )
+        investigator = await call(
+            server,
+            "character_change",
+            {
+                "action": "create",
+                "campaign_id": campaign["id"],
+                "data": {
+                    "name": "Investigator",
+                    "sheet": {
+                        "characteristics": {"dex": 60},
+                        "skills": {"Fighting (Brawl)": 100},
+                        "weapons": [
+                            {
+                                "name": "Knife",
+                                "skill": {"name": "Fighting (Brawl)"},
+                                "damage": "1",
+                                "ammo": 0,
+                                "properties": {"rngd": False, "impl": True},
+                            }
+                        ],
+                    },
+                },
+            },
+        )
+        cultist = await call(
+            server,
+            "character_change",
+            {
+                "action": "create",
+                "campaign_id": campaign["id"],
+                "data": {
+                    "name": "Cultist",
+                    "character_type": "npc",
+                    "sheet": {
+                        "characteristics": {"dex": 40},
+                        "skills": {"Firearms (Handgun)": 100},
+                        "weapons": [
+                            {
+                                "name": "Pistol",
+                                "skill": {"name": "Firearms (Handgun)"},
+                                "damage": "1",
+                                "ammo": 3,
+                                "malfunction": 100,
+                                "properties": {"rngd": True, "impl": True},
+                            }
+                        ],
+                    },
+                },
+            },
+        )
+        ally = await call(
+            server,
+            "character_change",
+            {
+                "action": "create",
+                "campaign_id": campaign["id"],
+                "data": {
+                    "name": "Late Ally",
+                    "character_type": "npc",
+                    "sheet": {"characteristics": {"dex": 50}},
+                },
+            },
+        )
+        await call(
+            server,
+            "campaign_change",
+            {
+                "action": "grant_campaign",
+                "campaign_id": campaign["id"],
+                "data": {"target_principal_id": "player:investigator", "role": "player"},
+            },
+        )
+        await call(
+            server,
+            "campaign_change",
+            {
+                "action": "grant_actor",
+                "campaign_id": campaign["id"],
+                "data": {
+                    "target_principal_id": "player:investigator",
+                    "actor_id": investigator["id"],
+                },
+            },
+        )
+        play = await call(
+            server,
+            "campaign_change",
+            {
+                "action": "set_phase",
+                "campaign_id": campaign["id"],
+                "data": {"phase": "play", "expected_revision": campaign["revision"]},
+            },
+        )
+        start_arguments = {
+            "campaign_id": campaign["id"],
+            "participants": [
+                {
+                    "actor_id": investigator["id"],
+                    "side": "investigators",
+                    "position": [0, 0],
+                },
+                {
+                    "actor_id": cultist["id"],
+                    "side": "opposition",
+                    "position": [3, 0],
+                    "ready_firearm": True,
+                },
+            ],
+            "expected_character_revisions": {
+                investigator["id"]: investigator["revision"],
+                cultist["id"]: cultist["revision"],
+            },
+            "positioning_mode": "grid",
+            "source": "A source-backed confrontation begins.",
+            "expected_revision": play["revision"],
+            "idempotency_key": "combat-start",
+        }
+        started = await call(server, "combat_start", start_arguments)
+        assert await call(server, "combat_start", start_arguments) == started
+        assert started["phase"] == "combat"
+        assert started["combat"]["order"] == [cultist["id"], investigator["id"]]
+        assert (await call(server, "game_phase", {"campaign_id": campaign["id"]}))[
+            "phase"
+        ] == "combat"
+        player_view = await call(
+            server,
+            "combat_query",
+            {
+                "campaign_id": campaign["id"],
+                "principal_id": "player:investigator",
+            },
+        )
+        assert "move" not in player_view["available_actions"]
+        incoming = await call(
+            server,
+            "combat_attack",
+            {
+                "action": "open",
+                "campaign_id": campaign["id"],
+                "data": {
+                    "attacker_id": cultist["id"],
+                    "target_actor_id": investigator["id"],
+                    "weapon_name": "Pistol",
+                    "source": "The cultist fires the readied pistol.",
+                    "expected_attacker_revision": cultist["revision"],
+                    "expected_target_revision": investigator["revision"],
+                },
+                "expected_revision": started["campaign_revision"],
+                "idempotency_key": "incoming-open",
+            },
+        )
+        assert incoming["pending_choice"]["response_options"] == [
+            "none",
+            "dive_for_cover",
+        ]
+        incoming_arguments = {
+            "action": "resolve",
+            "campaign_id": campaign["id"],
+            "data": {
+                "pending_id": incoming["pending_choice"]["id"],
+                "defense": "dive_for_cover",
+            },
+            "expected_revision": incoming["campaign_revision"],
+            "idempotency_key": "incoming-resolve",
+            "principal_id": "player:investigator",
+        }
+        incoming_resolved = await call(server, "combat_attack", incoming_arguments)
+        assert await call(server, "combat_attack", incoming_arguments) == incoming_resolved
+        assert incoming_resolved["resolution"]["defense"] == "dive_for_cover"
+        assert (
+            incoming_resolved["combat"]["participants"][investigator["id"]]["forfeit_next_action"]
+            is True
+        )
+        assert (
+            await call(
+                server,
+                "character_query",
+                {
+                    "action": "get",
+                    "campaign_id": campaign["id"],
+                    "character_id": cultist["id"],
+                },
+            )
+        )["sheet"]["weapons"][0]["ammo"] == 2
+        enemy_done = await call(
+            server,
+            "combat_action",
+            {
+                "action": "end_turn",
+                "campaign_id": campaign["id"],
+                "data": {"actor_id": cultist["id"]},
+                "expected_revision": incoming_resolved["campaign_revision"],
+                "idempotency_key": "cultist-turn",
+            },
+        )
+        assert enemy_done["combat"]["round"] == 2
+        assert enemy_done["combat"]["last_skipped_actor_ids"] == [investigator["id"]]
+        assert enemy_done["combat"]["current_actor_id"] == cultist["id"]
+        enemy_round_two_done = await call(
+            server,
+            "combat_action",
+            {
+                "action": "end_turn",
+                "campaign_id": campaign["id"],
+                "data": {"actor_id": cultist["id"]},
+                "expected_revision": enemy_done["campaign_revision"],
+                "idempotency_key": "cultist-round-two-turn",
+            },
+        )
+        assert enemy_round_two_done["combat"]["current_actor_id"] == investigator["id"]
+        moved = await call(
+            server,
+            "combat_action",
+            {
+                "action": "move",
+                "campaign_id": campaign["id"],
+                "data": {
+                    "actor_id": investigator["id"],
+                    "destination": [2, 1],
+                    "movement_budget": 2,
+                },
+                "expected_revision": enemy_round_two_done["campaign_revision"],
+                "idempotency_key": "investigator-move",
+                "principal_id": "player:investigator",
+            },
+        )
+        assert moved["combat"]["participants"][investigator["id"]]["position"] == [
+            2.0,
+            1.0,
+        ]
+        current_investigator = await call(
+            server,
+            "character_query",
+            {
+                "action": "get",
+                "campaign_id": campaign["id"],
+                "character_id": investigator["id"],
+            },
+        )
+        current_cultist = await call(
+            server,
+            "character_query",
+            {
+                "action": "get",
+                "campaign_id": campaign["id"],
+                "character_id": cultist["id"],
+            },
+        )
+        opened = await call(
+            server,
+            "combat_attack",
+            {
+                "action": "open",
+                "campaign_id": campaign["id"],
+                "data": {
+                    "attacker_id": investigator["id"],
+                    "target_actor_id": cultist["id"],
+                    "weapon_name": "Knife",
+                    "source": "The investigator attacks the adjacent cultist.",
+                    "expected_attacker_revision": current_investigator["revision"],
+                    "expected_target_revision": current_cultist["revision"],
+                },
+                "expected_revision": moved["campaign_revision"],
+                "idempotency_key": "attack-open",
+                "principal_id": "player:investigator",
+            },
+        )
+        assert opened["pending_choice"]["response_options"] == [
+            "none",
+            "dodge",
+            "fight-back",
+        ]
+        attack_arguments = {
+            "action": "resolve",
+            "campaign_id": campaign["id"],
+            "data": {
+                "pending_id": opened["pending_choice"]["id"],
+                "defense": "none",
+            },
+            "expected_revision": opened["campaign_revision"],
+            "idempotency_key": "attack-resolve",
+        }
+        attacked = await call(server, "combat_attack", attack_arguments)
+        assert await call(server, "combat_attack", attack_arguments) == attacked
+        assert attacked["combat"]["pending_choice"] is None
+        assert (
+            attacked["combat"]["participants"][investigator["id"]]["attacks_taken_this_turn"] == 1
+        )
+        assert attacked["resolution"]["resolution"]["winner"] == "attacker"
+        assert attacked["resolution"]["damaged_actor_id"] == cultist["id"]
+        cultist_after = await call(
+            server,
+            "character_query",
+            {
+                "action": "get",
+                "campaign_id": campaign["id"],
+                "character_id": cultist["id"],
+            },
+        )
+        assert cultist_after["sheet"]["hp"] == cultist["sheet"]["hp"] - 1
+        join_arguments = {
+            "action": "join",
+            "campaign_id": campaign["id"],
+            "data": {
+                "actor_id": ally["id"],
+                "side": "investigators",
+                "position": [1, 0],
+                "expected_character_revision": ally["revision"],
+            },
+            "expected_revision": attacked["campaign_revision"],
+            "idempotency_key": "ally-joins",
+        }
+        joined = await call(server, "combat_action", join_arguments)
+        assert await call(server, "combat_action", join_arguments) == joined
+        assert joined["combat"]["participants"][ally["id"]]["available_from_round"] == 3
+        ended = await call(
+            server,
+            "combat_end",
+            {
+                "campaign_id": campaign["id"],
+                "outcome": "escape",
+                "source": "The surviving investigators explicitly withdrew.",
+                "expected_revision": joined["campaign_revision"],
+                "idempotency_key": "combat-end",
+            },
+        )
+        assert ended["phase"] == "play"
+        assert ended["combat"]["active"] is False
+        assert (await call(server, "game_phase", {"campaign_id": campaign["id"]}))[
+            "phase"
+        ] == "play"
+        return campaign["id"], ended
+
+    campaign_id, ended = asyncio.run(exercise())
+    restarted = create_server(config)
+
+    async def verify_restart() -> None:
+        campaign = await call(
+            restarted,
+            "campaign_query",
+            {"action": "get", "campaign_id": campaign_id},
+        )
+        assert campaign["revision"] == ended["campaign_revision"]
+        assert campaign["state"]["combat"]["outcome"] == "escape"
+        assert (await call(restarted, "game_phase", {"campaign_id": campaign_id}))[
+            "phase"
+        ] == "play"
+
+    asyncio.run(verify_restart())
+
+
 def test_branch_snapshot_and_revision_recovery_are_guarded_and_replayable(tmp_path) -> None:
     config = McpConfig(
         home=tmp_path / "home",
@@ -1797,6 +2171,7 @@ def test_stdio_client_can_discover_load_and_call(tmp_path) -> None:
                             "module_draft",
                             "content_pack",
                             "campaign_change",
+                            "character_change",
                             "branch_query",
                             "snapshot_change",
                         ],
@@ -1808,6 +2183,7 @@ def test_stdio_client_can_discover_load_and_call(tmp_path) -> None:
                     "module_draft",
                     "content_pack",
                     "campaign_change",
+                    "character_change",
                     "branch_query",
                     "snapshot_change",
                 } <= visible
@@ -1824,6 +2200,33 @@ def test_stdio_client_can_discover_load_and_call(tmp_path) -> None:
                     },
                 )
                 assert not staged.isError
+                investigator_result = await session.call_tool(
+                    "character_change",
+                    {
+                        "action": "create",
+                        "campaign_id": campaign_id,
+                        "data": {
+                            "name": "Stdio Investigator",
+                            "sheet": {"characteristics": {"dex": 60}},
+                        },
+                    },
+                )
+                assert not investigator_result.isError
+                investigator = json.loads(investigator_result.content[0].text)
+                cultist_result = await session.call_tool(
+                    "character_change",
+                    {
+                        "action": "create",
+                        "campaign_id": campaign_id,
+                        "data": {
+                            "name": "Stdio Cultist",
+                            "character_type": "npc",
+                            "sheet": {"characteristics": {"dex": 40}},
+                        },
+                    },
+                )
+                assert not cultist_result.isError
+                cultist = json.loads(cultist_result.content[0].text)
                 campaign = await session.call_tool(
                     "campaign_query",
                     {"action": "get", "campaign_id": campaign_id},
@@ -1866,13 +2269,78 @@ def test_stdio_client_can_discover_load_and_call(tmp_path) -> None:
                 assert "module_draft" not in play_tools
                 assert "content_pack" not in play_tools
                 assert "snapshot_change" in play_tools
+                combat_loaded = await session.call_tool(
+                    "exposure",
+                    {"action": "set", "add_tool_ids": ["combat_start"]},
+                )
+                assert not combat_loaded.isError
+                started_result = await session.call_tool(
+                    "combat_start",
+                    {
+                        "campaign_id": campaign_id,
+                        "participants": [
+                            {
+                                "actor_id": investigator["id"],
+                                "side": "investigators",
+                                "position": [0, 0],
+                            },
+                            {
+                                "actor_id": cultist["id"],
+                                "side": "opposition",
+                                "position": [2, 0],
+                            },
+                        ],
+                        "expected_character_revisions": {
+                            investigator["id"]: investigator["revision"],
+                            cultist["id"]: cultist["revision"],
+                        },
+                        "positioning_mode": "grid",
+                        "source": "Stdio source-backed confrontation.",
+                        "expected_revision": play_value["revision"],
+                        "idempotency_key": "stdio-combat-start",
+                    },
+                )
+                assert not started_result.isError
+                started = json.loads(started_result.content[0].text)
+                combat_tools = {item.name for item in (await session.list_tools()).tools}
+                assert "combat_start" not in combat_tools
+                combat_loaded = await session.call_tool(
+                    "exposure",
+                    {
+                        "action": "set",
+                        "add_tool_ids": ["combat_query", "combat_action", "combat_end"],
+                    },
+                )
+                assert not combat_loaded.isError
+                status = await session.call_tool(
+                    "combat_query",
+                    {"campaign_id": campaign_id},
+                )
+                assert not status.isError
+                assert json.loads(status.content[0].text)["phase"] == "combat"
+                ended_result = await session.call_tool(
+                    "combat_end",
+                    {
+                        "campaign_id": campaign_id,
+                        "outcome": "other",
+                        "source": "The stdio encounter was explicitly closed.",
+                        "expected_revision": started["campaign_revision"],
+                        "idempotency_key": "stdio-combat-end",
+                    },
+                )
+                assert not ended_result.isError
+                ended = json.loads(ended_result.content[0].text)
+                assert ended["phase"] == "play"
+                assert "combat_end" not in {
+                    item.name for item in (await session.list_tools()).tools
+                }
                 restored = await session.call_tool(
                     "snapshot_change",
                     {
                         "action": "restore",
                         "campaign_id": campaign_id,
                         "data": {"slot": 1},
-                        "expected_revision": play_value["revision"],
+                        "expected_revision": ended["campaign_revision"],
                         "expected_branch_id": branch_id,
                         "idempotency_key": "stdio-restore",
                     },

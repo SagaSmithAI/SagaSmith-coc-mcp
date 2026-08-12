@@ -57,7 +57,7 @@ PHASE_TOOLS = {
         """
         actor_knowledge_change actor_knowledge_query campaign_change character_change
         branch_change branch_query character_query coc_check coc_dice_roll coc_hp_change
-        coc_resolve coc_sanity_check memory_change memory_query state_revision
+        coc_resolve coc_sanity_check combat_start memory_change memory_query state_revision
         module_change module_query
         snapshot_change snapshot_query
         """
@@ -65,8 +65,9 @@ PHASE_TOOLS = {
     PROFILE_COMBAT: _names(
         """
         actor_knowledge_query branch_change branch_query character_change character_query
-        coc_check coc_dice_roll coc_hp_change coc_resolve coc_sanity_check memory_query module_query
-        snapshot_change snapshot_query state_revision
+        coc_check coc_dice_roll coc_hp_change coc_resolve coc_sanity_check combat_action
+        combat_attack combat_end combat_query memory_query module_query snapshot_change
+        snapshot_query state_revision
         """
     ),
 }
@@ -81,10 +82,12 @@ PHASE_DM_TOOLS = {
     PROFILE_PLAY: _names(
         """
         actor_knowledge_change branch_change campaign_change memory_change module_change
-        snapshot_change snapshot_query state_revision
+        combat_start snapshot_change snapshot_query state_revision
         """
     ),
-    PROFILE_COMBAT: _names("branch_change snapshot_change snapshot_query state_revision"),
+    PROFILE_COMBAT: _names(
+        "branch_change combat_end snapshot_change snapshot_query state_revision"
+    ),
 }
 
 NO_CAMPAIGN_TOOLS = frozenset({"campaign_change"})

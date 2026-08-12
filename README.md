@@ -29,6 +29,19 @@ Play 与 Combat 阶段提供两项来源明确的角色状态结算：
 
 两项工具都要求角色控制权限、campaign/character revision 和幂等键；精确重试返回原响应，不能重复抽取或重复结算。
 
+权威战斗使用任务型原生工具，而不是让调用方直接改写 `campaign.state`：
+
+```text
+combat_start -> combat_query
+             -> combat_action(move|join|end_turn)
+             -> combat_attack(open -> resolve|abort)
+             -> combat_end
+```
+
+`combat_start` 校验参与者的角色 revision，并以 DEX、已准备枪械的 DEX+50 和稳定同值顺序进入 Combat。攻击先持久化待响应选择；目标控制者再选择闪避、反击、俯身找掩护或不响应。`resolve` 从战役随机流结算攻击、防御、极难/贯穿伤害、弹药、CON、HP 与伤势，并把战役和受影响角色写入同一 revision group。Grid 模式由引擎保存坐标和校验移动/近战距离；Agent 模式不生成坐标，只接受 Agent 明确给出的空间事实。`combat_end` 返回 Play，并列出仍需濒死恢复处理的角色。
+
+真实 stdio 宿主回归已覆盖 Lobby → Play → Combat → Play：每次阶段变化后 Host 刷新原生列表，旧阶段工具立即消失，新阶段工具可直接加载和调用。
+
 ## Module Pack 创作流程
 
 CoC 模组使用统一的 `sagasmith.content-package` schema v2：

@@ -30,6 +30,19 @@ Play and Combat expose two source-explicit actor-state settlements:
 
 Both tools require actor-control authorization, campaign and character revisions, and an idempotency key. An exact retry returns the original response without drawing or settling twice.
 
+Authoritative combat uses task-shaped native tools instead of allowing callers to patch `campaign.state` directly:
+
+```text
+combat_start -> combat_query
+             -> combat_action(move|join|end_turn)
+             -> combat_attack(open -> resolve|abort)
+             -> combat_end
+```
+
+`combat_start` checks participant character revisions, then enters Combat using DEX, DEX+50 for a readied firearm, and stable ties. An attack first persists a pending response; the target controller then chooses dodge, fight back, dive for cover, or no response. `resolve` draws from the campaign stream and atomically settles attack, defense, extreme/impaling damage, ammunition, CON, HP, and wounds in one campaign/character revision group. Grid mode owns coordinates and validates movement and melee distance. Agent mode creates no coordinates and accepts only explicit Agent spatial facts. `combat_end` returns to Play and reports actors that still require dying recovery.
+
+A real stdio-host regression covers Lobby → Play → Combat → Play. After each phase change the host refreshes the native list, observes the old tools disappear, and directly loads and calls the next legal phase tools.
+
 ## Module Pack authoring
 
 CoC scenarios use the unified `sagasmith.content-package` schema version 2 lifecycle:

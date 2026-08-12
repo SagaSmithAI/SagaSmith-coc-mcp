@@ -11,7 +11,7 @@
 | `sagasmith-dnd` | 107 个受版本控制文件、45 个 Python 测试文件 | 规则运行时参考实现 |
 | `sagasmith-coc` | 29 个受版本控制文件、5 个 Python 测试文件 | 仅具备基础判定、随机流和 Module Pack 编译 |
 | `SagaSmith-dnd-mcp` | 64 个 `public_tool`、80 个 Python 测试文件 | 全链路公共行为参考实现 |
-| `SagaSmith-coc-mcp` | 27 个 MCP 工具、1 个 Python 测试文件、14 项测试 | 已有创作、恢复、随机流与 SAN/HP 权威结算垂直切片，尚未形成完整运行时 |
+| `SagaSmith-coc-mcp` | 32 个 MCP 工具、1 个 Python 测试文件、15 项测试 | 已有创作、恢复、随机流、SAN/HP 与权威战斗垂直切片，尚未形成完整运行时 |
 | `SagaSmith-dnd-skills` | 4,157 个受版本控制文件 | 包含完整技能、引用、模板和内容语料 |
 | `SagaSmith-coc-skills` | 34 个受版本控制文件 | 只有 Keeper、战役管理和少量静态引用 |
 | `sagasmith-dnd-ui` | 59 个受版本控制文件 | 含 Content Workbench、场景图谱和战斗工作区 |
@@ -24,7 +24,7 @@
 | 能力域 | D&D 当前公共证据 | CoC 当前状态 | CoC 完成证据要求 |
 | --- | --- | --- | --- |
 | 原生动态工具 | `exposure`、会话级列表、`tools/list_changed`、调用时二次校验 | 完成 | stdio 客户端能 open/search/set，刷新后直接调用；跨 session、阶段、角色隔离回归 |
-| Lobby → Play → Combat → Play | `game_phase`、`combat_start/end`、动态裁剪 | 部分：Lobby/Play 可持久化；Combat 只从尚不存在的 `combat.active` 派生 | 公共 facade 启停权威战斗；每次阶段变化通知并允许下一次合法原生调用 |
+| Lobby → Play → Combat → Play | `game_phase`、`combat_start/end`、动态裁剪 | 完成 | 公共 `combat_start/end` 持久化权威 encounter；真实 stdio Host 在两次阶段变化后刷新工具列表、确认旧工具消失并直接调用下一阶段原生工具 |
 | 权威随机流 | `dnd_dice_roll`、`dnd_check` 与状态同事务 | 完成基础层 | 随机流位置、收据、revision、精确幂等响应在重启后保持一致；并发调用不重复抽取 |
 | 分支 | `branch_query/change` | 完成 | 公共 facade 覆盖 current/list/get/compare/create/checkout；revision、活动分支和幂等守卫；Lobby/Play 状态物化、精确重放与重启回归 |
 | 快照与恢复 | `snapshot_create/restore/query` | 完成 | 公共 facade 覆盖 list/get/verify/lineage/create/restore；head、revision、活动分支和幂等守卫；真实 stdio 宿主恢复后刷新阶段并成功执行下一次合法原生调用 |
@@ -59,8 +59,8 @@
 | d100、难度、奖励/惩罚骰 | 完成基础层 | 增加角色技能读取、push、对抗、组合检定和原子状态结算 |
 | Luck | 缺失 | 花费 Luck 修改检定、revision/幂等、下限和权限回归 |
 | SAN | 部分：已有来源明确的权威遭遇结算 | 公共 `coc_sanity_check` 已把 SAN/损失/INT/bout 随机流与调查员状态原子提交，并覆盖权限、幂等、重启和 revision group；仍需每日重置、治疗恢复、潜在神话技能增长与连续性流程 |
-| 伤害、重伤、濒死 | 部分：已有权威单次伤害/治疗结算 | 公共 `coc_hp_change` 已覆盖 HP、major wound、CON、unconscious/dying/dead、急救/治疗、随机流与精确重放；仍需濒死轮次、自然/周治疗调度和战斗 encounter 集成 |
-| 战斗 | 缺失权威 encounter | start/end、回合、DEX 顺序、fight back/dodge、maneuver、枪械多发、弹药、掩体、Grid/Agent 空间模式 |
+| 伤害、重伤、濒死 | 部分：已有权威单次及战斗内伤害/治疗结算 | `coc_hp_change` 与 `combat_attack(resolve)` 已覆盖 HP、major wound、CON、unconscious/dying/dead、急救/治疗、随机流与原子角色更新；仍需濒死轮次和自然/周治疗调度 |
+| 战斗 | 部分：权威 encounter 垂直切片可运行 | 公共 start/query/move/join/end-turn/attack/open-response-resolve/end 已覆盖 DEX/准备枪械顺序、稳定同值、下一轮加入、dodge/fight-back/dive、围攻、弹药、极难/贯穿伤害、Grid/Agent 和精确重放；仍缺 maneuver、枪械多发、护甲/掩体细节、濒死轮次与完整模组回测 |
 | 追逐 | 部分：纯解析器 | 权威 chase、MOV 排序、行动点、hazard/barrier、战斗互斥、结束/恢复 |
 | 调查 | 缺失结算层 | 线索发现、明显线索不阻塞、花费 Luck/push、个人受众与秘密信息 |
 | NPC 对话 | 缺失 | 每 NPC 隔离 worker、私有上下文、提案收敛、mechanic/场景变化前 close/abort |
@@ -84,7 +84,7 @@
 1. 以真实私有 PDF 证明 Module Draft 与 Pack 导入全流程。
 2. 实现规则书 Draft/Pack 与 CoC 规则检索，使 Quick-Start 能成为本地规则依据。
 3. 实现 event、continuity 与面向玩家/私有 NPC 的受众结算。
-4. 在已完成的 SAN/HP 单次权威结算之上，实现调查、战斗、追逐、NPC 对话和跨场景恢复流程。
+4. 在已完成的 SAN/HP 与战斗垂直切片之上，实现调查、完整战斗细节、追逐、NPC 对话和跨场景恢复流程。
 5. 更新 CoC Skills 和 ModuleGen，然后用 The Lightless Beacon 做垂直切片、Alone Against the Flames 做图回归。
 6. 对接 CoC UI，最后执行两个战役并行回测与完整完成审计。
 

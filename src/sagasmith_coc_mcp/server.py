@@ -26,6 +26,22 @@ from sagasmith_coc.engine.checks.chase import (
 from sagasmith_coc.engine.checks.combat import resolve_melee_attack, resolve_ranged_attack
 from sagasmith_coc.engine.checks.sanity import resolve_sanity_loss, roll_bout_of_madness
 from sagasmith_coc.engine.checks.skill import resolve_opposed_check, resolve_skill_check
+from sagasmith_coc.engine.combat_state import (
+    advance_turn as advance_combat_turn,
+)
+from sagasmith_coc.engine.combat_state import (
+    combat_distance_feet,
+    move_combatant,
+    outnumbering_bonus_dice,
+    record_attack,
+    record_defense,
+)
+from sagasmith_coc.engine.combat_state import (
+    join_combat as join_combat_state,
+)
+from sagasmith_coc.engine.combat_state import (
+    start_combat as build_combat_state,
+)
 from sagasmith_coc.engine.dice.rolls import roll_d100, roll_dice_expression
 from sagasmith_coc.engine.health import apply_damage, apply_healing
 from sagasmith_coc.module_profile import CocModuleProfile
@@ -284,6 +300,108 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
         return access.require_actor(
             campaign_id, actor_id, principal_id, control=control, private=not control
         )
+
+    def can_control_actor(campaign_id: str, actor_id: str, principal_id: str) -> bool:
+        try:
+            actor_access(campaign_id, actor_id, principal_id, control=True)
+        except (LookupError, PermissionError):
+            return False
+        return True
+
+    def combat_participant(
+        campaign_id: str,
+        raw: dict[str, Any],
+        *,
+        positioning_mode: str,
+    ) -> dict[str, Any]:
+        actor_id = str(raw.get("actor_id") or "").strip()
+        side = str(raw.get("side") or "").strip()
+        if not actor_id or not side:
+            raise ValueError("each combat participant requires actor_id and side")
+        actor = characters.get(actor_id)
+        if actor.campaign_id != campaign_id:
+            raise ValueError("every combat participant must belong to the target campaign")
+        sheet = validate_investigator_sheet(dict(actor.sheet))
+        conditions = dict(sheet.get("conditions") or {})
+        if conditions.get("dead"):
+            raise ValueError(f"dead actor cannot enter combat: {actor_id}")
+        value = {
+            "actor_id": actor_id,
+            "name": actor.name,
+            "side": side,
+            "dex": int(sheet["characteristics"]["dex"]),
+            "ready_firearm": bool(raw.get("ready_firearm", False)),
+            "attacks_per_round": int(sheet.get("attacks_per_round", 1)),
+        }
+        if positioning_mode == "grid":
+            value["position"] = raw.get("position")
+        elif "position" in raw:
+            raise ValueError("agent positioning mode must not accept coordinates")
+        return value
+
+    def active_combat(campaign_id: str) -> tuple[Any, dict[str, Any]]:
+        campaign = campaigns.get(campaign_id)
+        combat = dict(campaign.state.get("combat") or {})
+        if not combat.get("active"):
+            raise ValueError("campaign has no active combat")
+        return campaign, combat
+
+    def combat_view(campaign_id: str, principal_id: str) -> dict[str, Any]:
+        campaign, combat = active_combat(campaign_id)
+        current_actor_id = str(combat.get("current_actor_id") or "")
+        pending = dict(combat.get("pending_choice") or {})
+        actions: list[str] = []
+        if pending:
+            target_id = str(pending.get("target_actor_id") or "")
+            if target_id and can_control_actor(campaign_id, target_id, principal_id):
+                actions.append("react")
+        elif current_actor_id and can_control_actor(campaign_id, current_actor_id, principal_id):
+            actions.extend(["move", "attack", "end_turn"])
+        if is_dm(campaign_id, principal_id):
+            actions.extend(["join", "end"])
+        return {
+            "campaign_id": campaign_id,
+            "campaign_revision": campaign.revision,
+            "phase": PROFILE_COMBAT,
+            "combat": deepcopy(combat),
+            "available_actions": list(dict.fromkeys(actions)),
+        }
+
+    def exact_sheet_value(values: dict[str, Any], name: str, label: str) -> int:
+        folded = name.casefold()
+        matches = [int(value) for key, value in values.items() if str(key).casefold() == folded]
+        if len(matches) != 1:
+            raise ValueError(f"actor sheet must contain exactly one {label} {name!r}")
+        return matches[0]
+
+    def combat_weapon(sheet: dict[str, Any], weapon_name: str) -> dict[str, Any]:
+        folded = weapon_name.casefold()
+        matches = [
+            dict(item)
+            for item in list(sheet.get("weapons") or [])
+            if isinstance(item, dict) and str(item.get("name") or "").casefold() == folded
+        ]
+        if len(matches) != 1:
+            raise ValueError(f"actor sheet must contain exactly one weapon named {weapon_name!r}")
+        weapon = matches[0]
+        skill_field = weapon.get("skill")
+        skill_name = (
+            str(dict(skill_field).get("name") or "").strip()
+            if isinstance(skill_field, dict)
+            else str(skill_field or "").strip()
+        )
+        damage = str(weapon.get("damage") or "").strip()
+        if not skill_name or not damage:
+            raise ValueError("combat weapon requires skill and damage")
+        properties = dict(weapon.get("properties") or {})
+        return {
+            **weapon,
+            "name": weapon_name,
+            "skill_name": skill_name,
+            "damage": damage,
+            "ranged": bool(properties.get("rngd", False)),
+            "impaling": bool(properties.get("impl", False)),
+        }
 
     def require_lobby(campaign_id: str, operation: str) -> None:
         phase = authoritative_phase(campaign_id)
@@ -3104,6 +3222,691 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
         )
         if has_random_draws:
             stream.mark_persisted()
+        return response
+
+    @mcp.tool()
+    def combat_start(
+        campaign_id: str,
+        participants: list[dict[str, Any]],
+        expected_character_revisions: dict[str, int],
+        positioning_mode: Literal["grid", "agent"],
+        source: str,
+        expected_revision: int,
+        idempotency_key: str,
+        grid_metric: Literal["chebyshev", "euclidean"] = "chebyshev",
+        grid_unit_feet: float = 5.0,
+        principal_id: str = LOCAL_SYSTEM_PRINCIPAL_ID,
+    ) -> dict[str, Any]:
+        """Start one source-explicit authoritative CoC combat encounter."""
+
+        require_dm(campaign_id, principal_id)
+        source_value = " ".join(str(source or "").split()).strip()
+        if not source_value or len(source_value) > 500:
+            raise ValueError("source must contain 1 to 500 characters")
+        key = str(idempotency_key or "").strip()
+        if not key:
+            raise ValueError("idempotency_key is required")
+        request = {
+            "operation": "combat_start",
+            "campaign_id": campaign_id,
+            "participants": participants,
+            "expected_character_revisions": expected_character_revisions,
+            "positioning_mode": positioning_mode,
+            "source": source_value,
+            "grid_metric": grid_metric,
+            "grid_unit_feet": grid_unit_feet,
+            "expected_revision": int(expected_revision),
+        }
+        branch_id = current_branch_id(campaign_id)
+        scope = f"combat-start:{campaign_id}:{branch_id}:{principal_id}"
+        replay = replay_response(scope, key, request)
+        if replay is not None:
+            return replay
+        campaign = require_campaign_revision(campaign_id, int(expected_revision))
+        if authoritative_phase(campaign_id) != PROFILE_PLAY:
+            raise ValueError("combat_start is available only during play")
+        if dict(campaign.state.get("chase") or {}).get("active"):
+            raise ValueError("active chase must end before combat starts")
+        normalized: list[dict[str, Any]] = []
+        revision_map = {
+            str(actor_id): int(value) for actor_id, value in expected_character_revisions.items()
+        }
+        for raw in participants:
+            value = combat_participant(
+                campaign_id,
+                dict(raw),
+                positioning_mode=positioning_mode,
+            )
+            actor = characters.get(value["actor_id"])
+            expected_character_revision = revision_map.get(actor.id)
+            if expected_character_revision is None:
+                raise ValueError(f"expected_character_revisions is missing {actor.id}")
+            if actor.revision != expected_character_revision:
+                raise ValueError(
+                    "character revision conflict: "
+                    f"expected {expected_character_revision}, found {actor.revision}"
+                )
+            normalized.append(value)
+        if set(revision_map) != {item["actor_id"] for item in normalized}:
+            raise ValueError("expected_character_revisions must exactly match participants")
+        combat = build_combat_state(
+            normalized,
+            positioning_mode=positioning_mode,
+            source=source_value,
+            grid_metric=grid_metric,
+            grid_unit_feet=grid_unit_feet,
+        )
+        next_state = {**dict(campaign.state), "game_phase": PROFILE_PLAY, "combat": combat}
+        response = {
+            "campaign_id": campaign_id,
+            "campaign_revision": campaign.revision + 1,
+            "phase": PROFILE_COMBAT,
+            "combat": deepcopy(combat),
+        }
+        StateMutationService(storage.database).replace(
+            campaign_id,
+            campaign_state=next_state,
+            expected_campaign_revision=campaign.revision,
+            operation="coc.combat.start",
+            actor=principal_id,
+            branch_id=branch_id,
+            idempotency_key=key,
+            idempotency_write=IdempotencyWrite(
+                scope=scope,
+                payload=request,
+                response=response,
+            ),
+        )
+        return response
+
+    @mcp.tool()
+    def combat_query(
+        campaign_id: str,
+        principal_id: str = LOCAL_SYSTEM_PRINCIPAL_ID,
+    ) -> dict[str, Any]:
+        """Return the authoritative combat view and caller-specific legal tasks."""
+
+        access.require_campaign(campaign_id, principal_id)
+        return combat_view(campaign_id, principal_id)
+
+    @mcp.tool()
+    def combat_action(
+        action: Literal["join", "move", "end_turn"],
+        campaign_id: str,
+        data: dict[str, Any],
+        expected_revision: int,
+        idempotency_key: str,
+        principal_id: str = LOCAL_SYSTEM_PRINCIPAL_ID,
+    ) -> dict[str, Any]:
+        """Apply one guarded non-terminal combat task."""
+
+        data = dict(data or {})
+        key = str(idempotency_key or "").strip()
+        if not key:
+            raise ValueError("idempotency_key is required")
+        actor_id = str(data.get("actor_id") or "").strip()
+        if action == "join":
+            require_dm(campaign_id, principal_id)
+        elif action in {"move", "end_turn"}:
+            if not actor_id:
+                raise ValueError("data.actor_id is required")
+            actor_access(campaign_id, actor_id, principal_id, control=True)
+        request = {
+            "operation": f"combat_action.{action}",
+            "campaign_id": campaign_id,
+            "data": data,
+            "expected_revision": int(expected_revision),
+        }
+        branch_id = current_branch_id(campaign_id)
+        scope = f"combat-action:{campaign_id}:{branch_id}:{principal_id}:{action}"
+        replay = replay_response(scope, key, request)
+        if replay is not None:
+            return replay
+        campaign, combat = active_combat(campaign_id)
+        if campaign.revision != int(expected_revision):
+            raise ValueError(
+                "campaign revision conflict: "
+                f"expected {expected_revision}, found {campaign.revision}"
+            )
+        if action == "join":
+            participant = combat_participant(
+                campaign_id,
+                data,
+                positioning_mode=str(combat["positioning_mode"]),
+            )
+            actor = characters.get(participant["actor_id"])
+            if "expected_character_revision" not in data:
+                raise ValueError("data.expected_character_revision is required")
+            if actor.revision != int(data["expected_character_revision"]):
+                raise ValueError(
+                    "character revision conflict: "
+                    f"expected {data['expected_character_revision']}, found {actor.revision}"
+                )
+            next_combat = join_combat_state(combat, participant)
+        elif action == "move":
+            if actor_id != str(combat.get("current_actor_id") or ""):
+                raise ValueError("only the current actor may move")
+            next_combat = move_combatant(
+                combat,
+                actor_id,
+                destination=data.get("destination"),
+                movement_budget=data.get("movement_budget"),
+                agent_ruling=data.get("agent_ruling"),
+            )
+        else:
+            if actor_id != str(combat.get("current_actor_id") or ""):
+                raise ValueError("only the current actor may end the turn")
+            next_combat = advance_combat_turn(combat)
+        next_state = {**dict(campaign.state), "combat": next_combat}
+        response = {
+            "campaign_id": campaign_id,
+            "campaign_revision": campaign.revision + 1,
+            "phase": PROFILE_COMBAT,
+            "combat": deepcopy(next_combat),
+        }
+        StateMutationService(storage.database).replace(
+            campaign_id,
+            campaign_state=next_state,
+            expected_campaign_revision=campaign.revision,
+            operation=f"coc.combat.{action}",
+            actor=principal_id,
+            branch_id=branch_id,
+            idempotency_key=key,
+            idempotency_write=IdempotencyWrite(
+                scope=scope,
+                payload=request,
+                response=response,
+            ),
+        )
+        return response
+
+    @mcp.tool()
+    def combat_attack(
+        action: Literal["open", "resolve", "abort"],
+        campaign_id: str,
+        data: dict[str, Any],
+        expected_revision: int,
+        idempotency_key: str,
+        principal_id: str = LOCAL_SYSTEM_PRINCIPAL_ID,
+    ) -> dict[str, Any]:
+        """Open, answer, or abort one authoritative attack-response choice."""
+
+        data = dict(data or {})
+        key = str(idempotency_key or "").strip()
+        if not key:
+            raise ValueError("idempotency_key is required")
+        branch_id = current_branch_id(campaign_id)
+        request = {
+            "operation": f"combat_attack.{action}",
+            "campaign_id": campaign_id,
+            "data": data,
+            "expected_revision": int(expected_revision),
+        }
+        scope = f"combat-attack:{campaign_id}:{branch_id}:{principal_id}:{action}"
+        replay = replay_response(scope, key, request)
+        if replay is not None:
+            return replay
+        campaign, combat = active_combat(campaign_id)
+        if campaign.revision != int(expected_revision):
+            raise ValueError(
+                "campaign revision conflict: "
+                f"expected {expected_revision}, found {campaign.revision}"
+            )
+
+        if action == "open":
+            if combat.get("pending_choice") is not None:
+                raise ValueError("combat already has a pending response choice")
+            attacker_id = str(data.get("attacker_id") or "").strip()
+            target_id = str(data.get("target_actor_id") or "").strip()
+            if not attacker_id or not target_id or attacker_id == target_id:
+                raise ValueError("distinct attacker_id and target_actor_id are required")
+            actor_access(campaign_id, attacker_id, principal_id, control=True)
+            if attacker_id != str(combat.get("current_actor_id") or ""):
+                raise ValueError("only the current combat actor may open an attack")
+            if target_id not in combat.get("participants", {}):
+                raise ValueError("attack target must be a combat participant")
+            source_value = " ".join(str(data.get("source") or "").split()).strip()
+            if not source_value or len(source_value) > 500:
+                raise ValueError("data.source must contain 1 to 500 characters")
+            weapon_name = str(data.get("weapon_name") or "").strip()
+            if not weapon_name:
+                raise ValueError("data.weapon_name is required")
+            attacker = characters.get(attacker_id)
+            target = characters.get(target_id)
+            expected_attacker_revision = int(data.get("expected_attacker_revision", -1))
+            expected_target_revision = int(data.get("expected_target_revision", -1))
+            if attacker.revision != expected_attacker_revision:
+                raise ValueError(
+                    "attacker revision conflict: "
+                    f"expected {expected_attacker_revision}, found {attacker.revision}"
+                )
+            if target.revision != expected_target_revision:
+                raise ValueError(
+                    "target revision conflict: "
+                    f"expected {expected_target_revision}, found {target.revision}"
+                )
+            attacker_sheet = validate_investigator_sheet(dict(attacker.sheet))
+            weapon = combat_weapon(attacker_sheet, weapon_name)
+            if weapon["ranged"] and int(weapon.get("ammo", 0)) < 1:
+                raise ValueError("ranged weapon has no ammunition")
+            attacker_threshold = exact_sheet_value(
+                dict(attacker_sheet.get("skills") or {}),
+                str(weapon["skill_name"]),
+                "combat skill",
+            )
+            if combat["positioning_mode"] == "agent":
+                spatial = dict(data.get("spatial_ruling") or {})
+                if (
+                    not isinstance(spatial.get("allowed"), bool)
+                    or not str(spatial.get("source") or "").strip()
+                ):
+                    raise ValueError(
+                        "agent combat requires explicit spatial_ruling.allowed and source"
+                    )
+                if not spatial["allowed"]:
+                    raise ValueError("the explicit spatial ruling does not allow this attack")
+                distance_feet = None
+            else:
+                if data.get("spatial_ruling") is not None:
+                    raise ValueError("grid combat does not accept an Agent spatial override")
+                spatial = None
+                distance_feet = combat_distance_feet(combat, attacker_id, target_id)
+                if not weapon["ranged"] and distance_feet > float(combat["grid_unit_feet"]):
+                    raise ValueError("grid target is outside melee reach")
+            pending_id = hashlib.sha256(
+                f"{campaign_id}:{branch_id}:{key}:{attacker_id}:{target_id}".encode()
+            ).hexdigest()[:24]
+            pending = {
+                "id": pending_id,
+                "kind": "combat_attack_response",
+                "attacker_id": attacker_id,
+                "target_actor_id": target_id,
+                "attacker_revision": attacker.revision,
+                "target_revision": target.revision,
+                "attacker_name": attacker.name,
+                "target_name": target.name,
+                "weapon": weapon,
+                "attacker_threshold": attacker_threshold,
+                "damage_bonus": str(attacker_sheet.get("damage_bonus") or "0"),
+                "source": source_value,
+                "range_band": str(data.get("range_band") or "normal"),
+                "spatial_ruling": spatial,
+                "distance_feet": distance_feet,
+                "response_options": (
+                    ["none", "dive_for_cover"]
+                    if weapon["ranged"]
+                    else ["none", "dodge", "fight-back"]
+                ),
+            }
+            next_combat = {**combat, "pending_choice": pending}
+            next_combat["events"] = [
+                *list(combat.get("events") or []),
+                {"type": "attack_opened", "pending_id": pending_id},
+            ]
+            next_state = {**dict(campaign.state), "combat": next_combat}
+            response = {
+                "campaign_id": campaign_id,
+                "campaign_revision": campaign.revision + 1,
+                "phase": PROFILE_COMBAT,
+                "pending_choice": deepcopy(pending),
+            }
+            StateMutationService(storage.database).replace(
+                campaign_id,
+                campaign_state=next_state,
+                expected_campaign_revision=campaign.revision,
+                operation="coc.combat.attack.open",
+                actor=principal_id,
+                branch_id=branch_id,
+                idempotency_key=key,
+                idempotency_write=IdempotencyWrite(
+                    scope=scope,
+                    payload=request,
+                    response=response,
+                ),
+            )
+            return response
+
+        pending = dict(combat.get("pending_choice") or {})
+        if not pending or pending.get("kind") != "combat_attack_response":
+            raise ValueError("combat has no pending attack response")
+        if str(data.get("pending_id") or "") != str(pending["id"]):
+            raise ValueError("pending combat choice does not match")
+        if action == "abort":
+            require_dm(campaign_id, principal_id)
+            reason = " ".join(str(data.get("reason") or "").split()).strip()
+            if not reason:
+                raise ValueError("data.reason is required to abort a combat attack")
+            next_combat = {**combat, "pending_choice": None}
+            next_combat["events"] = [
+                *list(combat.get("events") or []),
+                {"type": "attack_aborted", "pending_id": pending["id"], "reason": reason},
+            ]
+            next_state = {**dict(campaign.state), "combat": next_combat}
+            response = {
+                "campaign_id": campaign_id,
+                "campaign_revision": campaign.revision + 1,
+                "phase": PROFILE_COMBAT,
+                "aborted_pending_id": pending["id"],
+            }
+            StateMutationService(storage.database).replace(
+                campaign_id,
+                campaign_state=next_state,
+                expected_campaign_revision=campaign.revision,
+                operation="coc.combat.attack.abort",
+                actor=principal_id,
+                branch_id=branch_id,
+                idempotency_key=key,
+                idempotency_write=IdempotencyWrite(
+                    scope=scope,
+                    payload=request,
+                    response=response,
+                ),
+            )
+            return response
+
+        target_id = str(pending["target_actor_id"])
+        actor_access(campaign_id, target_id, principal_id, control=True)
+        defense = str(data.get("defense") or "none")
+        if defense not in pending["response_options"]:
+            raise ValueError("defense must be one of " + ", ".join(pending["response_options"]))
+        attacker_id = str(pending["attacker_id"])
+        attacker = characters.get(attacker_id)
+        target = characters.get(target_id)
+        if attacker.revision != int(pending["attacker_revision"]):
+            raise ValueError("attacker changed while the response choice was pending")
+        if target.revision != int(pending["target_revision"]):
+            raise ValueError("target changed while the response choice was pending")
+        attacker_sheet = validate_investigator_sheet(dict(attacker.sheet))
+        target_sheet = validate_investigator_sheet(dict(target.sheet))
+        weapon = dict(pending["weapon"])
+        target_weapon = None
+        target_threshold = None
+        if defense == "dodge":
+            target_threshold = int(target_sheet["dodge"])
+        elif defense == "fight-back":
+            target_weapon_name = str(data.get("target_weapon_name") or "").strip()
+            if not target_weapon_name:
+                raise ValueError("data.target_weapon_name is required to fight back")
+            target_weapon = combat_weapon(target_sheet, target_weapon_name)
+            if target_weapon["ranged"]:
+                raise ValueError("a ranged weapon cannot be used to fight back")
+            target_threshold = exact_sheet_value(
+                dict(target_sheet.get("skills") or {}),
+                str(target_weapon["skill_name"]),
+                "combat skill",
+            )
+        stream = CampaignRandomStream.from_campaign_state(
+            campaign_id,
+            campaign.state,
+            operation="combat_attack.resolve",
+            idempotency_key=key,
+        )
+        with use_random_stream(stream):
+            defense_roll = None
+            dive_success = False
+            if defense in {"dodge", "fight-back", "dive_for_cover"}:
+                defense_roll = roll_d100()
+            if defense == "dive_for_cover":
+                dodge = resolve_skill_check(
+                    int(defense_roll["total"]),
+                    int(target_sheet["dodge"]),
+                    skill_name="Dodge",
+                    investigator_name=target.name,
+                )
+                dive_success = bool(dodge["success"])
+            bonus_dice = outnumbering_bonus_dice(
+                combat,
+                target_id,
+                ranged=bool(weapon["ranged"]),
+            )
+            penalty_dice = 1 if dive_success else 0
+            attack_roll = roll_d100(
+                bonus_dice=bonus_dice,
+                penalty_dice=penalty_dice,
+            )
+            if weapon["ranged"]:
+                resolution = resolve_ranged_attack(
+                    int(attack_roll["total"]),
+                    int(pending["attacker_threshold"]),
+                    str(weapon["damage"]),
+                    range_band=str(pending["range_band"]),
+                    damage_bonus=str(pending["damage_bonus"]),
+                    bonus_dice=bonus_dice,
+                    penalty_dice=penalty_dice,
+                    malfunction=(
+                        int(weapon["malfunction"])
+                        if weapon.get("malfunction") is not None
+                        else None
+                    ),
+                    attacker_name=attacker.name,
+                    weapon_name=str(weapon["name"]),
+                    impaling=bool(weapon["impaling"]),
+                )
+            else:
+                resolution = resolve_melee_attack(
+                    int(attack_roll["total"]),
+                    int(pending["attacker_threshold"]),
+                    damage_bonus=str(pending["damage_bonus"]),
+                    weapon_damage=str(weapon["damage"]),
+                    target_dodge=target_threshold if defense == "dodge" else None,
+                    target_fighting=(target_threshold if defense == "fight-back" else None),
+                    target_roll=(int(defense_roll["total"]) if defense_roll is not None else None),
+                    defense=defense,
+                    bonus_dice=bonus_dice,
+                    attacker_name=attacker.name,
+                    weapon_name=str(weapon["name"]),
+                    target_weapon_damage=(str(target_weapon["damage"]) if target_weapon else None),
+                    target_damage_bonus=str(target_sheet.get("damage_bonus") or "0"),
+                    impaling=bool(weapon["impaling"]),
+                    target_impaling=bool(target_weapon and target_weapon["impaling"]),
+                )
+
+            damaged_id = None
+            damage_value = 0
+            if resolution.get("damage") is not None:
+                damaged_id = target_id
+                damage_value = int(resolution["damage"]["total"])
+            elif resolution.get("counterattack") is not None:
+                damaged_id = attacker_id
+                damage_value = int(resolution["counterattack"]["total"])
+            health_transition = None
+            if damaged_id is not None:
+                damaged_sheet = target_sheet if damaged_id == target_id else attacker_sheet
+                preview = apply_damage(damaged_sheet, damage_value)
+                con_success = None
+                con_roll = None
+                if preview["requires_con_check"]:
+                    con_roll = roll_d100()
+                    con_success = int(con_roll["total"]) <= int(
+                        damaged_sheet["characteristics"]["con"]
+                    )
+                health_transition = apply_damage(
+                    damaged_sheet,
+                    damage_value,
+                    con_check_success=con_success,
+                )
+            else:
+                con_roll = None
+
+        next_combat = record_attack(combat, attacker_id)
+        if defense != "none":
+            next_combat = record_defense(
+                next_combat,
+                target_id,
+                dive_for_cover=defense == "dive_for_cover",
+            )
+        next_combat["pending_choice"] = None
+        event = {
+            "type": "attack_resolved",
+            "pending_id": pending["id"],
+            "source": pending["source"],
+            "attacker_id": attacker_id,
+            "target_actor_id": target_id,
+            "defense": defense,
+            "attack_roll": attack_roll,
+            "defense_roll": defense_roll,
+            "dive_success": dive_success,
+            "resolution": resolution,
+            "damaged_actor_id": damaged_id,
+            "health_transition": (
+                {key: value for key, value in health_transition.items() if key != "sheet"}
+                if health_transition is not None
+                else None
+            ),
+            "con_roll": con_roll,
+        }
+        next_combat["events"] = [*list(next_combat.get("events") or []), event]
+        next_state = {
+            **dict(campaign.state),
+            "combat": next_combat,
+            "random_stream": stream.persisted_state(),
+        }
+        updates_by_id: dict[str, dict[str, Any]] = {}
+        if weapon["ranged"]:
+            next_attacker_sheet = dict(attacker_sheet)
+            next_weapons = [dict(item) for item in next_attacker_sheet["weapons"]]
+            matching_indexes = [
+                index
+                for index, item in enumerate(next_weapons)
+                if str(item.get("name") or "").casefold() == str(weapon["name"]).casefold()
+            ]
+            next_weapons[matching_indexes[0]]["ammo"] = int(weapon["ammo"]) - 1
+            next_attacker_sheet["weapons"] = next_weapons
+            updates_by_id[attacker_id] = next_attacker_sheet
+        if health_transition is not None and damaged_id is not None:
+            damaged_sheet = dict(health_transition["sheet"])
+            damaged_sheet["health_events"] = [
+                *list(damaged_sheet.get("health_events") or [])[-499:],
+                {
+                    "idempotency_key": key,
+                    "action": "combat_damage",
+                    "source": pending["source"],
+                    "amount_roll": resolution.get("damage") or resolution.get("counterattack"),
+                    "con_roll": con_roll,
+                    "transition": {
+                        item_key: item_value
+                        for item_key, item_value in health_transition.items()
+                        if item_key != "sheet"
+                    },
+                },
+            ]
+            if damaged_id in updates_by_id:
+                damaged_sheet["weapons"] = updates_by_id[damaged_id]["weapons"]
+            updates_by_id[damaged_id] = damaged_sheet
+        character_updates = [
+            CharacterStateUpdate(
+                character_id=actor_id,
+                sheet=validate_investigator_sheet(sheet),
+                notes=dict(characters.get(actor_id).notes),
+                expected_revision=characters.get(actor_id).revision,
+            )
+            for actor_id, sheet in updates_by_id.items()
+        ]
+        character_revisions = {
+            actor_id: characters.get(actor_id).revision + 1 for actor_id in updates_by_id
+        }
+        response = {
+            "campaign_id": campaign_id,
+            "campaign_revision": campaign.revision + 1,
+            "phase": PROFILE_COMBAT,
+            "resolution": event,
+            "combat": deepcopy(next_combat),
+            "character_revisions": character_revisions,
+            "random_stream_receipt": stream.receipt(),
+        }
+        StateMutationService(storage.database).replace(
+            campaign_id,
+            campaign_state=next_state,
+            character_updates=character_updates,
+            expected_campaign_revision=campaign.revision,
+            operation="coc.combat.attack.resolve",
+            actor=principal_id,
+            branch_id=branch_id,
+            idempotency_key=key,
+            idempotency_write=IdempotencyWrite(
+                scope=scope,
+                payload=request,
+                response=response,
+            ),
+        )
+        stream.mark_persisted()
+        return response
+
+    @mcp.tool()
+    def combat_end(
+        campaign_id: str,
+        outcome: Literal["victory", "escape", "surrender", "defeat", "other"],
+        source: str,
+        expected_revision: int,
+        idempotency_key: str,
+        principal_id: str = LOCAL_SYSTEM_PRINCIPAL_ID,
+    ) -> dict[str, Any]:
+        """Close the active encounter and return the campaign to Play."""
+
+        require_dm(campaign_id, principal_id)
+        source_value = " ".join(str(source or "").split()).strip()
+        if not source_value or len(source_value) > 500:
+            raise ValueError("source must contain 1 to 500 characters")
+        key = str(idempotency_key or "").strip()
+        if not key:
+            raise ValueError("idempotency_key is required")
+        request = {
+            "operation": "combat_end",
+            "campaign_id": campaign_id,
+            "outcome": outcome,
+            "source": source_value,
+            "expected_revision": int(expected_revision),
+        }
+        branch_id = current_branch_id(campaign_id)
+        scope = f"combat-end:{campaign_id}:{branch_id}:{principal_id}"
+        replay = replay_response(scope, key, request)
+        if replay is not None:
+            return replay
+        campaign, combat = active_combat(campaign_id)
+        if campaign.revision != int(expected_revision):
+            raise ValueError(
+                "campaign revision conflict: "
+                f"expected {expected_revision}, found {campaign.revision}"
+            )
+        if combat.get("pending_choice") is not None:
+            raise ValueError("resolve or abort the pending combat choice before combat_end")
+        ended = {
+            **combat,
+            "active": False,
+            "outcome": outcome,
+            "ended_source": source_value,
+        }
+        recovery_actor_ids = [
+            actor_id
+            for actor_id in combat.get("participants", {})
+            if dict(
+                validate_investigator_sheet(dict(characters.get(actor_id).sheet)).get("conditions")
+                or {}
+            ).get("dying")
+        ]
+        next_state = {**dict(campaign.state), "game_phase": PROFILE_PLAY, "combat": ended}
+        response = {
+            "campaign_id": campaign_id,
+            "campaign_revision": campaign.revision + 1,
+            "phase": PROFILE_PLAY,
+            "outcome": outcome,
+            "combat": deepcopy(ended),
+            "recovery_required_actor_ids": recovery_actor_ids,
+        }
+        StateMutationService(storage.database).replace(
+            campaign_id,
+            campaign_state=next_state,
+            expected_campaign_revision=campaign.revision,
+            operation="coc.combat.end",
+            actor=principal_id,
+            branch_id=branch_id,
+            idempotency_key=key,
+            idempotency_write=IdempotencyWrite(
+                scope=scope,
+                payload=request,
+                response=response,
+            ),
+        )
         return response
 
     @mcp.tool()
