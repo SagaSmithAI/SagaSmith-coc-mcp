@@ -70,6 +70,9 @@ from sagasmith_core import (
     CampaignService,
     CharacterService,
     CharacterStateUpdate,
+    ContinuityCommitService,
+    ContinuityService,
+    EventService,
     IdempotencyService,
     IdempotencyWrite,
     ImportJobService,
@@ -84,6 +87,7 @@ from sagasmith_core import (
     normalize_document,
     normalized_document_page_text,
     render_pdf_page,
+    validate_subject_context_fact,
 )
 from sagasmith_core.access import LOCAL_SYSTEM_PRINCIPAL_ID
 from sagasmith_core.modules import MarkdownModuleParser
@@ -221,6 +225,9 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
     access = AccessService(storage.database)
     memories = MemoryService(storage.database)
     knowledge = ActorKnowledgeService(storage.database)
+    events = EventService(storage.database)
+    continuity = ContinuityService(storage.database)
+    continuity_commits = ContinuityCommitService(storage.database)
     modules = ModuleService(storage.database)
     import_jobs = ImportJobService(storage.database)
     snapshots = SnapshotService(storage.database)
@@ -701,6 +708,36 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
 
     def current_branch_id(campaign_id: str) -> str:
         return branches.current(campaign_id).id
+
+    def readable_branch_id(
+        campaign_id: str, branch_id: str | None, principal_id: str
+    ) -> str:
+        """Players may read only the checked-out timeline."""
+
+        current = current_branch_id(campaign_id)
+        if not is_dm(campaign_id, principal_id) and branch_id not in {None, current}:
+            raise PermissionError("players may inspect only the current branch")
+        return current if branch_id is None else str(branch_id)
+
+    def writable_branch_id(campaign_id: str, branch_id: str | None) -> str:
+        """All live writes target the checked-out branch."""
+
+        current = current_branch_id(campaign_id)
+        if branch_id not in {None, current}:
+            raise ValueError("branch_id must match the campaign's active branch")
+        return current
+
+    def readable_scope_id(campaign_id: str, scope_id: str, principal_id: str) -> str:
+        """Keep split-party scene progress inside an owned actor scope."""
+
+        value = str(scope_id or "party").strip() or "party"
+        if is_dm(campaign_id, principal_id) or value == "party":
+            return value
+        if value.startswith("player:"):
+            actor_id = value.split(":", 1)[1]
+            actor_access(campaign_id, actor_id, principal_id)
+            return value
+        raise PermissionError("players may read only party or an owned player scene scope")
 
     def require_campaign_revision(campaign_id: str, expected_revision: int) -> Any:
         campaign = campaigns.get(campaign_id)
@@ -2467,39 +2504,368 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
         data: dict[str, Any] | None = None,
         principal_id: str = "system:local",
     ) -> dict[str, Any]:
-        access.require_campaign(campaign_id, principal_id)
+        """Read the Keeper's objective, branch-scoped continuity ledger."""
+
+        require_dm(campaign_id, principal_id)
         data = dict(data or {})
+        branch_id = readable_branch_id(campaign_id, data.get("branch_id"), principal_id)
         values = (
-            memories.search(campaign_id, str(data.get("query") or ""))
+            memories.search(
+                campaign_id,
+                str(data.get("query") or " "),
+                limit=int(data.get("limit", 8)),
+                branch_id=branch_id,
+                include_inactive=bool(data.get("include_inactive", False)),
+            )
             if action == "search"
-            else memories.list(campaign_id, kind=data.get("kind"))
+            else memories.list(
+                campaign_id,
+                kind=data.get("kind"),
+                branch_id=branch_id,
+                include_inactive=bool(data.get("include_inactive", False)),
+            )
         )
         return {"memories": [asdict(item) for item in values]}
 
     @mcp.tool()
     def memory_change(
-        action: Literal["add", "revise"],
+        action: Literal["add", "upsert", "revise", "commit"],
         campaign_id: str,
         data: dict[str, Any],
         principal_id: str = "system:local",
+        expected_revision: int | None = None,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
+        """Write objective facts or atomically settle one investigation outcome."""
+
         require_dm(campaign_id, principal_id)
+        key = str(idempotency_key or "").strip()
+        if not key:
+            raise ValueError("idempotency_key is required for memory writes")
+        data = deepcopy(dict(data or {}))
+        branch_id = writable_branch_id(campaign_id, data.get("branch_id"))
+
+        if action == "commit":
+            event = data.get("event")
+            facts = data.get("facts") or []
+            actor_knowledge = data.get("actor_knowledge") or []
+            snapshot = data.get("snapshot")
+            if not isinstance(event, dict):
+                raise ValueError("data.event must be an object")
+            if not isinstance(facts, list) or not all(isinstance(item, dict) for item in facts):
+                raise ValueError("data.facts must be a list of objects")
+            if not isinstance(actor_knowledge, list) or not all(
+                isinstance(item, dict) for item in actor_knowledge
+            ):
+                raise ValueError("data.actor_knowledge must be a list of objects")
+            if snapshot is not None and not isinstance(snapshot, dict):
+                raise ValueError("data.snapshot must be an object")
+            event_data = deepcopy(event)
+            facts_data = [deepcopy(item) for item in facts]
+            knowledge_data = [deepcopy(item) for item in actor_knowledge]
+            if not str(event_data.get("summary") or "").strip():
+                raise ValueError("data.event.summary is required")
+            if (
+                str(event_data.get("audience_scope") or "dm") == "actor"
+                and not event_data.get("participants")
+                and not knowledge_data
+            ):
+                raise ValueError(
+                    "actor-scoped continuity events require participants or actor knowledge"
+                )
+            request = {
+                "action": action,
+                "branch_id": branch_id,
+                "event": event_data,
+                "facts": facts_data,
+                "actor_knowledge": knowledge_data,
+                "snapshot": snapshot,
+            }
+            scope = f"continuity-commit:{campaign_id}:{branch_id}:{principal_id}"
+            replay = replay_response(scope, key, request)
+            if replay is not None:
+                return replay
+            if expected_revision is not None:
+                require_campaign_revision(campaign_id, int(expected_revision))
+            current_facts = {
+                item.fact_key: item
+                for item in memories.list(
+                    campaign_id,
+                    branch_id=branch_id,
+                    include_inactive=True,
+                )
+            }
+            for index, fact in enumerate(facts_data):
+                validate_subject_context_fact(
+                    kind=fact.get("kind"), subject_ref=fact.get("subject_ref")
+                )
+                fact_action = str(fact.get("action") or "upsert")
+                if fact_action == "upsert" and str(fact.get("fact_key") or "") in current_facts:
+                    if not fact.get("expected_revision_id"):
+                        raise ValueError(
+                            f"data.facts[{index}].expected_revision_id is required "
+                            "when upsert revises a fact"
+                        )
+                if fact_action == "revise" and not fact.get("expected_revision_id"):
+                    raise ValueError(
+                        f"data.facts[{index}].expected_revision_id is required for revisions"
+                    )
+            for index, item in enumerate(knowledge_data):
+                if str(item.get("action") or "add") == "revise" and not item.get(
+                    "expected_revision_id"
+                ):
+                    raise ValueError(
+                        "data.actor_knowledge"
+                        f"[{index}].expected_revision_id is required for revisions"
+                    )
+            return continuity_commits.commit(
+                campaign_id,
+                event=event_data,
+                facts=facts_data,
+                actor_knowledge=knowledge_data,
+                snapshot=deepcopy(snapshot),
+                branch_id=branch_id,
+                idempotency_key=key,
+                idempotency_write=IdempotencyWrite(
+                    scope=scope,
+                    payload=request,
+                    response=lambda result: result,
+                ),
+            )
+
+        content = str(data.get("content") or "").strip()
+        if not content:
+            raise ValueError("data.content is required")
+        if action in {"add", "upsert"}:
+            validate_subject_context_fact(
+                kind=data.get("kind") or "fact",
+                subject_ref=data.get("subject_ref") or "",
+            )
+        request = {**data, "action": action, "branch_id": branch_id}
+        scope = f"memory-change:{campaign_id}:{branch_id}:{principal_id}:{action}"
+        replay = replay_response(scope, key, request)
+        if replay is not None:
+            return replay
+        if expected_revision is not None:
+            require_campaign_revision(campaign_id, int(expected_revision))
+        atomic_write = IdempotencyWrite(
+            scope=scope,
+            payload=request,
+            response=lambda result: asdict(result),
+        )
         if action == "add":
             return asdict(
                 memories.add(
                     campaign_id,
-                    content=str(data.get("content") or ""),
+                    content=content,
                     kind=str(data.get("kind") or "fact"),
                     subject=str(data.get("subject") or ""),
                     metadata=dict(data.get("metadata") or {}),
+                    branch_id=branch_id,
+                    fact_key=data.get("fact_key"),
+                    subject_ref=str(data.get("subject_ref") or ""),
+                    predicate=str(data.get("predicate") or ""),
+                    status=str(data.get("status") or "active"),
+                    source_event_ids=list(data.get("source_event_ids") or []),
+                    importance=int(data.get("importance", 3)),
+                    disclosure_scope=data.get("disclosure_scope"),
+                    idempotency_key=key,
+                    idempotency_write=atomic_write,
+                )
+            )
+        if action == "upsert":
+            return asdict(
+                memories.upsert(
+                    campaign_id,
+                    fact_key=str(data.get("fact_key") or ""),
+                    content=content,
+                    kind=(str(data["kind"]) if data.get("kind") is not None else None),
+                    subject=(
+                        str(data["subject"]) if data.get("subject") is not None else None
+                    ),
+                    subject_ref=(
+                        str(data["subject_ref"])
+                        if data.get("subject_ref") is not None
+                        else None
+                    ),
+                    predicate=(
+                        str(data["predicate"]) if data.get("predicate") is not None else None
+                    ),
+                    metadata=(dict(data["metadata"]) if data.get("metadata") is not None else None),
+                    branch_id=branch_id,
+                    expected_revision_id=data.get("expected_revision_id"),
+                    status=str(data.get("status") or "active"),
+                    source_event_ids=(
+                        list(data["source_event_ids"])
+                        if data.get("source_event_ids") is not None
+                        else None
+                    ),
+                    importance=int(data.get("importance", 3)),
+                    disclosure_scope=data.get("disclosure_scope"),
+                    idempotency_key=key,
+                    idempotency_write=atomic_write,
                 )
             )
         return asdict(
             memories.revise(
                 str(data.get("memory_id") or ""),
-                content=str(data.get("content") or ""),
-                metadata=dict(data.get("metadata") or {}),
+                content=content,
+                metadata=(dict(data["metadata"]) if data.get("metadata") is not None else None),
+                branch_id=branch_id,
+                expected_revision_id=data.get("expected_revision_id"),
+                status=data.get("status"),
+                source_event_ids=(
+                    list(data["source_event_ids"])
+                    if data.get("source_event_ids") is not None
+                    else None
+                ),
+                importance=(
+                    int(data["importance"]) if data.get("importance") is not None else None
+                ),
+                disclosure_scope=data.get("disclosure_scope"),
+                idempotency_key=key,
+                idempotency_write=atomic_write,
             )
+        )
+
+    @mcp.tool()
+    def campaign_event(
+        action: Literal["add", "list"],
+        campaign_id: str,
+        data: dict[str, Any] | None = None,
+        principal_id: str = LOCAL_SYSTEM_PRINCIPAL_ID,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Append or read the branch-visible chronology with explicit audiences."""
+
+        data = deepcopy(dict(data or {}))
+        membership = access.require_campaign(campaign_id, principal_id)
+        if action == "list":
+            branch_id = readable_branch_id(campaign_id, data.get("branch_id"), principal_id)
+            actor_id = str(data.get("actor_id") or "").strip() or None
+            if actor_id is not None:
+                actor_access(campaign_id, actor_id, principal_id)
+            audience = "dm" if membership.role in {"owner", "dm"} else "player"
+            values = events.list_for_audience(
+                campaign_id,
+                audience=audience,
+                actor_id=actor_id,
+                limit=int(data.get("limit", 50)),
+                branch_id=branch_id,
+            )
+            return {"events": [asdict(item) for item in values]}
+
+        require_dm(campaign_id, principal_id)
+        key = str(idempotency_key or "").strip()
+        if not key:
+            raise ValueError("idempotency_key is required for event writes")
+        branch_id = writable_branch_id(campaign_id, data.get("branch_id"))
+        summary = str(data.get("summary") or "").strip()
+        if not summary:
+            raise ValueError("data.summary is required")
+        audience_scope = str(data.get("audience_scope") or "dm")
+        participants = data.get("participants") or []
+        known_by_actor_ids = [str(item) for item in data.get("known_by_actor_ids") or []]
+        if audience_scope == "actor" and not participants and not known_by_actor_ids:
+            raise ValueError(
+                "actor-scoped events require participants or known_by_actor_ids"
+            )
+        if known_by_actor_ids and (
+            not str(data.get("knowledge_key") or "").strip()
+            or not str(data.get("knowledge_proposition") or "").strip()
+        ):
+            raise ValueError(
+                "knowledge_key and knowledge_proposition are required for known actors"
+            )
+        request = {
+            "summary": summary,
+            "event_type": str(data.get("event_type") or "narrative"),
+            "payload": deepcopy(dict(data.get("payload") or {})),
+            "audience_scope": audience_scope,
+            "participants": deepcopy(participants),
+            "known_by_actor_ids": known_by_actor_ids,
+            "knowledge_key": data.get("knowledge_key"),
+            "knowledge_proposition": data.get("knowledge_proposition"),
+            "knowledge_disclosure_scope": str(
+                data.get("knowledge_disclosure_scope") or "owner"
+            ),
+            "branch_id": branch_id,
+        }
+        scope = f"campaign-event:{campaign_id}:{branch_id}:{principal_id}"
+        replay = replay_response(scope, key, request)
+        if replay is not None:
+            return replay
+        atomic_write = IdempotencyWrite(
+            scope=scope,
+            payload=request,
+            response=lambda result: (
+                {**asdict(result[0]), "actor_knowledge_ids": result[1]}
+                if isinstance(result, tuple)
+                else {**asdict(result), "actor_knowledge_ids": []}
+            ),
+        )
+        if known_by_actor_ids:
+            created, knowledge_ids = events.add_with_actor_knowledge(
+                campaign_id,
+                summary=summary,
+                actor_ids=known_by_actor_ids,
+                knowledge_key=str(data["knowledge_key"]),
+                proposition=str(data["knowledge_proposition"]),
+                event_type=request["event_type"],
+                payload=request["payload"],
+                audience_scope=audience_scope,
+                disclosure_scope=request["knowledge_disclosure_scope"],
+                participants=deepcopy(participants),
+                branch_id=branch_id,
+                idempotency_key=key,
+                idempotency_write=atomic_write,
+            )
+            return {**asdict(created), "actor_knowledge_ids": knowledge_ids}
+        created = events.add(
+            campaign_id,
+            summary=summary,
+            event_type=request["event_type"],
+            payload=request["payload"],
+            audience_scope=audience_scope,
+            participants=deepcopy(participants),
+            branch_id=branch_id,
+            idempotency_key=key,
+            idempotency_write=atomic_write,
+        )
+        return {**asdict(created), "actor_knowledge_ids": []}
+
+    @mcp.tool()
+    def continuity_context(
+        campaign_id: str,
+        query: str = "",
+        actor_id: str | None = None,
+        scope_id: str = "party",
+        audience: Literal["dm", "player"] = "dm",
+        branch_id: str | None = None,
+        limit: int = 8,
+        budget_chars: int = 12_000,
+        related_refs: list[str] | None = None,
+        principal_id: str = LOCAL_SYSTEM_PRINCIPAL_ID,
+    ) -> dict[str, Any]:
+        """Retrieve one audience-safe, branch-scoped investigation context bundle."""
+
+        membership = access.require_campaign(campaign_id, principal_id)
+        resolved_branch = readable_branch_id(campaign_id, branch_id, principal_id)
+        resolved_scope = readable_scope_id(campaign_id, scope_id, principal_id)
+        if membership.role not in {"owner", "dm"}:
+            audience = "player"
+        if actor_id is not None:
+            actor_access(campaign_id, actor_id, principal_id)
+        return continuity.context(
+            campaign_id,
+            query=str(query or ""),
+            actor_id=actor_id,
+            scope_id=resolved_scope,
+            audience=audience,
+            branch_id=resolved_branch,
+            limit=int(limit),
+            budget_chars=int(budget_chars),
+            related_refs=list(related_refs or []),
         )
 
     @mcp.tool()
@@ -2512,11 +2878,26 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
     ) -> dict[str, Any]:
         actor_access(campaign_id, actor_id, principal_id)
         data = dict(data or {})
+        branch_id = readable_branch_id(campaign_id, data.get("branch_id"), principal_id)
         values = (
-            knowledge.search(campaign_id, actor_id=actor_id, query=str(data.get("query") or ""))
+            knowledge.search(
+                campaign_id,
+                actor_id=actor_id,
+                query=str(data.get("query") or " "),
+                branch_id=branch_id,
+                limit=int(data.get("limit", 8)),
+                include_inactive=bool(data.get("include_inactive", False)),
+            )
             if action == "search"
-            else knowledge.list(campaign_id, actor_id=actor_id)
+            else knowledge.list(
+                campaign_id,
+                actor_id=actor_id,
+                branch_id=branch_id,
+                include_inactive=bool(data.get("include_inactive", False)),
+            )
         )
+        if not is_dm(campaign_id, principal_id):
+            values = [item for item in values if item.disclosure_scope in {"owner", "public"}]
         return {"knowledge": [asdict(item) for item in values]}
 
     @mcp.tool()
@@ -2526,8 +2907,25 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
         actor_id: str,
         data: dict[str, Any],
         principal_id: str = "system:local",
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
-        actor_access(campaign_id, actor_id, principal_id, control=True)
+        require_dm(campaign_id, principal_id)
+        actor_access(campaign_id, actor_id, principal_id)
+        key = str(idempotency_key or "").strip()
+        if not key:
+            raise ValueError("idempotency_key is required for actor knowledge writes")
+        data = deepcopy(dict(data or {}))
+        branch_id = writable_branch_id(campaign_id, data.get("branch_id"))
+        request = {**data, "action": action, "actor_id": actor_id, "branch_id": branch_id}
+        scope = f"actor-knowledge:{campaign_id}:{branch_id}:{principal_id}:{actor_id}"
+        replay = replay_response(scope, key, request)
+        if replay is not None:
+            return replay
+        atomic_write = IdempotencyWrite(
+            scope=scope,
+            payload=request,
+            response=lambda result: asdict(result),
+        )
         if action == "add":
             return asdict(
                 knowledge.add(
@@ -2538,21 +2936,32 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
                     subject_ref=str(data.get("subject_ref") or ""),
                     epistemic_status=str(data.get("epistemic_status") or "known"),
                     confidence=int(data.get("confidence", 3)),
+                    source_event_id=data.get("source_event_id"),
                     cause=str(data.get("cause") or "witnessed"),
                     disclosure_scope=str(data.get("disclosure_scope") or "dm"),
+                    branch_id=branch_id,
+                    idempotency_key=key,
+                    idempotency_write=atomic_write,
                 )
             )
-        item = knowledge.get(str(data.get("knowledge_id") or ""))
+        item = knowledge.get(str(data.get("knowledge_id") or ""), branch_id=branch_id)
         if item.actor_id != actor_id:
             raise PermissionError("knowledge item belongs to another actor")
+        if not data.get("expected_revision_id"):
+            raise ValueError("data.expected_revision_id is required for knowledge revisions")
         return asdict(
             knowledge.revise(
                 item.id,
                 proposition=str(data.get("proposition") or ""),
                 epistemic_status=str(data.get("epistemic_status") or "known"),
                 confidence=int(data.get("confidence", 3)),
+                source_event_id=data.get("source_event_id"),
                 cause=str(data.get("cause") or "told_by"),
                 disclosure_scope=str(data.get("disclosure_scope") or "dm"),
+                branch_id=branch_id,
+                expected_revision_id=str(data["expected_revision_id"]),
+                idempotency_key=key,
+                idempotency_write=atomic_write,
             )
         )
 

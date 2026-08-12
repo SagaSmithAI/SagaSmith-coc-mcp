@@ -45,6 +45,14 @@ A real stdio-host regression covers Lobby → Play → Combat → Play. After ea
 
 Chases stay within Play and use `chase_start/query/action/end`, with strict mutual exclusion against Combat. At chase start, MCP reads an explicitly named CON, Drive Auto, or Pack-defined skill from each sheet, resolves speed checks from the campaign stream, then derives per-round action points from the slowest effective MOV. `chase_action` owns DEX order, action-point consumption, route position, obstacle checks, and round resets. A Pack or Agent must explicitly supply the sourced position effects of success and failure; MCP does not guess narrative terrain. Players can act only for controlled actors, start/end remain Keeper-only, and every random/state transition has revision and exact-idempotency receipts.
 
+Investigation continuity uses three distinct ledgers instead of treating narration as shared knowledge:
+
+- `campaign_event` appends a branch-local chronology entry with an explicit `dm`, `party`, `public`, or `actor` audience and optional speaker/listener/witness/target participants.
+- `continuity_context` returns one budgeted, branch-scoped context projection. Non-Keeper callers are always forced through the player projection and may retrieve private knowledge only for an owned actor.
+- `memory_change(action="commit")` atomically settles one event together with objective fact revisions, per-actor knowledge revisions, and an optional snapshot. Every derived fact and knowledge row defaults its provenance to the committed event; exact retries replay the same response and any failed component rolls back the whole settlement.
+
+Objective `memory_query` and all continuity writes are Keeper-only. Players cannot use the objective fact ledger to bypass clue, secret, false-belief, or split-party boundaries. Continuity remains available during Combat as a safe read, while chronology and memory writes close until Play resumes. Real stdio coverage verifies these native tools are added and removed with the phase-specific schema.
+
 ## Module Pack authoring
 
 CoC scenarios use the unified `sagasmith.content-package` schema version 2 lifecycle:

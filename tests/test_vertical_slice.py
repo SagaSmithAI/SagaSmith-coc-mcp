@@ -184,7 +184,9 @@ def test_coc_mcp_persists_campaign_modules_and_actor_knowledge(tmp_path) -> None
                 "data": {
                     "knowledge_key": "attic-whisper",
                     "proposition": "The whisper came from the attic.",
+                    "disclosure_scope": "owner",
                 },
+                "idempotency_key": "alice-attic-whisper",
             },
         )
         alice_knowledge = await call(
@@ -2497,6 +2499,33 @@ def test_stdio_client_can_discover_load_and_call(tmp_path) -> None:
                 assert "module_draft" not in play_tools
                 assert "content_pack" not in play_tools
                 assert "snapshot_change" in play_tools
+                continuity_loaded = await session.call_tool(
+                    "exposure",
+                    {
+                        "action": "set",
+                        "add_tool_ids": ["campaign_event", "continuity_context"],
+                    },
+                )
+                assert not continuity_loaded.isError
+                recorded = await session.call_tool(
+                    "campaign_event",
+                    {
+                        "action": "add",
+                        "campaign_id": campaign_id,
+                        "data": {
+                            "summary": "The investigators enter the rain-soaked house.",
+                            "audience_scope": "party",
+                        },
+                        "idempotency_key": "stdio-arrival-event",
+                    },
+                )
+                assert not recorded.isError
+                context = await session.call_tool(
+                    "continuity_context",
+                    {"campaign_id": campaign_id, "query": "rain-soaked house"},
+                )
+                assert not context.isError
+                assert len(json.loads(context.content[0].text)["events"]) == 1
                 combat_loaded = await session.call_tool(
                     "exposure",
                     {"action": "set", "add_tool_ids": ["combat_start"]},
@@ -2532,6 +2561,8 @@ def test_stdio_client_can_discover_load_and_call(tmp_path) -> None:
                 started = json.loads(started_result.content[0].text)
                 combat_tools = {item.name for item in (await session.list_tools()).tools}
                 assert "combat_start" not in combat_tools
+                assert "campaign_event" not in combat_tools
+                assert "continuity_context" in combat_tools
                 combat_loaded = await session.call_tool(
                     "exposure",
                     {

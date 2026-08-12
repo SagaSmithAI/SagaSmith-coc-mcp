@@ -44,6 +44,14 @@ combat_start -> combat_query
 
 追逐在 Play 内由 `chase_start/query/action/end` 管理，并与 Combat 严格互斥。开始追逐时，MCP 从角色 sheet 读取明确指定的 CON、Drive Auto 或 Pack 技能，使用战役随机流结算速度检定，再按最慢有效 MOV 计算每轮行动点。`chase_action` 权威维护 DEX 顺序、行动点消耗、路线位置、障碍检定和回合重置；障碍成功/失败对应的位置变化与来源必须由 Pack 或 Agent 明确提供，MCP 不猜测叙事地形。玩家只能操作被授权角色，开始/结束追逐只对 Keeper 开放，所有随机和状态变更均具 revision 与精确幂等收据。
 
+调查连续性使用彼此分离的三类账本，不能把叙述自动当成所有角色都知道的事实：
+
+- `campaign_event` 写入分支内时间线，必须显式给出 `dm`、`party`、`public` 或 `actor` 受众，并可标记 speaker/listener/witness/target 参与者。
+- `continuity_context` 返回受统一字符预算约束的分支上下文。非 Keeper 调用始终强制使用玩家投影，只能读取自己获授权角色的私有知识。
+- `memory_change(action="commit")` 将一个事件、客观事实修订、逐角色知识修订及可选快照原子结算；派生事实与知识默认引用同一来源事件。精确重试返回原响应，任何子项失败都会整体回滚。
+
+客观 `memory_query` 和全部连续性写入只对 Keeper 开放，玩家不能借客观事实账本绕过线索、秘密、错误信念或分队边界。Combat 期间保留安全的连续性读取，但关闭时间线与记忆写入，回到 Play 后再恢复；真实 stdio 回归验证这些原生工具随阶段 schema 正确出现和消失。
+
 ## Module Pack 创作流程
 
 CoC 模组使用统一的 `sagasmith.content-package` schema v2：

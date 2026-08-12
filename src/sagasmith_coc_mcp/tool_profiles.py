@@ -48,7 +48,7 @@ PHASE_TOOLS = {
         """
         actor_knowledge_change actor_knowledge_query campaign_change character_change
         branch_change branch_query character_query coc_check coc_dice_roll coc_resolve
-        memory_change memory_query state_revision
+        campaign_event continuity_context memory_change memory_query state_revision
         content_pack module_change module_draft module_query
         snapshot_change snapshot_query
         """
@@ -58,7 +58,7 @@ PHASE_TOOLS = {
         actor_knowledge_change actor_knowledge_query campaign_change character_change
         branch_change branch_query character_query coc_check coc_dice_roll coc_hp_change
         chase_action chase_end chase_query chase_start coc_resolve coc_sanity_check
-        combat_start memory_change memory_query state_revision
+        combat_start campaign_event continuity_context memory_change memory_query state_revision
         module_change module_query
         snapshot_change snapshot_query
         """
@@ -67,7 +67,7 @@ PHASE_TOOLS = {
         """
         actor_knowledge_query branch_change branch_query character_change character_query
         coc_check coc_dice_roll coc_hp_change coc_resolve coc_sanity_check combat_action
-        combat_attack combat_end combat_query memory_query module_query snapshot_change
+        combat_attack combat_end combat_query continuity_context module_query snapshot_change
         snapshot_query state_revision
         """
     ),
@@ -76,13 +76,15 @@ PHASE_TOOLS = {
 PHASE_DM_TOOLS = {
     PROFILE_LOBBY: _names(
         """
-        actor_knowledge_change branch_change character_change content_pack memory_change
+        actor_knowledge_change branch_change campaign_event character_change content_pack
+        memory_change memory_query
         module_change module_draft snapshot_change snapshot_query state_revision
         """
     ),
     PROFILE_PLAY: _names(
         """
-        actor_knowledge_change branch_change campaign_change memory_change module_change
+        actor_knowledge_change branch_change campaign_change campaign_event memory_change
+        memory_query module_change
         chase_end chase_start combat_start snapshot_change snapshot_query state_revision
         """
     ),

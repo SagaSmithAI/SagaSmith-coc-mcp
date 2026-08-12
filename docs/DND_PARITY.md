@@ -11,7 +11,7 @@
 | `sagasmith-dnd` | 107 个受版本控制文件、45 个 Python 测试文件 | 规则运行时参考实现 |
 | `sagasmith-coc` | 29 个受版本控制文件、5 个 Python 测试文件 | 仅具备基础判定、随机流和 Module Pack 编译 |
 | `SagaSmith-dnd-mcp` | 64 个 `public_tool`、80 个 Python 测试文件 | 全链路公共行为参考实现 |
-| `SagaSmith-coc-mcp` | 36 个 MCP 工具、1 个 Python 测试文件、16 项测试 | 已有创作、恢复、随机流、SAN/HP、权威战斗与追逐垂直切片，尚未形成完整运行时 |
+| `SagaSmith-coc-mcp` | 38 个 MCP 工具、2 个 Python 测试文件、18 项测试 | 已有创作、恢复、随机流、SAN/HP、事件连续性、权威战斗与追逐垂直切片，尚未形成完整运行时 |
 | `SagaSmith-dnd-skills` | 4,157 个受版本控制文件 | 包含完整技能、引用、模板和内容语料 |
 | `SagaSmith-coc-skills` | 34 个受版本控制文件 | 只有 Keeper、战役管理和少量静态引用 |
 | `sagasmith-dnd-ui` | 59 个受版本控制文件 | 含 Content Workbench、场景图谱和战斗工作区 |
@@ -29,12 +29,12 @@
 | 分支 | `branch_query/change` | 完成 | 公共 facade 覆盖 current/list/get/compare/create/checkout；revision、活动分支和幂等守卫；Lobby/Play 状态物化、精确重放与重启回归 |
 | 快照与恢复 | `snapshot_create/restore/query` | 完成 | 公共 facade 覆盖 list/get/verify/lineage/create/restore；head、revision、活动分支和幂等守卫；真实 stdio 宿主恢复后刷新阶段并成功执行下一次合法原生调用 |
 | revision、undo/redo | `state_revision` | 完成 | 公共 history/receipt/undo/redo；DM、分支历史游标、原子幂等响应、随机流状态撤销/重做与重启回归 |
-| 事件与连续性 | `campaign_event`、`continuity_context` | 缺失 | 事件原子落账、受众事实、时间线、恢复后连续性重建 |
+| 事件与连续性 | `campaign_event`、`continuity_context` | 完成基础运行链路 | 显式 dm/party/public/actor 受众与参与者；事件、客观事实、角色知识、可选快照原子提交；玩家强制安全投影；分支、精确重放、整体回滚、重启恢复和真实 stdio 动态工具回归。仍需 NPC 隔离会话和完整场景结算协议 |
 | 访问控制 | `access_grant`、campaign/actor scopes | 部分：grant 仍藏在 `campaign_change` | 独立任务型 facade；DM、玩家、私有 NPC、跨战役、调用时权限回归 |
 | 角色基础 | `character_create_from`、metadata/state tools | 部分：create/update/query | CoC investigator/NPC/creature schema、模板实例、metadata 与状态结算均有 revision/幂等 |
 | 物品与经济 | `inventory_change/transfer`、`wallet_change` | 缺失 | CoC 装备、武器、弹药、资产/信用评级相关确定性操作和原子转移 |
-| 角色知识 | `actor_knowledge_query/change` | 完成基础层 | DM/玩家受众、错误信念、分支恢复、NPC 私有上下文回归 |
-| 记忆 | `memory_query/change` | 完成基础层 | 分支隔离、revision 与恢复证据补齐 |
+| 角色知识 | `actor_knowledge_query/change` | 完成基础运行链路 | 分支读写、写入幂等、修订守卫、owner/public 玩家投影、跨玩家隔离、来源事件与重启回归；仍需 NPC 隔离会话上下文 |
+| 记忆 | `memory_query/change` | 完成基础运行链路 | Keeper-only 客观账本、分支读写、事实 identity/revision 守卫、与事件/角色知识原子结算、失败回滚和来源绑定 |
 | 模组检索 | `module_search`、`module_expand`、`module_query` | 部分：一个复合 `module_query` | search 返回有界命中；expand 返回精确来源；玩家不见 Keeper 内容；活动版本唯一 |
 | 技能/规则检索 | `rule_search/expand`、分层 `skill_query` | 部分：只能整文件读 skill，无规则 Pack | CoC 规则 Pack、outline/section/search/read、来源收据与战役规则上下文 |
 | 有界评估 | `bounded_evaluation` | 缺失 | Agent 裁定请求有明确输入、来源、默认 resolver 和持久化收据 |
@@ -83,7 +83,7 @@
 
 1. 以真实私有 PDF 证明 Module Draft 与 Pack 导入全流程。
 2. 实现规则书 Draft/Pack 与 CoC 规则检索，使 Quick-Start 能成为本地规则依据。
-3. 实现 event、continuity 与面向玩家/私有 NPC 的受众结算。
+3. 在已完成的受众安全事件与连续性账本之上，实现 NPC 隔离会话和完整调查场景结算。
 4. 在已完成的 SAN/HP、战斗与追逐垂直切片之上，实现调查、完整战斗/车辆追逐细节、NPC 对话和跨场景恢复流程。
 5. 更新 CoC Skills 和 ModuleGen，然后用 The Lightless Beacon 做垂直切片、Alone Against the Flames 做图回归。
 6. 对接 CoC UI，最后执行两个战役并行回测与完整完成审计。
