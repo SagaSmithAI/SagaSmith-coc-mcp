@@ -215,6 +215,37 @@ def test_inventory_wallet_and_source_study_are_atomic_and_idempotent(tmp_path: P
             },
         )
         assert recovered["random_stream_receipt"]["draw_count"] >= 1
+        therapy = await call(
+            server,
+            "long_term_change",
+            {
+                "action": "therapy",
+                "campaign_id": campaign_id,
+                "actor_id": actor["id"],
+                "data": {"source": "Reviewed downtime interval.", "amount": 2},
+                "expected_revision": recovered["campaign_revision"],
+                "expected_character_revision": recovered["character_revision"],
+                "idempotency_key": "therapy",
+            },
+        )
+        assert therapy["receipt"]["san"]["gain"] == 2
+        aged = await call(
+            server,
+            "long_term_change",
+            {
+                "action": "aging",
+                "campaign_id": campaign_id,
+                "actor_id": actor["id"],
+                "data": {
+                    "source": "Reviewed age-band adjustment.",
+                    "characteristic_changes": {"edu": 1, "dex": -1},
+                },
+                "expected_revision": therapy["campaign_revision"],
+                "expected_character_revision": therapy["character_revision"],
+                "idempotency_key": "aging",
+            },
+        )
+        assert aged["receipt"]["after"]["edu"] == aged["receipt"]["before"]["edu"] + 1
         current = await call(
             server,
             "character_query",
@@ -223,6 +254,98 @@ def test_inventory_wallet_and_source_study_are_atomic_and_idempotent(tmp_path: P
         assert current["sheet"]["inventory"][0]["id"] == "item.lantern"
         assert current["sheet"]["monetary"]["cash_cents"] == 500
         assert current["sheet"]["books"][0]["id"] == "tome.private-fragment"
+
+    asyncio.run(scenario())
+
+
+def test_vehicle_chase_preserves_source_bound_cards_through_public_facade(
+    tmp_path: Path,
+) -> None:
+    server = create_server(config(tmp_path))
+
+    async def scenario() -> None:
+        campaign = await call(
+            server,
+            "campaign_change",
+            {"action": "create", "data": {"name": "Vehicles", "idempotency_key": "c"}},
+        )
+        campaign_id = campaign["id"]
+
+        async def create_driver(name: str) -> dict:
+            return await call(
+                server,
+                "character_change",
+                {
+                    "action": "create",
+                    "campaign_id": campaign_id,
+                    "data": {
+                        "name": name,
+                        "sheet": {
+                            "characteristics": {"con": 60, "dex": 60},
+                            "skills": {"Drive Auto": 60},
+                            "mov": 8,
+                        },
+                    },
+                },
+            )
+
+        lead = await create_driver("Lead Driver")
+        pursuit = await create_driver("Pursuit Driver")
+        phased = await call(
+            server,
+            "campaign_change",
+            {
+                "action": "set_phase",
+                "campaign_id": campaign_id,
+                "data": {"phase": "play", "expected_revision": campaign["revision"]},
+            },
+        )
+        started = await call(
+            server,
+            "chase_start",
+            {
+                "campaign_id": campaign_id,
+                "participants": [
+                    {
+                        "actor_id": lead["id"],
+                        "role": "fleeing",
+                        "speed_skill_name": "Drive Auto",
+                        "participant_kind": "vehicle",
+                        "vehicle": {
+                            "source_id": "vehicle.sedan",
+                            "name": "Sedan",
+                            "mov": 12,
+                            "build": 5,
+                        },
+                    },
+                    {
+                        "actor_id": pursuit["id"],
+                        "role": "pursuer",
+                        "speed_skill_name": "Drive Auto",
+                        "participant_kind": "vehicle",
+                        "vehicle": {
+                            "source_id": "vehicle.truck",
+                            "name": "Truck",
+                            "mov": 11,
+                            "build": 6,
+                        },
+                    },
+                ],
+                "expected_character_revisions": {
+                    lead["id"]: lead["revision"],
+                    pursuit["id"]: pursuit["revision"],
+                },
+                "source": "Reviewed source vehicle chase setup.",
+                "expected_revision": phased["revision"],
+                "idempotency_key": "vehicle-chase",
+            },
+        )
+        assert started["chase"]["participants"][lead["id"]]["vehicle"] == {
+            "source_id": "vehicle.sedan",
+            "name": "Sedan",
+            "mov": 12,
+            "build": 5,
+        }
 
     asyncio.run(scenario())
 
