@@ -11,6 +11,7 @@ from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 from pypdf import PdfWriter
 from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
+from sagasmith_core import ModuleService
 
 from sagasmith_coc_mcp.config import McpConfig
 from sagasmith_coc_mcp.exposure import ExposureError, ExposureRegistry
@@ -613,6 +614,69 @@ def test_module_draft_pack_round_trip_is_finalized_replayable_and_cross_campaign
     asyncio.run(import_elsewhere())
 
 
+def test_module_draft_advance_resumes_an_interrupted_mechanical_first_pass(
+    tmp_path, monkeypatch
+) -> None:
+    config = McpConfig(
+        home=tmp_path / "home",
+        database_url=None,
+        coc_skills_dir=tmp_path / "coc",
+        modulegen_skills_dir=tmp_path / "modulegen",
+    )
+    server = create_server(config)
+    original_preview = ModuleService.preview_path
+
+    async def exercise() -> None:
+        campaign = await call(
+            server,
+            "campaign_change",
+            {
+                "action": "create",
+                "data": {"name": "Interrupted import", "idempotency_key": "advance-campaign"},
+            },
+        )
+
+        def interrupt_preview(*args, **kwargs):
+            raise RuntimeError("simulated interruption after durable staging")
+
+        monkeypatch.setattr(ModuleService, "preview_path", interrupt_preview)
+        with pytest.raises(Exception, match="simulated interruption"):
+            await call(
+                server,
+                "module_draft",
+                {
+                    "action": "start",
+                    "campaign_id": campaign["id"],
+                    "data": {
+                        "name": "interrupted.md",
+                        "title": "Interrupted Case",
+                        "content": "# Case\n## Scene\nA source-backed clue.\n",
+                    },
+                    "idempotency_key": "interrupted-start",
+                },
+            )
+        monkeypatch.setattr(ModuleService, "preview_path", original_preview)
+        jobs = await call(
+            server,
+            "module_draft",
+            {"action": "get", "campaign_id": campaign["id"]},
+        )
+        assert len(jobs["jobs"]) == 1
+        assert jobs["jobs"][0]["state"] == "staged"
+        arguments = {
+            "action": "edit",
+            "campaign_id": campaign["id"],
+            "data": {"job_id": jobs["jobs"][0]["job_id"], "operation": "advance"},
+            "idempotency_key": "resume-first-pass",
+        }
+        advanced = await call(server, "module_draft", arguments)
+        assert advanced["job"]["state"] == "imported"
+        assert advanced["status"] == "editing"
+        assert await call(server, "module_draft", arguments) == advanced
+
+    asyncio.run(exercise())
+
+
 def test_module_source_path_must_be_inside_configured_import_roots(tmp_path) -> None:
     allowed = tmp_path / "allowed"
     allowed.mkdir()
@@ -746,6 +810,52 @@ def test_module_draft_content_asset_and_actor_edits_enter_final_pack(tmp_path) -
         }
         content_edit = await call(server, "module_draft", content_args)
         assert await call(server, "module_draft", content_args) == content_edit
+        statblock_args = {
+            "action": "edit",
+            "campaign_id": campaign["id"],
+            "data": {
+                "job_id": draft["job_id"],
+                "operation": "statblock",
+                "scene_id": chunk["scene_id"],
+                "content_key": "statblock:mr-marsh",
+                "statblock": {
+                    "actor_type": "npc",
+                    "name": "Mr Marsh",
+                    "characteristics": {"dex": 55},
+                    "skills": {"Persuade": 50},
+                    "notes": ["The source prints only social statistics."],
+                },
+                "source_chunk_ids": [chunk["id"]],
+                "observation": "Reviewed the partial NPC card without filling absent combat data.",
+            },
+            "expected_revision": content_edit["job"]["revision"],
+            "idempotency_key": "edits-statblock",
+        }
+        statblock_edit = await call(server, "module_draft", statblock_args)
+        assert await call(server, "module_draft", statblock_args) == statblock_edit
+        assert statblock_edit["runtime_readiness"]["combat_ready"] is False
+        assert "hit_points" in statblock_edit["runtime_readiness"]["missing_for_combat"]
+        with pytest.raises(Exception, match="use operation=statblock"):
+            await call(
+                server,
+                "module_draft",
+                {
+                    "action": "edit",
+                    "campaign_id": campaign["id"],
+                    "data": {
+                        "job_id": draft["job_id"],
+                        "operation": "content",
+                        "scene_id": chunk["scene_id"],
+                        "content_key": "statblock:bypass",
+                        "content_kind": "coc7e_statblock",
+                        "normalized_content": "{}",
+                        "source_chunk_ids": [chunk["id"]],
+                        "observation": "Attempted bypass.",
+                    },
+                    "expected_revision": statblock_edit["job"]["revision"],
+                    "idempotency_key": "edits-statblock-bypass",
+                },
+            )
         asset_args = {
             "action": "edit",
             "campaign_id": campaign["id"],
@@ -757,7 +867,7 @@ def test_module_draft_content_asset_and_actor_edits_enter_final_pack(tmp_path) -
                 "scene_id": chunk["scene_id"],
                 "title": "Lantern Mark",
             },
-            "expected_revision": content_edit["job"]["revision"],
+            "expected_revision": statblock_edit["job"]["revision"],
             "idempotency_key": "edits-asset",
         }
         asset_edit = await call(server, "module_draft", asset_args)
@@ -815,7 +925,13 @@ def test_module_draft_content_asset_and_actor_edits_enter_final_pack(tmp_path) -
         )
         package = finalized["package"]
         assert [actor["id"] for actor in package["actors"]] == ["coc7e.actor.mr-marsh"]
-        assert package["content_reviews"][0]["kind"] == "clue"
+        assert [item["kind"] for item in package["content_reviews"]] == [
+            "clue",
+            "coc7e_statblock",
+        ]
+        stored_statblock = json.loads(package["content_reviews"][1]["normalized_content"])
+        assert stored_statblock["characteristics"] == {"dex": 55}
+        assert "hit_points" not in stored_statblock
         assert any(asset["kind"] == "handout" for asset in package["assets"])
         stored = await call(
             server,

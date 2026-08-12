@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import re
 from copy import deepcopy
 from dataclasses import asdict
@@ -32,6 +33,7 @@ from sagasmith_coc.random_stream import (
     initial_random_stream,
     use_random_stream,
 )
+from sagasmith_coc.statblocks import coc7e_statblock_readiness, validate_coc7e_statblock
 from sagasmith_coc.system import validate_investigator_sheet
 from sagasmith_core import (
     AccessService,
@@ -339,6 +341,183 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
             raise RuntimeError("module inspection page_revisions must be an array")
         return [deepcopy(dict(item)) for item in revisions if isinstance(item, dict)]
 
+    def advance_module_draft(job: Any, key: str, principal_id: str) -> dict[str, Any]:
+        """Resume the mechanical first pass after any committed intermediate step."""
+
+        request = {
+            "operation": "advance_module_draft",
+            "job_id": job.id,
+            "artifact_checksum": job.artifact_checksum,
+        }
+        scope = f"module-draft-advance:{job.campaign_id}:{job.id}:{principal_id}"
+        replay = replay_response(scope, key, request)
+        if replay is not None:
+            return replay
+        if dict(job.result or {}).get("finalized_package") or job.state == "compiled":
+            raise ValueError("a finalized module draft is immutable")
+        if job.state == "imported":
+            response = {
+                "job": import_job_view(job),
+                "inspection": deepcopy(job.inspection),
+                "validation": deepcopy(job.validation),
+                "module_id": job.module_id,
+                "status": "editing",
+            }
+            return remember_response(
+                scope,
+                key,
+                request,
+                response,
+                campaign_id=job.campaign_id,
+            )
+
+        values = dict(job.payload or {})
+        source = storage.artifact_module_path(job.artifact)
+        if job.state in {"staged", "failed"}:
+            inspect_scope = f"{scope}:inspect"
+            inspect_key = f"{key}:inspect"
+            inspected = replay_response(inspect_scope, inspect_key, request)
+            if inspected is None:
+                inspection = modules.preview_path(
+                    source,
+                    parser=parser,
+                    document_cache_dir=config.normalized_modules_dir,
+                    expected_checksum=job.artifact_checksum,
+                )
+                job = import_jobs.record_inspection(
+                    job.id,
+                    inspection,
+                    expected_revision=job.revision,
+                    idempotency_key=inspect_key,
+                    idempotency_write=IdempotencyWrite(
+                        scope=inspect_scope,
+                        payload=request,
+                        response=lambda value: {"job_id": value.id},
+                    ),
+                )
+            else:
+                job = require_module_job(job.campaign_id, str(inspected["job_id"]))
+
+        if job.state == "inspected":
+            inspection = deepcopy(job.inspection)
+            validation = {
+                "valid": bool(inspection.get("valid", not inspection.get("errors"))),
+                "errors": list(inspection.get("errors") or []),
+                "warnings": list(inspection.get("warnings") or []),
+            }
+            if not validation["valid"]:
+                public_validation = deepcopy(validation)
+                failed = import_jobs.record_validation(
+                    job.id,
+                    validation,
+                    state="failed",
+                    expected_revision=job.revision,
+                    idempotency_key=key,
+                    idempotency_write=IdempotencyWrite(
+                        scope=scope,
+                        payload=request,
+                        response=lambda value: {
+                            "job": import_job_view(value),
+                            "inspection": deepcopy(value.inspection),
+                            "validation": deepcopy(public_validation),
+                            "module_id": value.module_id,
+                            "status": "needs_repair",
+                        },
+                    ),
+                )
+                return {
+                    "job": import_job_view(failed),
+                    "inspection": inspection,
+                    "validation": validation,
+                    "module_id": failed.module_id,
+                    "status": "needs_repair",
+                }
+            validate_scope = f"{scope}:validate"
+            validate_key = f"{key}:validate"
+            validated = replay_response(validate_scope, validate_key, request)
+            if validated is None:
+                job = import_jobs.record_validation(
+                    job.id,
+                    validation,
+                    expected_revision=job.revision,
+                    idempotency_key=validate_key,
+                    idempotency_write=IdempotencyWrite(
+                        scope=validate_scope,
+                        payload=request,
+                        response=lambda value: {"job_id": value.id},
+                    ),
+                )
+            else:
+                job = require_module_job(job.campaign_id, str(validated["job_id"]))
+
+        if job.state == "validated":
+            ingest_scope = f"{scope}:ingest"
+            ingest_key = f"{key}:ingest"
+            ingested = replay_response(ingest_scope, ingest_key, request)
+            if ingested is None:
+                imported = modules.ingest_path(
+                    campaign_id=job.campaign_id,
+                    path=source,
+                    source_key=str(values.get("source_key") or job.artifact),
+                    logical_source_key=str(values.get("source_key") or job.artifact),
+                    title=str(values.get("title") or job.artifact),
+                    parser=parser,
+                    activate=False,
+                    document_cache_dir=config.normalized_modules_dir,
+                    expected_checksum=job.artifact_checksum,
+                    page_revisions=import_page_revisions(job),
+                    idempotency_key=ingest_key,
+                    idempotency_write=IdempotencyWrite(
+                        scope=ingest_scope,
+                        payload=request,
+                        response=lambda value: {
+                            "module_id": value.module_id,
+                            "scenes": value.scenes,
+                            "chunks": value.chunks,
+                        },
+                    ),
+                )
+                mechanical_import = {
+                    "module_id": imported.module_id,
+                    "scenes": imported.scenes,
+                    "chunks": imported.chunks,
+                }
+            else:
+                mechanical_import = dict(ingested)
+            public_import = deepcopy(mechanical_import)
+            updated = import_jobs.record_result(
+                job.id,
+                {
+                    **dict(job.result or {}),
+                    "mechanical_import": mechanical_import,
+                    "pack_draft": {},
+                    "pack_edit_history": [],
+                },
+                state="imported",
+                module_id=str(mechanical_import["module_id"]),
+                expected_revision=job.revision,
+                idempotency_key=key,
+                idempotency_write=IdempotencyWrite(
+                    scope=scope,
+                    payload=request,
+                    response=lambda value: {
+                        "job": import_job_view(value),
+                        "inspection": deepcopy(value.inspection),
+                        "validation": deepcopy(value.validation),
+                        "module_id": public_import["module_id"],
+                        "status": "editing",
+                    },
+                ),
+            )
+            return {
+                "job": import_job_view(updated),
+                "inspection": deepcopy(updated.inspection),
+                "validation": deepcopy(updated.validation),
+                "module_id": updated.module_id,
+                "status": "editing",
+            }
+        raise ValueError(f"module draft cannot advance from state {job.state!r}")
+
     def replay_response(scope: str, key: str, payload: dict[str, Any]) -> dict[str, Any] | None:
         replay = idempotency.lookup(scope, key, payload)
         if replay is None:
@@ -497,7 +676,9 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
                 "kinds": ["module"],
                 "draft_stages": [
                     "module_draft(start)",
+                    "module_draft(edit:advance)",
                     "module_draft(evidence)",
+                    "module_draft(edit:source_text|content|statblock|asset|actor)",
                     "module_draft(edit:package)",
                     "module_draft(finalize)",
                     "content_pack(import)",
@@ -1071,6 +1252,12 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
                 )
             return {"job_id": job.id, "evidence": evidence}
 
+        if action == "edit" and str(data.get("operation") or "").strip() == "advance":
+            advance_key = str(idempotency_key or "").strip()
+            if not advance_key:
+                raise ValueError("idempotency_key is required to advance a module draft")
+            return advance_module_draft(job, advance_key, principal_id)
+
         revision, key = require_write_contract(expected_revision, idempotency_key)
         if action == "edit":
             operation = str(data.get("operation") or "").strip()
@@ -1378,8 +1565,10 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
                 raise ValueError("module edits require a mechanically imported draft")
             if dict(job.result or {}).get("finalized_package"):
                 raise ValueError("a finalized module draft is immutable")
-            if operation not in {"content", "asset", "actor", "package"}:
-                raise ValueError("data.operation must be content, asset, actor, or package")
+            if operation not in {"content", "statblock", "asset", "actor", "package"}:
+                raise ValueError(
+                    "data.operation must be content, statblock, asset, actor, or package"
+                )
             request = {
                 "operation": f"edit_module_{operation}",
                 "job_id": job.id,
@@ -1406,9 +1595,65 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
                 edit_record,
             ]
 
-            if operation == "content":
+            if operation == "statblock":
+                raw_statblock = data.get("statblock")
+                if not isinstance(raw_statblock, dict):
+                    raise ValueError("data.statblock must be an object")
+                statblock = validate_coc7e_statblock(raw_statblock)
+                readiness = coc7e_statblock_readiness(statblock)
+                service_payload = {
+                    "module_id": job.module_id,
+                    "scene_id": str(data.get("scene_id") or ""),
+                    "content_key": str(data.get("content_key") or ""),
+                    "content_kind": "coc7e_statblock",
+                    "normalized_content": json.dumps(
+                        statblock,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    "source_asset_id": data.get("source_asset_id"),
+                    "page_number": data.get("page_number"),
+                    "source_chunk_ids": list(data.get("source_chunk_ids") or []),
+                    "observation": str(data.get("observation") or ""),
+                    "metadata": {
+                        **dict(data.get("metadata") or {}),
+                        "statblock_schema": "sagasmith.coc7e-statblock.v1",
+                        "runtime_readiness": readiness,
+                    },
+                }
+                service_scope = f"{scope}:statblock"
+                service_key = f"{key}:statblock"
+                saved = replay_response(service_scope, service_key, service_payload)
+                if saved is None:
+                    review = modules.review_content(
+                        campaign_id=campaign_id,
+                        reviewer=principal_id,
+                        idempotency_key=service_key,
+                        idempotency_write=IdempotencyWrite(
+                            scope=service_scope,
+                            payload=service_payload,
+                            response=lambda value: {"review": value},
+                        ),
+                        **service_payload,
+                    )
+                else:
+                    review = dict(saved["review"])
+                review_ids = list(prior.get("content_review_ids") or [])
+                if review["id"] not in review_ids:
+                    review_ids.append(review["id"])
+                result_value = {
+                    **prior,
+                    "content_review_ids": review_ids,
+                    "draft_edit_history": operation_history,
+                }
+                public = {
+                    "review": review,
+                    "statblock": statblock,
+                    "runtime_readiness": readiness,
+                }
+            elif operation == "content":
                 allowed_kinds = {
-                    "coc7e_statblock",
                     "clue",
                     "handout",
                     "map_transcription",
@@ -1419,7 +1664,10 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
                 }
                 content_kind = str(data.get("content_kind") or "custom").strip()
                 if content_kind not in allowed_kinds:
-                    raise ValueError("data.content_kind is not a supported CoC review kind")
+                    raise ValueError(
+                        "data.content_kind is not a supported CoC review kind; "
+                        "use operation=statblock for CoC statblocks"
+                    )
                 service_payload = {
                     "module_id": job.module_id,
                     "scene_id": str(data.get("scene_id") or ""),

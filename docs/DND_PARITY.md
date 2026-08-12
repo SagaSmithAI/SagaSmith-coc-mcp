@@ -11,7 +11,7 @@
 | `sagasmith-dnd` | 107 个受版本控制文件、45 个 Python 测试文件 | 规则运行时参考实现 |
 | `sagasmith-coc` | 29 个受版本控制文件、5 个 Python 测试文件 | 仅具备基础判定、随机流和 Module Pack 编译 |
 | `SagaSmith-dnd-mcp` | 64 个 `public_tool`、80 个 Python 测试文件 | 全链路公共行为参考实现 |
-| `SagaSmith-coc-mcp` | 25 个 MCP 工具、1 个 Python 测试文件、11 项测试 | 已有创作、恢复与随机流垂直切片，尚未形成完整运行时 |
+| `SagaSmith-coc-mcp` | 25 个 MCP 工具、1 个 Python 测试文件、12 项测试 | 已有创作、恢复与随机流垂直切片，尚未形成完整运行时 |
 | `SagaSmith-dnd-skills` | 4,157 个受版本控制文件 | 包含完整技能、引用、模板和内容语料 |
 | `SagaSmith-coc-skills` | 34 个受版本控制文件 | 只有 Keeper、战役管理和少量静态引用 |
 | `sagasmith-dnd-ui` | 59 个受版本控制文件 | 含 Content Workbench、场景图谱和战斗工作区 |
@@ -44,7 +44,7 @@
 | 能力域 | D&D 当前协议 | CoC 当前状态 | CoC 完成证据要求 |
 | --- | --- | --- | --- |
 | 当前 Pack schema | unified `sagasmith.content-package` v2 | 完成模块层 | CoC 模块 validator、archive round trip、跨战役导入 |
-| Module Draft | `start/get/evidence/edit/finalize`；source/content/statblock/asset/actor/package/advance | 部分：已具备 PDF 页证据、source/content/asset/actor/package；缺 CoC statblock 专用校验与 advance | CoC statblock 校验和 advance 通过当前 facade；真实用户 PDF 完成一次全流程 |
+| Module Draft | `start/get/evidence/edit/finalize`；source/content/statblock/asset/actor/package/advance | 部分：功能面已具备 PDF 页证据、source/content/statblock/asset/actor/package/advance；尚缺真实私有 PDF 全流程证据 | CoC statblock 校验和中断后 advance 已通过当前 facade；真实用户 PDF 完成一次全流程 |
 | 终结信任边界 | Agent 明确确认；最终档不可变 | 完成基础层 | 精确幂等重放、重启后不可变、新修改只能创建新版本 |
 | Pack 管理 | list/get/import/export/activate/deactivate/remove | 部分：缺 deactivate；remove 仅非活动模块 | 导入、激活、停用、删除均有 revision、幂等、并发和进度重映射证据 |
 | Pack 导入原子性 | MCP 负责结果与幂等 | 部分：正常重放成立，崩溃窗口仍可能重复导入 | 整个模块、演员、资产、archive 注册与幂等响应同一可恢复事务或可证明的确定性恢复协议 |
@@ -81,7 +81,7 @@
 
 ## 当前最短关键路径
 
-1. 补齐 Module Draft 的 source/content/asset/actor/advance，并关闭 Pack 导入崩溃重复窗口。
+1. 关闭 Pack 导入崩溃重复窗口，并以真实私有 PDF 证明 Module Draft 全流程。
 2. 实现规则书 Draft/Pack 与 CoC 规则检索，使 Quick-Start 能成为本地规则依据。
 3. 实现 event、continuity 与面向玩家/私有 NPC 的受众结算。
 4. 实现 SAN、调查、战斗、追逐和 NPC 对话的权威结算。

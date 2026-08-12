@@ -29,14 +29,16 @@ CoC scenarios use the unified `sagasmith.content-package` schema version 2 lifec
 
 ```text
 module_draft(start)
+  -> module_draft(edit, operation="advance")  # only after an interrupted first pass
   -> module_draft(evidence)
+  -> module_draft(edit, operation="statblock|content|asset|actor")
   -> module_draft(edit, operation="package")
   -> module_draft(finalize)
   -> content_pack(import)
   -> content_pack(activate)
 ```
 
-`start` accepts either an allowlisted PDF/Markdown/text `source_path` or generated `name` plus `content`. Mechanical import creates an inactive draft. `evidence` exposes bounded chunks, managed PDF-page render receipts, assets, and content reviews. `edit` supports checksum-bound PDF transcription repair, reviewed CoC content, allowlisted assets, actor bindings, and Pack decisions. Any source-text repair creates a new inactive mechanical revision and invalidates downstream draft decisions. Pack profile and catalog decisions must use the exact source receipts returned by `evidence`. Finalization requires an explicit Agent confirmation and writes an immutable `.sagasmith-pack` archive. Only a module re-imported from that finalized archive may be activated.
+`start` accepts either an allowlisted PDF/Markdown/text `source_path` or generated `name` plus `content`. Mechanical import creates an inactive draft; `advance` resumes from a committed intermediate step after interruption. `evidence` exposes bounded chunks, managed PDF-page render receipts, assets, and content reviews. `edit` supports checksum-bound PDF transcription repair, reviewed CoC content, current CoC statblock-schema validation, allowlisted assets, actor bindings, and Pack decisions. Statblocks may preserve source-true partial non-combat NPC data; only an explicit `combat_ready` declaration requires combat fields. Any source-text repair creates a new inactive mechanical revision and invalidates downstream draft decisions. Pack profile and catalog decisions must use the exact source receipts returned by `evidence`. Finalization requires an explicit Agent confirmation and writes an immutable `.sagasmith-pack` archive. Only a module re-imported from that finalized archive may be activated.
 
 Commercial rulebooks and scenarios remain local. Configure allowed source roots with `SAGASMITH_COC_MCP_MODULE_IMPORT_ROOTS`, separated by the platform path separator. Source books and extracted assets are never bundled in this repository.
 
