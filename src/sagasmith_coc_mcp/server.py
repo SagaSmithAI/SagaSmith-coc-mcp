@@ -98,6 +98,7 @@ from sagasmith_core import (
 )
 from sagasmith_core.access import LOCAL_SYSTEM_PRINCIPAL_ID
 from sagasmith_core.modules import MarkdownModuleParser
+from sagasmith_core.visibility import PLAYER_MODULE_VISIBILITY_SCOPES
 
 from .config import McpConfig
 from .exposure import Exposure, ExposureError, ExposureRegistry
@@ -1101,13 +1102,40 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
 
     @mcp.tool()
     def character_change(
-        action: Literal["create", "update"],
+        action: Literal["create", "instantiate", "update"],
         campaign_id: str,
         data: dict[str, Any],
         character_id: str | None = None,
         principal_id: str = "system:local",
     ) -> dict[str, Any]:
         membership = access.require_campaign(campaign_id, principal_id)
+        if action == "instantiate":
+            require_dm(campaign_id, principal_id)
+            template_id = str(data.get("template_id") or "").strip()
+            if not template_id:
+                raise ValueError("data.template_id is required")
+            template = characters.get(template_id)
+            if template.system_id != "coc7e" or template.character_type != "investigator":
+                raise ValueError("template must be a CoC investigator")
+            created = characters.instantiate(
+                template_id,
+                campaign_id=campaign_id,
+                name=(str(data["name"]) if data.get("name") is not None else None),
+                player_name=(
+                    str(data["player_name"])
+                    if data.get("player_name") is not None
+                    else None
+                ),
+                sheet=validate_investigator_sheet(dict(template.sheet)),
+            )
+            access.grant_actor(
+                campaign_id,
+                principal_id,
+                created.id,
+                can_control=True,
+                can_view_private=True,
+            )
+            return asdict(created)
         if action == "create":
             character_type = str(data.get("character_type") or "investigator")
             if character_type not in {"investigator", "npc", "creature"}:
@@ -2555,13 +2583,21 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
             return {
                 "scenes": values
                 if keeper
-                else [item for item in values if item["visibility"] == "player"]
+                else [
+                    item
+                    for item in values
+                    if item["visibility"] in PLAYER_MODULE_VISIBILITY_SCOPES
+                ]
             }
         if action == "current":
             value = modules.current_scene(
                 campaign_id, scope_id=str(data.get("scope_id") or "party")
             )
-            if value and not keeper and value.get("visibility") != "player":
+            if (
+                value
+                and not keeper
+                and value.get("visibility") not in PLAYER_MODULE_VISIBILITY_SCOPES
+            ):
                 return {"scene": None}
             return {"scene": value}
         if action == "progress":
@@ -2579,7 +2615,12 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
         return {
             "hits": values
             if keeper
-            else [item for item in values if item.get("metadata", {}).get("visibility") == "player"]
+            else [
+                item
+                for item in values
+                if item.get("metadata", {}).get("visibility")
+                in PLAYER_MODULE_VISIBILITY_SCOPES
+            ]
         }
 
     @mcp.tool()

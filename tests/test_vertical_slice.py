@@ -243,7 +243,8 @@ def test_coc_mcp_persists_campaign_modules_and_actor_knowledge(tmp_path) -> None
                     "title": "The Haunting",
                     "content": (
                         "# Boston\n## Corbitt House\nTwo investigators arrive in the 1920s. "
-                        "A hidden clue waits upstairs.\n## Ending\nThe case is solved."
+                        "A hidden clue waits upstairs.\n## Handout: Public Notice\n"
+                        "The public notice warns visitors.\n## Ending\nThe case is solved."
                     ),
                 },
                 "idempotency_key": "haunting-draft",
@@ -262,7 +263,8 @@ def test_coc_mcp_persists_campaign_modules_and_actor_knowledge(tmp_path) -> None
                     "title": "The Haunting",
                     "content": (
                         "# Boston\n## Corbitt House\nTwo investigators arrive in the 1920s. "
-                        "A hidden clue waits upstairs.\n## Ending\nThe case is solved."
+                        "A hidden clue waits upstairs.\n## Handout: Public Notice\n"
+                        "The public notice warns visitors.\n## Ending\nThe case is solved."
                     ),
                 },
                 "idempotency_key": "haunting-draft",
@@ -401,6 +403,18 @@ def test_coc_mcp_persists_campaign_modules_and_actor_knowledge(tmp_path) -> None
             {"action": "index", "campaign_id": campaign_id},
         )
         assert any(scene["title"] == "Corbitt House" for scene in scenes["scenes"])
+        player_scenes = await call(
+            server,
+            "module_query",
+            {
+                "action": "index",
+                "campaign_id": campaign_id,
+                "principal_id": "player:alice",
+            },
+        )
+        assert [scene["title"] for scene in player_scenes["scenes"]] == [
+            "Handout: Public Notice"
+        ]
         check = await call(
             server,
             "coc_resolve",
@@ -787,6 +801,21 @@ def test_module_draft_content_asset_and_actor_edits_enter_final_pack(tmp_path, m
                 },
             },
         )
+        pregen = await call(
+            server,
+            "character_change",
+            {
+                "action": "create",
+                "campaign_id": campaign["id"],
+                "data": {
+                    "name": "Harriet Vane",
+                    "sheet": {
+                        "characteristics": {"pow": 60, "dex": 70},
+                        "skills": {"Spot Hidden": 65},
+                    },
+                },
+            },
+        )
         draft = await call(
             server,
             "module_draft",
@@ -912,6 +941,24 @@ def test_module_draft_content_asset_and_actor_edits_enter_final_pack(tmp_path, m
         }
         actor_edit = await call(server, "module_draft", actor_args)
         assert await call(server, "module_draft", actor_args) == actor_edit
+        pregen_edit = await call(
+            server,
+            "module_draft",
+            {
+                "action": "edit",
+                "campaign_id": campaign["id"],
+                "data": {
+                    "job_id": draft["job_id"],
+                    "operation": "actor",
+                    "character_id": pregen["id"],
+                    "actor_card_id": "coc7e.actor.harriet-vane",
+                    "binding_kind": "preset_pc",
+                    "role": "investigator",
+                },
+                "expected_revision": actor_edit["job"]["revision"],
+                "idempotency_key": "edits-pregen",
+            },
+        )
         package_edit = await call(
             server,
             "module_draft",
@@ -923,7 +970,7 @@ def test_module_draft_content_asset_and_actor_edits_enter_final_pack(tmp_path, m
                     "operation": "package",
                     **synthetic_pack_decisions(chunk["source_ref"], title="The Marsh Case"),
                 },
-                "expected_revision": actor_edit["job"]["revision"],
+                "expected_revision": pregen_edit["job"]["revision"],
                 "idempotency_key": "edits-package",
             },
         )
@@ -947,7 +994,10 @@ def test_module_draft_content_asset_and_actor_edits_enter_final_pack(tmp_path, m
             },
         )
         package = finalized["package"]
-        assert [actor["id"] for actor in package["actors"]] == ["coc7e.actor.mr-marsh"]
+        assert [actor["id"] for actor in package["actors"]] == [
+            "coc7e.actor.harriet-vane",
+            "coc7e.actor.mr-marsh",
+        ]
         assert [item["kind"] for item in package["content_reviews"]] == [
             "clue",
             "coc7e_statblock",
@@ -1011,6 +1061,32 @@ def test_module_draft_content_asset_and_actor_edits_enter_final_pack(tmp_path, m
             {"action": "list", "campaign_id": target["id"]},
         )
         assert [item["name"] for item in target_characters["characters"]] == ["Mr Marsh"]
+        instantiated = await call(
+            server,
+            "character_change",
+            {
+                "action": "instantiate",
+                "campaign_id": target["id"],
+                "data": {
+                    "template_id": imported["actor_map"]["coc7e.actor.harriet-vane"],
+                    "player_name": "Player One",
+                },
+            },
+        )
+        assert instantiated["template_id"] == imported["actor_map"][
+            "coc7e.actor.harriet-vane"
+        ]
+        assert instantiated["campaign_id"] == target["id"]
+        assert instantiated["sheet"]["skills"]["Spot Hidden"] == 65
+        target_characters = await call(
+            server,
+            "character_query",
+            {"action": "list", "campaign_id": target["id"]},
+        )
+        assert [item["name"] for item in target_characters["characters"]] == [
+            "Harriet Vane",
+            "Mr Marsh",
+        ]
 
         roll_one = await call(
             server,
