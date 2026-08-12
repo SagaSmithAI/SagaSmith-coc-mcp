@@ -22,6 +22,13 @@ Keeper 恢复接口由 `branch_query/change`、`snapshot_query/change` 和
 `idempotency_key`；checkout、restore、undo、redo 改变权威阶段后会触发
 `tools/list_changed`。Host 刷新列表后可重新加载并直接调用该阶段的合法原生工具。
 
+Play 与 Combat 阶段提供两项来源明确的角色状态结算：
+
+- `coc_sanity_check` 原子完成 SAN 检定、损失骰、必要的 INT 检定、临时/不定期/永久疯狂、狂乱发作与持续时间，并在同一 revision group 中提交战役随机流和调查员 sheet。
+- `coc_hp_change` 原子完成伤害或治疗；单次重伤会使用权威随机流执行必要的 CON 检定，并持久化 major wound、unconscious、dying、dead 与治疗状态。无随机抽取的纯 HP 变更不会伪造战役 revision。
+
+两项工具都要求角色控制权限、campaign/character revision 和幂等键；精确重试返回原响应，不能重复抽取或重复结算。
+
 ## Module Pack 创作流程
 
 CoC 模组使用统一的 `sagasmith.content-package` schema v2：

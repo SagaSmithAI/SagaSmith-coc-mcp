@@ -11,7 +11,7 @@
 | `sagasmith-dnd` | 107 个受版本控制文件、45 个 Python 测试文件 | 规则运行时参考实现 |
 | `sagasmith-coc` | 29 个受版本控制文件、5 个 Python 测试文件 | 仅具备基础判定、随机流和 Module Pack 编译 |
 | `SagaSmith-dnd-mcp` | 64 个 `public_tool`、80 个 Python 测试文件 | 全链路公共行为参考实现 |
-| `SagaSmith-coc-mcp` | 25 个 MCP 工具、1 个 Python 测试文件、12 项测试 | 已有创作、恢复与随机流垂直切片，尚未形成完整运行时 |
+| `SagaSmith-coc-mcp` | 27 个 MCP 工具、1 个 Python 测试文件、14 项测试 | 已有创作、恢复、随机流与 SAN/HP 权威结算垂直切片，尚未形成完整运行时 |
 | `SagaSmith-dnd-skills` | 4,157 个受版本控制文件 | 包含完整技能、引用、模板和内容语料 |
 | `SagaSmith-coc-skills` | 34 个受版本控制文件 | 只有 Keeper、战役管理和少量静态引用 |
 | `sagasmith-dnd-ui` | 59 个受版本控制文件 | 含 Content Workbench、场景图谱和战斗工作区 |
@@ -58,8 +58,8 @@
 | --- | --- | --- |
 | d100、难度、奖励/惩罚骰 | 完成基础层 | 增加角色技能读取、push、对抗、组合检定和原子状态结算 |
 | Luck | 缺失 | 花费 Luck 修改检定、revision/幂等、下限和权限回归 |
-| SAN | 部分：纯解析器 | SAN 扣减、临时/永久疯狂、bout、潜在神话技能增长与连续性同事务 |
-| 伤害、重伤、濒死 | 部分：纯战斗解析器 | HP、major wound、unconscious/dying、治疗与死亡的权威状态机 |
+| SAN | 部分：已有来源明确的权威遭遇结算 | 公共 `coc_sanity_check` 已把 SAN/损失/INT/bout 随机流与调查员状态原子提交，并覆盖权限、幂等、重启和 revision group；仍需每日重置、治疗恢复、潜在神话技能增长与连续性流程 |
+| 伤害、重伤、濒死 | 部分：已有权威单次伤害/治疗结算 | 公共 `coc_hp_change` 已覆盖 HP、major wound、CON、unconscious/dying/dead、急救/治疗、随机流与精确重放；仍需濒死轮次、自然/周治疗调度和战斗 encounter 集成 |
 | 战斗 | 缺失权威 encounter | start/end、回合、DEX 顺序、fight back/dodge、maneuver、枪械多发、弹药、掩体、Grid/Agent 空间模式 |
 | 追逐 | 部分：纯解析器 | 权威 chase、MOV 排序、行动点、hazard/barrier、战斗互斥、结束/恢复 |
 | 调查 | 缺失结算层 | 线索发现、明显线索不阻塞、花费 Luck/push、个人受众与秘密信息 |
@@ -84,7 +84,7 @@
 1. 以真实私有 PDF 证明 Module Draft 与 Pack 导入全流程。
 2. 实现规则书 Draft/Pack 与 CoC 规则检索，使 Quick-Start 能成为本地规则依据。
 3. 实现 event、continuity 与面向玩家/私有 NPC 的受众结算。
-4. 实现 SAN、调查、战斗、追逐和 NPC 对话的权威结算。
+4. 在已完成的 SAN/HP 单次权威结算之上，实现调查、战斗、追逐、NPC 对话和跨场景恢复流程。
 5. 更新 CoC Skills 和 ModuleGen，然后用 The Lightless Beacon 做垂直切片、Alone Against the Flames 做图回归。
 6. 对接 CoC UI，最后执行两个战役并行回测与完整完成审计。
 

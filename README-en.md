@@ -23,6 +23,13 @@ guards plus an `idempotency_key`. When checkout, restore, undo, or redo changes 
 authoritative phase, the server emits `tools/list_changed`; after refreshing, the host can
 load and directly call the next legal native tool for that phase.
 
+Play and Combat expose two source-explicit actor-state settlements:
+
+- `coc_sanity_check` atomically rolls the SAN check, loss, required INT check, temporary/indefinite/permanent insanity, bout, and duration, then commits the campaign random stream and investigator sheet in one revision group.
+- `coc_hp_change` atomically applies damage or healing. A major single blow draws any required CON check from the authoritative stream and persists major-wound, unconscious, dying, dead, and recovery state. A fixed HP change with no random draw does not manufacture a campaign revision.
+
+Both tools require actor-control authorization, campaign and character revisions, and an idempotency key. An exact retry returns the original response without drawing or settling twice.
+
 ## Module Pack authoring
 
 CoC scenarios use the unified `sagasmith.content-package` schema version 2 lifecycle:

@@ -1218,6 +1218,253 @@ def test_random_roll_is_atomic_idempotent_and_persists_across_restart(tmp_path) 
     asyncio.run(verify())
 
 
+def test_sanity_check_commits_rolls_actor_state_and_bout_atomically(tmp_path) -> None:
+    config = McpConfig(
+        home=tmp_path / "home",
+        database_url=None,
+        coc_skills_dir=tmp_path / "coc",
+        modulegen_skills_dir=tmp_path / "modulegen",
+    )
+    server = create_server(config)
+
+    async def exercise() -> tuple[str, str, dict]:
+        campaign = await call(
+            server,
+            "campaign_change",
+            {
+                "action": "create",
+                "data": {"name": "Sanity case", "idempotency_key": "sanity-campaign"},
+            },
+        )
+        investigator = await call(
+            server,
+            "character_change",
+            {
+                "action": "create",
+                "campaign_id": campaign["id"],
+                "data": {
+                    "name": "Dr Armitage",
+                    "sheet": {"characteristics": {"pow": 80, "int": 100}},
+                },
+            },
+        )
+        await call(
+            server,
+            "campaign_change",
+            {
+                "action": "grant_campaign",
+                "campaign_id": campaign["id"],
+                "data": {"target_principal_id": "player:armitage", "role": "player"},
+            },
+        )
+        await call(
+            server,
+            "campaign_change",
+            {
+                "action": "grant_actor",
+                "campaign_id": campaign["id"],
+                "data": {
+                    "target_principal_id": "player:armitage",
+                    "actor_id": investigator["id"],
+                },
+            },
+        )
+        play = await call(
+            server,
+            "campaign_change",
+            {
+                "action": "set_phase",
+                "campaign_id": campaign["id"],
+                "data": {"phase": "play", "expected_revision": campaign["revision"]},
+            },
+        )
+        arguments = {
+            "campaign_id": campaign["id"],
+            "actor_id": investigator["id"],
+            "success_loss": "5",
+            "failure_loss": "5",
+            "source": "Witnessed a source-backed Mythos manifestation.",
+            "context": "real_time",
+            "expected_revision": play["revision"],
+            "expected_character_revision": investigator["revision"],
+            "idempotency_key": "sanity-manifestation",
+            "principal_id": "player:armitage",
+        }
+        settled = await call(server, "coc_sanity_check", arguments)
+        assert await call(server, "coc_sanity_check", arguments) == settled
+        assert settled["san"] == 75
+        assert settled["conditions"]["temporary_insanity"] is True
+        assert settled["conditions"]["indefinite_insanity"] is False
+        assert settled["resolution"]["bout"]["duration_unit"] == "rounds"
+        assert settled["random_stream_receipt"]["draw_count"] == 6
+        actor = await call(
+            server,
+            "character_query",
+            {
+                "action": "get",
+                "campaign_id": campaign["id"],
+                "character_id": investigator["id"],
+                "principal_id": "player:armitage",
+            },
+        )
+        assert actor["sheet"]["san"] == 75
+        assert actor["sheet"]["san_daily_loss"] == 5
+        assert actor["sheet"]["sanity_loss_events"][0]["source"].startswith("Witnessed")
+        history = await call(
+            server,
+            "state_revision",
+            {"action": "history", "campaign_id": campaign["id"]},
+        )
+        assert {item["entity_type"] for item in history["revisions"][:2]} == {
+            "campaign",
+            "character",
+        }
+        with pytest.raises(Exception, match="different request"):
+            await call(
+                server,
+                "coc_sanity_check",
+                {**arguments, "source": "A different manifestation."},
+            )
+        return campaign["id"], investigator["id"], settled
+
+    campaign_id, actor_id, settled = asyncio.run(exercise())
+    restarted = create_server(config)
+
+    async def verify_restart() -> None:
+        campaign = await call(
+            restarted,
+            "campaign_query",
+            {"action": "get", "campaign_id": campaign_id},
+        )
+        actor = await call(
+            restarted,
+            "character_query",
+            {"action": "get", "campaign_id": campaign_id, "character_id": actor_id},
+        )
+        assert (
+            campaign["state"]["random_stream"]["last_receipt"] == settled["random_stream_receipt"]
+        )
+        assert actor["sheet"]["conditions"]["temporary_insanity"] is True
+
+    asyncio.run(verify_restart())
+
+
+def test_hp_changes_commit_major_wound_dying_and_first_aid_transitions(tmp_path) -> None:
+    config = McpConfig(
+        home=tmp_path / "home",
+        database_url=None,
+        coc_skills_dir=tmp_path / "coc",
+        modulegen_skills_dir=tmp_path / "modulegen",
+    )
+    server = create_server(config)
+
+    async def exercise() -> None:
+        campaign = await call(
+            server,
+            "campaign_change",
+            {"action": "create", "data": {"name": "Wounds", "idempotency_key": "hp-campaign"}},
+        )
+        actor = await call(
+            server,
+            "character_change",
+            {
+                "action": "create",
+                "campaign_id": campaign["id"],
+                "data": {
+                    "name": "Hardy Investigator",
+                    "sheet": {
+                        "characteristics": {"con": 100, "siz": 20},
+                        "max_hp": 12,
+                        "hp": 12,
+                    },
+                },
+            },
+        )
+        play = await call(
+            server,
+            "campaign_change",
+            {
+                "action": "set_phase",
+                "campaign_id": campaign["id"],
+                "data": {"phase": "play", "expected_revision": campaign["revision"]},
+            },
+        )
+        first_args = {
+            "action": "damage",
+            "campaign_id": campaign["id"],
+            "actor_id": actor["id"],
+            "data": {"amount": 6, "source": "A single source-backed blow."},
+            "expected_revision": play["revision"],
+            "expected_character_revision": actor["revision"],
+            "idempotency_key": "hp-major-wound",
+        }
+        first = await call(server, "coc_hp_change", first_args)
+        assert await call(server, "coc_hp_change", first_args) == first
+        assert first["hp"] == 6
+        assert first["conditions"]["major_wound"] is True
+        assert first["conditions"]["unconscious"] is False
+        assert first["random_stream_receipt"]["draw_count"] == 2
+        second_args = {
+            "action": "damage",
+            "campaign_id": campaign["id"],
+            "actor_id": actor["id"],
+            "data": {"amount": 6, "source": "A second source-backed blow."},
+            "expected_revision": first["campaign_revision"],
+            "expected_character_revision": first["character_revision"],
+            "idempotency_key": "hp-dying",
+        }
+        second = await call(server, "coc_hp_change", second_args)
+        assert second["hp"] == 0
+        assert second["conditions"]["dying"] is True
+        assert second["conditions"]["unconscious"] is True
+        aid_args = {
+            "action": "heal",
+            "campaign_id": campaign["id"],
+            "actor_id": actor["id"],
+            "data": {
+                "amount": 1,
+                "source": "Successful First Aid.",
+                "healing_source": "first_aid",
+            },
+            "expected_revision": second["campaign_revision"],
+            "expected_character_revision": second["character_revision"],
+            "idempotency_key": "hp-first-aid",
+        }
+        aided = await call(server, "coc_hp_change", aid_args)
+        assert await call(server, "coc_hp_change", aid_args) == aided
+        assert aided["campaign_revision"] == second["campaign_revision"]
+        assert aided["hp"] == 1
+        assert aided["conditions"]["dying"] is False
+        assert aided["conditions"]["major_wound"] is True
+        medicine = await call(
+            server,
+            "coc_hp_change",
+            {
+                "action": "heal",
+                "campaign_id": campaign["id"],
+                "actor_id": actor["id"],
+                "data": {
+                    "amount": 5,
+                    "source": "A week of successful Medicine treatment.",
+                    "healing_source": "medicine",
+                },
+                "expected_revision": aided["campaign_revision"],
+                "expected_character_revision": aided["character_revision"],
+                "idempotency_key": "hp-medicine",
+            },
+        )
+        assert medicine["hp"] == 6
+        assert medicine["conditions"]["major_wound"] is False
+        current = await call(
+            server,
+            "character_query",
+            {"action": "get", "campaign_id": campaign["id"], "character_id": actor["id"]},
+        )
+        assert len(current["sheet"]["health_events"]) == 4
+
+    asyncio.run(exercise())
+
+
 def test_branch_snapshot_and_revision_recovery_are_guarded_and_replayable(tmp_path) -> None:
     config = McpConfig(
         home=tmp_path / "home",

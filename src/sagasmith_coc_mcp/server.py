@@ -24,9 +24,10 @@ from sagasmith_coc.engine.checks.chase import (
     resolve_chase_speed_check,
 )
 from sagasmith_coc.engine.checks.combat import resolve_melee_attack, resolve_ranged_attack
-from sagasmith_coc.engine.checks.sanity import resolve_sanity_loss
+from sagasmith_coc.engine.checks.sanity import resolve_sanity_loss, roll_bout_of_madness
 from sagasmith_coc.engine.checks.skill import resolve_opposed_check, resolve_skill_check
 from sagasmith_coc.engine.dice.rolls import roll_d100, roll_dice_expression
+from sagasmith_coc.engine.health import apply_damage, apply_healing
 from sagasmith_coc.module_profile import CocModuleProfile
 from sagasmith_coc.random_stream import (
     CampaignRandomStream,
@@ -41,6 +42,7 @@ from sagasmith_core import (
     BranchService,
     CampaignService,
     CharacterService,
+    CharacterStateUpdate,
     IdempotencyService,
     IdempotencyWrite,
     ImportJobService,
@@ -2805,6 +2807,304 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
             idempotency_key=idempotency_key,
             resolve=resolve,
         )
+
+    @mcp.tool()
+    def coc_sanity_check(
+        campaign_id: str,
+        actor_id: str,
+        success_loss: str,
+        failure_loss: str,
+        source: str,
+        context: Literal["real_time", "summary"],
+        expected_revision: int,
+        expected_character_revision: int,
+        idempotency_key: str,
+        principal_id: str = LOCAL_SYSTEM_PRINCIPAL_ID,
+    ) -> dict[str, Any]:
+        """Roll, settle, and audit one source-explicit SAN encounter atomically."""
+
+        actor_access(campaign_id, actor_id, principal_id, control=True)
+        source_value = " ".join(str(source or "").split()).strip()
+        if not source_value or len(source_value) > 500:
+            raise ValueError("source must contain 1 to 500 characters")
+        if context not in {"real_time", "summary"}:
+            raise ValueError("context must be real_time or summary")
+        formulas = {
+            "success": str(success_loss or "").strip(),
+            "failure": str(failure_loss or "").strip(),
+        }
+        if not all(formulas.values()) or any(len(value) > 100 for value in formulas.values()):
+            raise ValueError("success_loss and failure_loss must contain 1 to 100 characters")
+        key = str(idempotency_key or "").strip()
+        if not key:
+            raise ValueError("idempotency_key is required")
+        branch_id = current_branch_id(campaign_id)
+        request = {
+            "operation": "coc_sanity_check",
+            "campaign_id": campaign_id,
+            "actor_id": actor_id,
+            "success_loss": formulas["success"],
+            "failure_loss": formulas["failure"],
+            "source": source_value,
+            "context": context,
+            "expected_revision": int(expected_revision),
+            "expected_character_revision": int(expected_character_revision),
+            "branch_id": branch_id,
+        }
+        scope = f"coc-sanity:{campaign_id}:{branch_id}:{actor_id}:{principal_id}"
+        replay = replay_response(scope, key, request)
+        if replay is not None:
+            return replay
+        campaign = require_campaign_revision(campaign_id, int(expected_revision))
+        actor = characters.get(actor_id)
+        if actor.campaign_id != campaign_id:
+            raise ValueError("actor must belong to the target campaign")
+        if actor.revision != int(expected_character_revision):
+            raise ValueError(
+                "character revision conflict: "
+                f"expected {expected_character_revision}, found {actor.revision}"
+            )
+        sheet = validate_investigator_sheet(dict(actor.sheet))
+        current_san = int(sheet["san"])
+        if current_san <= 0:
+            raise ValueError("an actor with zero SAN cannot make another SAN check")
+        stream = CampaignRandomStream.from_campaign_state(
+            campaign_id,
+            campaign.state,
+            operation="coc_sanity_check",
+            idempotency_key=key,
+        )
+        with use_random_stream(stream):
+            sanity_roll = roll_d100()
+            succeeded = int(sanity_roll["total"]) <= current_san
+            selected_formula = formulas["success" if succeeded else "failure"]
+            loss_roll = roll_dice_expression(selected_formula)
+            if int(loss_roll["total"]) < 0:
+                raise ValueError("SAN loss expressions must not produce a negative result")
+            int_roll = None
+            int_success = None
+            if int(loss_roll["total"]) >= 5:
+                int_roll = roll_d100()
+                int_success = int(int_roll["total"]) <= int(sheet["characteristics"]["int"])
+            outcome = resolve_sanity_loss(
+                current_san=current_san,
+                san_max=int(sheet["san_max"]),
+                loss_amount=int(loss_roll["total"]),
+                daily_loss_accumulated=int(sheet.get("san_daily_loss", 0)),
+                daily_limit=int(sheet.get("san_daily_limit", max(1, current_san // 5))),
+                cthulhu_mythos_value=int(sheet.get("cthulhu_mythos", 0)),
+                is_mythos_hardened=bool(sheet.get("mythos_hardened", False)),
+                pulp_rules=str(sheet.get("ruleset") or "classic") == "pulp",
+                investigator_name=actor.name,
+                source=source_value,
+                int_check_success=int_success,
+            )
+            bout = None
+            if outcome["bout_of_madness"]:
+                bout = {
+                    **roll_bout_of_madness(real_time=context == "real_time"),
+                    "duration": roll_dice_expression("1D10"),
+                    "duration_unit": "rounds" if context == "real_time" else "hours",
+                }
+        conditions = dict(sheet.get("conditions") or {})
+        conditions["temporary_insanity"] = bool(outcome["temp_insanity"])
+        conditions["indefinite_insanity"] = bool(outcome["indef_insanity"])
+        conditions["permanent_insanity"] = outcome["insanity_type"] == "permanent"
+        sheet["conditions"] = conditions
+        sheet["san"] = int(outcome["new_san"])
+        sheet["san_daily_loss"] = int(outcome["daily_loss_accumulated"])
+        event = {
+            "idempotency_key": key,
+            "source": source_value,
+            "context": context,
+            "sanity_roll": sanity_roll,
+            "succeeded": succeeded,
+            "loss_formula": selected_formula,
+            "loss_roll": loss_roll,
+            "int_roll": int_roll,
+            "outcome": outcome,
+            "bout": bout,
+        }
+        sheet["sanity_loss_events"] = [
+            *list(sheet.get("sanity_loss_events") or [])[-499:],
+            event,
+        ]
+        next_state = {**dict(campaign.state), "random_stream": stream.persisted_state()}
+        response = {
+            "campaign_revision": campaign.revision + 1,
+            "character_revision": actor.revision + 1,
+            "actor_id": actor_id,
+            "resolution": event,
+            "san": int(outcome["new_san"]),
+            "conditions": conditions,
+            "random_stream_receipt": stream.receipt(),
+        }
+        StateMutationService(storage.database).replace(
+            campaign_id,
+            campaign_state=next_state,
+            character_updates=[
+                CharacterStateUpdate(
+                    character_id=actor_id,
+                    sheet=validate_investigator_sheet(sheet),
+                    notes=dict(actor.notes),
+                    expected_revision=actor.revision,
+                )
+            ],
+            expected_campaign_revision=campaign.revision,
+            operation="coc.sanity.check",
+            actor=principal_id,
+            branch_id=branch_id,
+            idempotency_key=key,
+            idempotency_write=IdempotencyWrite(
+                scope=scope,
+                payload=request,
+                response=response,
+            ),
+        )
+        stream.mark_persisted()
+        return response
+
+    @mcp.tool()
+    def coc_hp_change(
+        action: Literal["damage", "heal"],
+        campaign_id: str,
+        actor_id: str,
+        data: dict[str, Any],
+        expected_revision: int,
+        expected_character_revision: int,
+        idempotency_key: str,
+        principal_id: str = LOCAL_SYSTEM_PRINCIPAL_ID,
+    ) -> dict[str, Any]:
+        """Apply one source-explicit HP transition and any required CON roll atomically."""
+
+        actor_access(campaign_id, actor_id, principal_id, control=True)
+        data = dict(data or {})
+        source = " ".join(str(data.get("source") or "").split()).strip()
+        if not source or len(source) > 500:
+            raise ValueError("data.source must contain 1 to 500 characters")
+        amount_fields = [field for field in ("amount", "expression") if field in data]
+        if len(amount_fields) != 1:
+            raise ValueError("provide exactly one of data.amount or data.expression")
+        key = str(idempotency_key or "").strip()
+        if not key:
+            raise ValueError("idempotency_key is required")
+        branch_id = current_branch_id(campaign_id)
+        request = {
+            "operation": f"coc_hp_change.{action}",
+            "campaign_id": campaign_id,
+            "actor_id": actor_id,
+            "data": data,
+            "expected_revision": int(expected_revision),
+            "expected_character_revision": int(expected_character_revision),
+            "branch_id": branch_id,
+        }
+        scope = f"coc-hp:{campaign_id}:{branch_id}:{actor_id}:{principal_id}:{action}"
+        replay = replay_response(scope, key, request)
+        if replay is not None:
+            return replay
+        campaign = require_campaign_revision(campaign_id, int(expected_revision))
+        actor = characters.get(actor_id)
+        if actor.campaign_id != campaign_id:
+            raise ValueError("actor must belong to the target campaign")
+        if actor.revision != int(expected_character_revision):
+            raise ValueError(
+                "character revision conflict: "
+                f"expected {expected_character_revision}, found {actor.revision}"
+            )
+        sheet = validate_investigator_sheet(dict(actor.sheet))
+        stream = CampaignRandomStream.from_campaign_state(
+            campaign_id,
+            campaign.state,
+            operation=f"coc_hp_change.{action}",
+            idempotency_key=key,
+        )
+        with use_random_stream(stream):
+            amount_roll = None
+            if amount_fields[0] == "expression":
+                expression = str(data.get("expression") or "").strip()
+                if not expression or len(expression) > 100:
+                    raise ValueError("data.expression must contain 1 to 100 characters")
+                amount_roll = roll_dice_expression(expression)
+                amount = int(amount_roll["total"])
+            else:
+                raw_amount = data.get("amount")
+                if isinstance(raw_amount, bool) or not isinstance(raw_amount, int):
+                    raise ValueError("data.amount must be an integer")
+                amount = raw_amount
+            if amount < 0:
+                raise ValueError("HP change amount must not be negative")
+            con_roll = None
+            if action == "damage":
+                preview = apply_damage(sheet, amount)
+                con_success = None
+                if preview["requires_con_check"]:
+                    con_roll = roll_d100()
+                    con_success = int(con_roll["total"]) <= int(sheet["characteristics"]["con"])
+                transition = apply_damage(
+                    sheet,
+                    amount,
+                    con_check_success=con_success,
+                )
+            else:
+                transition = apply_healing(
+                    sheet,
+                    amount,
+                    source=str(data.get("healing_source") or "other"),
+                    extreme_success=bool(data.get("extreme_success", False)),
+                )
+        next_sheet = dict(transition.pop("sheet"))
+        event = {
+            "idempotency_key": key,
+            "action": action,
+            "source": source,
+            "amount_roll": amount_roll,
+            "con_roll": con_roll,
+            "transition": transition,
+        }
+        next_sheet["health_events"] = [
+            *list(next_sheet.get("health_events") or [])[-499:],
+            event,
+        ]
+        has_random_draws = stream.draw_count > 0
+        next_state = (
+            {**dict(campaign.state), "random_stream": stream.persisted_state()}
+            if has_random_draws
+            else None
+        )
+        response = {
+            "campaign_revision": campaign.revision + int(has_random_draws),
+            "character_revision": actor.revision + 1,
+            "actor_id": actor_id,
+            "resolution": event,
+            "hp": int(next_sheet["hp"]),
+            "conditions": dict(next_sheet["conditions"]),
+            **({"random_stream_receipt": stream.receipt()} if has_random_draws else {}),
+        }
+        StateMutationService(storage.database).replace(
+            campaign_id,
+            campaign_state=next_state,
+            character_updates=[
+                CharacterStateUpdate(
+                    character_id=actor_id,
+                    sheet=validate_investigator_sheet(next_sheet),
+                    notes=dict(actor.notes),
+                    expected_revision=actor.revision,
+                )
+            ],
+            expected_campaign_revision=campaign.revision,
+            operation=f"coc.hp.{action}",
+            actor=principal_id,
+            branch_id=branch_id,
+            idempotency_key=key,
+            idempotency_write=IdempotencyWrite(
+                scope=scope,
+                payload=request,
+                response=response,
+            ),
+        )
+        if has_random_draws:
+            stream.mark_persisted()
+        return response
 
     @mcp.tool()
     def coc_resolve(
