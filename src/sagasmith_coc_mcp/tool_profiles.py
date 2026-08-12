@@ -47,21 +47,23 @@ PHASE_TOOLS = {
     PROFILE_LOBBY: _names(
         """
         actor_knowledge_change actor_knowledge_query campaign_change character_change
-        character_query coc_resolve memory_change memory_query module_change module_query
+        character_query coc_check coc_dice_roll coc_resolve memory_change memory_query
+        module_change module_query
         snapshot_change snapshot_query
         """
     ),
     PROFILE_PLAY: _names(
         """
         actor_knowledge_change actor_knowledge_query campaign_change character_change
-        character_query coc_resolve memory_change memory_query module_change module_query
+        character_query coc_check coc_dice_roll coc_resolve memory_change memory_query
+        module_change module_query
         snapshot_change snapshot_query
         """
     ),
     PROFILE_COMBAT: _names(
         """
-        actor_knowledge_query character_change character_query coc_resolve memory_query
-        module_query snapshot_change snapshot_query
+        actor_knowledge_query character_change character_query coc_check coc_dice_roll
+        coc_resolve memory_query module_query snapshot_change snapshot_query
         """
     ),
 }

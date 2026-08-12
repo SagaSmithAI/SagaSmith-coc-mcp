@@ -9,7 +9,7 @@
 - **状态归 MCP 所有**：SQLite 与导入产物都位于 `.sagasmith-coc-mcp/`，不依赖某个 Agent 的工作目录。
 - **Exposure 在服务端**：每个原生 MCP session 独立维护已加载原生工具、TTL 与 Lobby/Play/Combat 阶段，不要求 Agent 复制工具分类。
 - **角色知识真正隔离**：PC、NPC、怪物的 belief/rumor/false belief 分别按 actor 与 branch 保存；玩家只能读取或修改被授权角色。
-- **判定与写状态分离**：`coc_resolve` 返回规则结算；角色卡、SAN、HP 或战役状态必须通过显式写工具提交，避免“调用检查就偷偷改卡”。
+- **随机流与结果同一事务**：`coc_dice_roll`、`coc_check` 和可能掷伤害骰的 `coc_resolve` 从战役随机流取值，并将位置、收据、revision 与幂等回放响应原子提交；纯计算不写状态。
 - **Keeper 信息不外泄**：玩家的模组索引与搜索只返回 `visibility=player` 的 handout 场景。
 
 ```mermaid

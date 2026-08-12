@@ -16,16 +16,26 @@ from sagasmith_coc.engine.checks.chase import (
 from sagasmith_coc.engine.checks.combat import resolve_melee_attack, resolve_ranged_attack
 from sagasmith_coc.engine.checks.sanity import resolve_sanity_loss
 from sagasmith_coc.engine.checks.skill import resolve_opposed_check, resolve_skill_check
+from sagasmith_coc.engine.dice.rolls import roll_d100, roll_dice_expression
 from sagasmith_coc.module_profile import CocModuleProfile
+from sagasmith_coc.random_stream import (
+    CampaignRandomStream,
+    initial_random_stream,
+    use_random_stream,
+)
 from sagasmith_coc.system import validate_investigator_sheet
 from sagasmith_core import (
     AccessService,
     ActorKnowledgeService,
+    BranchService,
     CampaignService,
     CharacterService,
+    IdempotencyService,
+    IdempotencyWrite,
     MemoryService,
     ModuleService,
     SnapshotService,
+    StateMutationService,
     default_local_principal,
 )
 from sagasmith_core.access import LOCAL_SYSTEM_PRINCIPAL_ID
@@ -159,12 +169,14 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
     storage = SagaSmithStorage(config)
     storage.migrate()
     campaigns = CampaignService(storage.database)
+    branches = BranchService(storage.database)
     characters = CharacterService(storage.database)
     access = AccessService(storage.database)
     memories = MemoryService(storage.database)
     knowledge = ActorKnowledgeService(storage.database)
     modules = ModuleService(storage.database)
     snapshots = SnapshotService(storage.database)
+    idempotency = IdempotencyService(storage.database)
     default_local_principal(storage.database)
     parser = MarkdownModuleParser(profile=CocModuleProfile())
     skills = SkillCatalog(
@@ -251,6 +263,70 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
             campaign_id, actor_id, principal_id, control=control, private=not control
         )
 
+    def authoritative_random_resolution(
+        *,
+        campaign_id: str,
+        principal_id: str,
+        operation: str,
+        payload: dict[str, Any],
+        expected_revision: int,
+        idempotency_key: str,
+        resolve: Any,
+    ) -> dict[str, Any]:
+        """Resolve and persist one random operation as a single audited write."""
+
+        if not str(idempotency_key or "").strip():
+            raise ValueError("idempotency_key is required for random resolution")
+        access.require_campaign(campaign_id, principal_id)
+        campaign = campaigns.get(campaign_id)
+        branch_id = branches.current(campaign_id).id
+        request = {
+            "operation": operation,
+            "campaign_id": campaign_id,
+            "principal_id": principal_id,
+            "branch_id": branch_id,
+            "expected_revision": expected_revision,
+            "payload": payload,
+        }
+        scope = f"coc-random:{campaign_id}:{branch_id}:{principal_id}:{operation}"
+        replay = idempotency.lookup(scope, idempotency_key, request)
+        if replay is not None:
+            if replay.response is None:
+                raise RuntimeError("random resolution replay has no stored response")
+            return replay.response
+        stream = CampaignRandomStream.from_campaign_state(
+            campaign_id,
+            campaign.state,
+            operation=operation,
+            idempotency_key=idempotency_key,
+        )
+        with use_random_stream(stream):
+            result = resolve()
+        if stream.draw_count == 0:
+            return {"resolution": result, "campaign_revision": campaign.revision}
+        next_state = {**dict(campaign.state), "random_stream": stream.persisted_state()}
+        response = {
+            "resolution": result,
+            "campaign_revision": campaign.revision + 1,
+            "random_stream_receipt": stream.receipt(),
+        }
+        StateMutationService(storage.database).replace(
+            campaign_id,
+            campaign_state=next_state,
+            expected_campaign_revision=expected_revision,
+            operation=operation,
+            actor=principal_id,
+            branch_id=branch_id or None,
+            idempotency_key=idempotency_key,
+            idempotency_write=IdempotencyWrite(
+                scope=scope,
+                payload=request,
+                response=response,
+            ),
+        )
+        stream.mark_persisted()
+        return response
+
     @mcp.tool()
     def server_capabilities() -> dict[str, Any]:
         return {
@@ -261,7 +337,10 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
             "progressive_exposure": True,
             "native_dynamic_tools_required": True,
             "actor_knowledge": "branch-scoped and actor-authorized",
-            "resolution_boundary": "pure result first; explicit state mutation second",
+            "resolution_boundary": (
+                "random draws and their stream receipt commit atomically; "
+                "pure calculations do not mutate state"
+            ),
             "tool_catalog": tool_catalog(),
         }
 
@@ -310,7 +389,11 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
                 idempotency_key=str(data.get("idempotency_key") or uuid4().hex),
                 description=str(data.get("description") or ""),
                 settings=dict(data.get("settings") or {}),
-                state={"game_phase": PROFILE_LOBBY, **dict(data.get("state") or {})},
+                state={
+                    "game_phase": PROFILE_LOBBY,
+                    "random_stream": initial_random_stream(f"sagasmith-coc:{uuid4().hex}"),
+                    **dict(data.get("state") or {}),
+                },
             )
             return asdict(created)
         if campaign_id is None:
@@ -636,6 +719,116 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
         return asdict(snapshots.restore(campaign_id, int(data["slot"])))
 
     @mcp.tool()
+    def coc_dice_roll(
+        kind: Literal["d100", "expression"],
+        campaign_id: str,
+        expected_revision: int,
+        idempotency_key: str,
+        expression: str | None = None,
+        bonus_dice: int = 0,
+        penalty_dice: int = 0,
+        principal_id: str = LOCAL_SYSTEM_PRINCIPAL_ID,
+    ) -> dict[str, Any]:
+        """Roll from the campaign stream and atomically persist its receipt."""
+
+        payload = {
+            "kind": kind,
+            "expression": expression,
+            "bonus_dice": bonus_dice,
+            "penalty_dice": penalty_dice,
+        }
+
+        def resolve() -> dict[str, Any]:
+            if kind == "d100":
+                return roll_d100(bonus_dice=bonus_dice, penalty_dice=penalty_dice)
+            if not str(expression or "").strip():
+                raise ValueError("expression is required for expression rolls")
+            return roll_dice_expression(str(expression))
+
+        return authoritative_random_resolution(
+            campaign_id=campaign_id,
+            principal_id=principal_id,
+            operation="coc_dice_roll",
+            payload=payload,
+            expected_revision=expected_revision,
+            idempotency_key=idempotency_key,
+            resolve=resolve,
+        )
+
+    @mcp.tool()
+    def coc_check(
+        campaign_id: str,
+        skill_name: str,
+        difficulty: Literal["regular", "hard", "extreme"],
+        expected_revision: int,
+        idempotency_key: str,
+        actor_id: str | None = None,
+        threshold: int | None = None,
+        bonus_dice: int = 0,
+        penalty_dice: int = 0,
+        pushed: bool = False,
+        principal_id: str = LOCAL_SYSTEM_PRINCIPAL_ID,
+    ) -> dict[str, Any]:
+        """Roll and resolve one source-explicit CoC check from campaign randomness."""
+
+        resolved_threshold = threshold
+        actor_name = ""
+        if actor_id is not None:
+            actor_access(campaign_id, actor_id, principal_id, control=True)
+            actor = characters.get(actor_id)
+            actor_name = actor.name
+            sheet = validate_investigator_sheet(dict(actor.sheet))
+            folded_name = skill_name.casefold()
+            skill_matches = [
+                int(value)
+                for name, value in dict(sheet.get("skills") or {}).items()
+                if str(name).casefold() == folded_name
+            ]
+            characteristic_matches = [
+                int(value)
+                for name, value in dict(sheet.get("characteristics") or {}).items()
+                if str(name).casefold() == folded_name
+            ]
+            matches = skill_matches or characteristic_matches
+            if not matches:
+                raise ValueError(f"actor sheet has no skill or characteristic {skill_name!r}")
+            resolved_threshold = matches[0]
+        if resolved_threshold is None:
+            raise ValueError("threshold or actor_id is required")
+        payload = {
+            "actor_id": actor_id,
+            "skill_name": skill_name,
+            "threshold": int(resolved_threshold),
+            "difficulty": difficulty,
+            "bonus_dice": bonus_dice,
+            "penalty_dice": penalty_dice,
+            "pushed": pushed,
+        }
+
+        def resolve() -> dict[str, Any]:
+            rolled = roll_d100(bonus_dice=bonus_dice, penalty_dice=penalty_dice)
+            outcome = resolve_skill_check(
+                d100_total=int(rolled["total"]),
+                threshold=int(resolved_threshold),
+                difficulty=difficulty,
+                bonus_dice=bonus_dice,
+                penalty_dice=penalty_dice,
+                skill_name=skill_name,
+                investigator_name=actor_name,
+            )
+            return {"roll": rolled, "outcome": outcome, "pushed": pushed}
+
+        return authoritative_random_resolution(
+            campaign_id=campaign_id,
+            principal_id=principal_id,
+            operation="coc_check",
+            payload=payload,
+            expected_revision=expected_revision,
+            idempotency_key=idempotency_key,
+            resolve=resolve,
+        )
+
+    @mcp.tool()
     def coc_resolve(
         kind: Literal[
             "skill",
@@ -648,22 +841,34 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
         ],
         campaign_id: str,
         data: dict[str, Any],
-        principal_id: str = "system:local",
+        expected_revision: int,
+        idempotency_key: str,
+        principal_id: str = LOCAL_SYSTEM_PRINCIPAL_ID,
     ) -> dict[str, Any]:
-        access.require_campaign(campaign_id, principal_id)
-        if kind == "skill":
-            return resolve_skill_check(**data)
-        if kind == "opposed":
-            return resolve_opposed_check(**data)
-        if kind == "sanity":
-            return resolve_sanity_loss(**data)
-        if kind == "melee":
-            return resolve_melee_attack(**data)
-        if kind == "ranged":
-            return resolve_ranged_attack(**data)
-        if kind == "chase_speed":
-            return resolve_chase_speed_check(**data)
-        return resolve_chase_action(**data)
+        def resolve() -> dict[str, Any]:
+            if kind == "skill":
+                return resolve_skill_check(**data)
+            if kind == "opposed":
+                return resolve_opposed_check(**data)
+            if kind == "sanity":
+                return resolve_sanity_loss(**data)
+            if kind == "melee":
+                return resolve_melee_attack(**data)
+            if kind == "ranged":
+                return resolve_ranged_attack(**data)
+            if kind == "chase_speed":
+                return resolve_chase_speed_check(**data)
+            return resolve_chase_action(**data)
+
+        return authoritative_random_resolution(
+            campaign_id=campaign_id,
+            principal_id=principal_id,
+            operation=f"coc_resolve.{kind}",
+            payload={"kind": kind, "data": data},
+            expected_revision=expected_revision,
+            idempotency_key=idempotency_key,
+            resolve=resolve,
+        )
 
     @mcp.tool()
     def skill_query(

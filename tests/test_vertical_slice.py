@@ -143,9 +143,17 @@ def test_coc_mcp_persists_campaign_modules_and_actor_knowledge(tmp_path) -> None
                 "kind": "skill",
                 "campaign_id": campaign_id,
                 "data": {"d100_total": 31, "threshold": 60, "difficulty": "regular"},
+                "expected_revision": (
+                    await call(
+                        server,
+                        "campaign_query",
+                        {"action": "get", "campaign_id": campaign_id},
+                    )
+                )["revision"],
+                "idempotency_key": "haunting-check-1",
             },
         )
-        assert check["success"] is True
+        assert check["resolution"]["success"] is True
         await call(
             server,
             "snapshot_change",
@@ -171,6 +179,63 @@ def test_coc_mcp_persists_campaign_modules_and_actor_knowledge(tmp_path) -> None
         assert values["knowledge"][0]["proposition"].endswith("attic.")
 
     asyncio.run(verify_restart())
+
+
+def test_random_roll_is_atomic_idempotent_and_persists_across_restart(tmp_path) -> None:
+    config = McpConfig(
+        home=tmp_path / "home",
+        database_url=None,
+        coc_skills_dir=tmp_path / "coc",
+        modulegen_skills_dir=tmp_path / "modulegen",
+    )
+    server = create_server(config)
+
+    async def exercise() -> tuple[str, dict]:
+        campaign = await call(
+            server,
+            "campaign_change",
+            {
+                "action": "create",
+                "data": {"name": "Random stream", "idempotency_key": "random-campaign"},
+            },
+        )
+        arguments = {
+            "kind": "d100",
+            "campaign_id": campaign["id"],
+            "expected_revision": campaign["revision"],
+            "idempotency_key": "roll-1",
+            "bonus_dice": 1,
+        }
+        first = await call(server, "coc_dice_roll", arguments)
+        replay = await call(server, "coc_dice_roll", arguments)
+        assert replay == first
+        current = await call(
+            server,
+            "campaign_query",
+            {"action": "get", "campaign_id": campaign["id"]},
+        )
+        assert current["state"]["random_stream"]["position"] == 3
+        assert first["random_stream_receipt"]["draw_count"] == 3
+        with pytest.raises(Exception, match="revision conflict"):
+            await call(
+                server,
+                "coc_dice_roll",
+                {**arguments, "idempotency_key": "roll-stale"},
+            )
+        return campaign["id"], first
+
+    campaign_id, first = asyncio.run(exercise())
+    restarted = create_server(config)
+
+    async def verify() -> None:
+        current = await call(
+            restarted,
+            "campaign_query",
+            {"action": "get", "campaign_id": campaign_id},
+        )
+        assert current["state"]["random_stream"]["last_receipt"] == first["random_stream_receipt"]
+
+    asyncio.run(verify())
 
 
 def test_exposure_registry_is_session_and_phase_scoped() -> None:
