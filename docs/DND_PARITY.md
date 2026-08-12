@@ -11,7 +11,7 @@
 | `sagasmith-dnd` | 107 个受版本控制文件、45 个 Python 测试文件 | 规则运行时参考实现 |
 | `sagasmith-coc` | 29 个受版本控制文件、5 个 Python 测试文件 | 仅具备基础判定、随机流和 Module Pack 编译 |
 | `SagaSmith-dnd-mcp` | 64 个 `public_tool`、80 个 Python 测试文件 | 全链路公共行为参考实现 |
-| `SagaSmith-coc-mcp` | 22 个 MCP 工具、1 个 Python 测试文件、8 项测试 | 已有垂直切片，尚未形成完整运行时 |
+| `SagaSmith-coc-mcp` | 25 个 MCP 工具、1 个 Python 测试文件、11 项测试 | 已有创作、恢复与随机流垂直切片，尚未形成完整运行时 |
 | `SagaSmith-dnd-skills` | 4,157 个受版本控制文件 | 包含完整技能、引用、模板和内容语料 |
 | `SagaSmith-coc-skills` | 34 个受版本控制文件 | 只有 Keeper、战役管理和少量静态引用 |
 | `sagasmith-dnd-ui` | 59 个受版本控制文件 | 含 Content Workbench、场景图谱和战斗工作区 |
@@ -26,9 +26,9 @@
 | 原生动态工具 | `exposure`、会话级列表、`tools/list_changed`、调用时二次校验 | 完成 | stdio 客户端能 open/search/set，刷新后直接调用；跨 session、阶段、角色隔离回归 |
 | Lobby → Play → Combat → Play | `game_phase`、`combat_start/end`、动态裁剪 | 部分：Lobby/Play 可持久化；Combat 只从尚不存在的 `combat.active` 派生 | 公共 facade 启停权威战斗；每次阶段变化通知并允许下一次合法原生调用 |
 | 权威随机流 | `dnd_dice_roll`、`dnd_check` 与状态同事务 | 完成基础层 | 随机流位置、收据、revision、精确幂等响应在重启后保持一致；并发调用不重复抽取 |
-| 分支 | `branch_query/change` | 缺失 | 创建、checkout、合并/恢复边界、分支级知识与随机状态；公共回归 |
-| 快照与恢复 | `snapshot_create/restore/query` | 部分：基础 snapshot 工具存在 | 恢复后 exposure/context 立即刷新；下一个合法原生调用成功；覆盖重启 |
-| revision、undo/redo | `state_revision` | 缺失 | 公共 revision 列表、undo、redo；权限、分支和幂等回归 |
+| 分支 | `branch_query/change` | 完成 | 公共 facade 覆盖 current/list/get/compare/create/checkout；revision、活动分支和幂等守卫；Lobby/Play 状态物化、精确重放与重启回归 |
+| 快照与恢复 | `snapshot_create/restore/query` | 完成 | 公共 facade 覆盖 list/get/verify/lineage/create/restore；head、revision、活动分支和幂等守卫；真实 stdio 宿主恢复后刷新阶段并成功执行下一次合法原生调用 |
+| revision、undo/redo | `state_revision` | 完成 | 公共 history/receipt/undo/redo；DM、分支历史游标、原子幂等响应、随机流状态撤销/重做与重启回归 |
 | 事件与连续性 | `campaign_event`、`continuity_context` | 缺失 | 事件原子落账、受众事实、时间线、恢复后连续性重建 |
 | 访问控制 | `access_grant`、campaign/actor scopes | 部分：grant 仍藏在 `campaign_change` | 独立任务型 facade；DM、玩家、私有 NPC、跨战役、调用时权限回归 |
 | 角色基础 | `character_create_from`、metadata/state tools | 部分：create/update/query | CoC investigator/NPC/creature schema、模板实例、metadata 与状态结算均有 revision/幂等 |
@@ -83,7 +83,7 @@
 
 1. 补齐 Module Draft 的 source/content/asset/actor/advance，并关闭 Pack 导入崩溃重复窗口。
 2. 实现规则书 Draft/Pack 与 CoC 规则检索，使 Quick-Start 能成为本地规则依据。
-3. 实现 branch、revision、event、continuity、恢复通知。
+3. 实现 event、continuity 与面向玩家/私有 NPC 的受众结算。
 4. 实现 SAN、调查、战斗、追逐和 NPC 对话的权威结算。
 5. 更新 CoC Skills 和 ModuleGen，然后用 The Lightless Beacon 做垂直切片、Alone Against the Flames 做图回归。
 6. 对接 CoC UI，最后执行两个战役并行回测与完整完成审计。

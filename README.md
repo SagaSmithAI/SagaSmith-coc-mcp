@@ -17,6 +17,11 @@ SagaSmithAI 的 Call of Cthulhu 7e 本地权威 MCP 服务。它把 `sagasmith-c
 exposure(open) -> exposure(search) -> exposure(set) -> native domain tool
 ```
 
+Keeper 恢复接口由 `branch_query/change`、`snapshot_query/change` 和
+`state_revision` 组成。所有写操作都要求显式 revision/分支或历史游标守卫以及
+`idempotency_key`；checkout、restore、undo、redo 改变权威阶段后会触发
+`tools/list_changed`。Host 刷新列表后可重新加载并直接调用该阶段的合法原生工具。
+
 ## Module Pack 创作流程
 
 CoC 模组使用统一的 `sagasmith.content-package` schema v2：

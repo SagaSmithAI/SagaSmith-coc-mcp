@@ -44,6 +44,7 @@ from sagasmith_core import (
     ImportJobService,
     MemoryService,
     ModuleService,
+    RevisionService,
     SnapshotService,
     StateMutationService,
     apply_document_page_revisions,
@@ -192,6 +193,7 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
     modules = ModuleService(storage.database)
     import_jobs = ImportJobService(storage.database)
     snapshots = SnapshotService(storage.database)
+    revisions = RevisionService(storage.database)
     idempotency = IdempotencyService(storage.database)
     default_local_principal(storage.database)
     parser = MarkdownModuleParser(profile=CocModuleProfile())
@@ -363,6 +365,30 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
         if remembered.response is None:
             raise RuntimeError("idempotency write has no stored response")
         return dict(remembered.response)
+
+    def current_branch_id(campaign_id: str) -> str:
+        return branches.current(campaign_id).id
+
+    def require_campaign_revision(campaign_id: str, expected_revision: int) -> Any:
+        campaign = campaigns.get(campaign_id)
+        if campaign.revision != expected_revision:
+            raise ValueError(
+                "campaign revision conflict: "
+                f"expected {expected_revision}, found {campaign.revision}"
+            )
+        return campaign
+
+    def require_active_branch(campaign_id: str, expected_branch_id: str) -> str:
+        current = current_branch_id(campaign_id)
+        if current != expected_branch_id:
+            raise ValueError(
+                f"active branch conflict: expected {expected_branch_id}, found {current}"
+            )
+        return current
+
+    def history_cursor(campaign_id: str) -> int:
+        applied = next((item for item in revisions.history(campaign_id) if item.applied), None)
+        return int(applied.sequence) if applied is not None else 0
 
     def module_archive(
         campaign_id: str, module_id: str
@@ -2106,32 +2132,298 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
         )
 
     @mcp.tool()
-    def snapshot_query(
-        action: Literal["list", "lineage"],
+    def branch_query(
+        action: Literal["current", "list", "get", "compare"],
         campaign_id: str,
         data: dict[str, Any] | None = None,
-        principal_id: str = "system:local",
+        principal_id: str = LOCAL_SYSTEM_PRINCIPAL_ID,
     ) -> dict[str, Any]:
-        access.require_campaign(campaign_id, principal_id)
+        """Inspect campaign timelines without changing the checked-out branch."""
+
+        membership = access.require_campaign(campaign_id, principal_id)
         data = dict(data or {})
-        values = (
-            snapshots.lineage(campaign_id, slot=data.get("slot"))
-            if action == "lineage"
-            else snapshots.list(campaign_id)
+        if action == "current":
+            return {"branch": asdict(branches.current(campaign_id))}
+        if action == "list":
+            values = [asdict(item) for item in branches.list(campaign_id)]
+            if membership.role not in {"owner", "dm"}:
+                current = current_branch_id(campaign_id)
+                values = [item for item in values if item["id"] == current]
+            return {"branches": values}
+        if action == "get":
+            branch_id = str(data.get("branch_id") or "")
+            if not branch_id:
+                raise ValueError("data.branch_id is required")
+            if membership.role not in {"owner", "dm"} and branch_id != current_branch_id(
+                campaign_id
+            ):
+                raise PermissionError("players may inspect only the current branch")
+            return {"branch": asdict(branches.get(campaign_id, branch_id))}
+        require_dm(campaign_id, principal_id)
+        left_branch_id = str(data.get("left_branch_id") or "")
+        right_branch_id = str(data.get("right_branch_id") or "")
+        if not left_branch_id or not right_branch_id:
+            raise ValueError("data.left_branch_id and data.right_branch_id are required")
+        return {"comparison": branches.compare(campaign_id, left_branch_id, right_branch_id)}
+
+    @mcp.tool()
+    def branch_change(
+        action: Literal["create", "checkout"],
+        campaign_id: str,
+        data: dict[str, Any],
+        expected_revision: int,
+        expected_branch_id: str,
+        idempotency_key: str,
+        principal_id: str = LOCAL_SYSTEM_PRINCIPAL_ID,
+    ) -> dict[str, Any]:
+        """Create or checkout a timeline under campaign and active-branch guards."""
+
+        require_dm(campaign_id, principal_id)
+        key = str(idempotency_key or "").strip()
+        branch_guard = str(expected_branch_id or "").strip()
+        if not key or not branch_guard:
+            raise ValueError("expected_branch_id and idempotency_key are required")
+        data = dict(data or {})
+        payload = {
+            "action": action,
+            "data": data,
+            "expected_revision": int(expected_revision),
+            "expected_branch_id": branch_guard,
+        }
+        scope = f"branch-change:{campaign_id}:{principal_id}:{action}"
+        replay = replay_response(scope, key, payload)
+        if replay is not None:
+            return replay
+        require_campaign_revision(campaign_id, int(expected_revision))
+        require_active_branch(campaign_id, branch_guard)
+        if action == "create":
+            name = str(data.get("name") or "").strip()
+            if not name:
+                raise ValueError("data.name is required")
+            created = branches.create(
+                campaign_id,
+                name=name,
+                from_snapshot_id=(
+                    str(data["from_snapshot_id"]) if data.get("from_snapshot_id") else None
+                ),
+                checkout=bool(data.get("checkout", False)),
+                idempotency_key=key,
+                idempotency_write=IdempotencyWrite(
+                    scope=scope,
+                    payload=payload,
+                    response=lambda value: {
+                        "branch": asdict(value["branch"]),
+                        "snapshot": (
+                            asdict(value["snapshot"]) if value["snapshot"] is not None else None
+                        ),
+                    },
+                ),
+            )
+            return {
+                "branch": asdict(created),
+                "snapshot": (
+                    asdict(
+                        next(
+                            item
+                            for item in snapshots.list(campaign_id)
+                            if item.id == created.head_snapshot_id
+                        )
+                    )
+                    if bool(data.get("checkout", False)) and created.head_snapshot_id
+                    else None
+                ),
+            }
+        branch_id = str(data.get("branch_id") or "").strip()
+        if not branch_id:
+            raise ValueError("data.branch_id is required")
+        checked_out = branches.checkout(
+            campaign_id,
+            branch_id,
+            idempotency_key=key,
+            idempotency_write=IdempotencyWrite(
+                scope=scope,
+                payload=payload,
+                response=lambda value: {
+                    "branch": asdict(value["branch"]),
+                    "snapshot": (
+                        asdict(value["snapshot"]) if value["snapshot"] is not None else None
+                    ),
+                },
+            ),
         )
-        return {"snapshots": [asdict(item) for item in values]}
+        snapshot = (
+            next(
+                item
+                for item in snapshots.list(campaign_id)
+                if item.id == checked_out.head_snapshot_id
+            )
+            if checked_out.head_snapshot_id
+            else None
+        )
+        return {
+            "branch": asdict(checked_out),
+            "snapshot": asdict(snapshot) if snapshot is not None else None,
+        }
+
+    @mcp.tool()
+    def snapshot_query(
+        action: Literal["list", "get", "verify", "lineage"],
+        campaign_id: str,
+        data: dict[str, Any] | None = None,
+        principal_id: str = LOCAL_SYSTEM_PRINCIPAL_ID,
+    ) -> dict[str, Any]:
+        """Read Keeper-only save history, payloads, integrity, and lineage."""
+
+        require_dm(campaign_id, principal_id)
+        data = dict(data or {})
+        if action == "list":
+            return {"snapshots": [asdict(item) for item in snapshots.list(campaign_id)]}
+        if action == "lineage":
+            slot = int(data["slot"]) if data.get("slot") is not None else None
+            return {
+                "snapshots": [asdict(item) for item in snapshots.lineage(campaign_id, slot=slot)]
+            }
+        if "slot" not in data:
+            raise ValueError("data.slot is required")
+        slot = int(data["slot"])
+        if action == "verify":
+            return {
+                "campaign_id": campaign_id,
+                "slot": slot,
+                "valid": snapshots.verify(campaign_id, slot),
+            }
+        return {"snapshot": snapshots.get(campaign_id, slot)}
 
     @mcp.tool()
     def snapshot_change(
         action: Literal["create", "restore"],
         campaign_id: str,
         data: dict[str, Any],
-        principal_id: str = "system:local",
+        expected_revision: int,
+        expected_branch_id: str,
+        idempotency_key: str,
+        principal_id: str = LOCAL_SYSTEM_PRINCIPAL_ID,
     ) -> dict[str, Any]:
+        """Create or restore an immutable save under revision and branch guards."""
+
         require_dm(campaign_id, principal_id)
+        key = str(idempotency_key or "").strip()
+        branch_guard = str(expected_branch_id or "").strip()
+        if not key or not branch_guard:
+            raise ValueError("expected_branch_id and idempotency_key are required")
+        data = dict(data or {})
+        payload = {
+            "action": action,
+            "data": data,
+            "expected_revision": int(expected_revision),
+            "expected_branch_id": branch_guard,
+        }
+        scope = f"snapshot-change:{campaign_id}:{principal_id}:{action}"
+        replay = replay_response(scope, key, payload)
+        if replay is not None:
+            return replay
+        require_campaign_revision(campaign_id, int(expected_revision))
+        require_active_branch(campaign_id, branch_guard)
         if action == "create":
-            return asdict(snapshots.create(campaign_id, label=str(data.get("label") or "")))
-        return asdict(snapshots.restore(campaign_id, int(data["slot"])))
+            if "expected_head_snapshot_id" not in data:
+                raise ValueError("data.expected_head_snapshot_id is required")
+            expected_head = str(data.get("expected_head_snapshot_id") or "")
+            actual_head = str(branches.current(campaign_id).head_snapshot_id or "")
+            if actual_head != expected_head:
+                raise ValueError(
+                    "branch head conflict: "
+                    f"expected {expected_head or '<none>'}, found {actual_head or '<none>'}"
+                )
+            return asdict(
+                snapshots.create(
+                    campaign_id,
+                    label=str(data.get("label") or ""),
+                    idempotency_key=key,
+                    idempotency_write=IdempotencyWrite(
+                        scope=scope,
+                        payload=payload,
+                        response=lambda value: asdict(value),
+                    ),
+                )
+            )
+        if "slot" not in data:
+            raise ValueError("data.slot is required")
+        return asdict(
+            snapshots.restore(
+                campaign_id,
+                int(data["slot"]),
+                idempotency_key=key,
+                idempotency_write=IdempotencyWrite(
+                    scope=scope,
+                    payload=payload,
+                    response=lambda value: asdict(value),
+                ),
+            )
+        )
+
+    @mcp.tool()
+    def state_revision(
+        action: Literal["history", "receipt", "undo", "redo"],
+        campaign_id: str,
+        data: dict[str, Any] | None = None,
+        idempotency_key: str | None = None,
+        principal_id: str = LOCAL_SYSTEM_PRINCIPAL_ID,
+    ) -> dict[str, Any]:
+        """Read the branch revision ledger or perform guarded undo and redo."""
+
+        require_dm(campaign_id, principal_id)
+        data = dict(data or {})
+        if action == "history":
+            return {
+                "revisions": [
+                    asdict(item)
+                    for item in revisions.history(campaign_id, limit=int(data.get("limit", 100)))
+                ]
+            }
+        if action == "receipt":
+            receipt_key = str(data.get("idempotency_key") or "").strip()
+            if not receipt_key:
+                raise ValueError("data.idempotency_key is required")
+            return {
+                "receipt": asdict(
+                    idempotency.receipt(
+                        campaign_id,
+                        receipt_key,
+                        branch_id=(str(data["branch_id"]) if data.get("branch_id") else None),
+                    )
+                )
+            }
+        key = str(idempotency_key or "").strip()
+        if "expected_history_sequence" not in data or not key:
+            raise ValueError("data.expected_history_sequence and idempotency_key are required")
+        expected_cursor = int(data["expected_history_sequence"])
+        branch_id = current_branch_id(campaign_id)
+        payload = {
+            "action": action,
+            "expected_history_sequence": expected_cursor,
+            "branch_id": branch_id,
+        }
+        scope = f"state-revision:{campaign_id}:{branch_id}:{principal_id}:{action}"
+        replay = replay_response(scope, key, payload)
+        if replay is not None:
+            return replay
+        actual_cursor = history_cursor(campaign_id)
+        if actual_cursor != expected_cursor:
+            raise ValueError(
+                f"history cursor conflict: expected {expected_cursor}, found {actual_cursor}"
+            )
+        method = revisions.undo if action == "undo" else revisions.redo
+        return asdict(
+            method(
+                campaign_id,
+                idempotency_key=key,
+                idempotency_write=IdempotencyWrite(
+                    scope=scope,
+                    payload=payload,
+                    response=lambda value: asdict(value),
+                ),
+            )
+        )
 
     @mcp.tool()
     def coc_dice_roll(

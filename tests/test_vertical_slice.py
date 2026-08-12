@@ -395,10 +395,27 @@ def test_coc_mcp_persists_campaign_modules_and_actor_knowledge(tmp_path) -> None
             },
         )
         assert check["resolution"]["success"] is True
+        campaign = await call(
+            server,
+            "campaign_query",
+            {"action": "get", "campaign_id": campaign_id},
+        )
+        branch = await call(
+            server,
+            "branch_query",
+            {"action": "current", "campaign_id": campaign_id},
+        )
         await call(
             server,
             "snapshot_change",
-            {"action": "create", "campaign_id": campaign_id, "data": {"label": "Start"}},
+            {
+                "action": "create",
+                "campaign_id": campaign_id,
+                "data": {"label": "Start", "expected_head_snapshot_id": ""},
+                "expected_revision": campaign["revision"],
+                "expected_branch_id": branch["branch"]["id"],
+                "idempotency_key": "haunting-snapshot-start",
+            },
         )
         return campaign_id, alice["id"], bob["id"]
 
@@ -979,6 +996,241 @@ def test_random_roll_is_atomic_idempotent_and_persists_across_restart(tmp_path) 
     asyncio.run(verify())
 
 
+def test_branch_snapshot_and_revision_recovery_are_guarded_and_replayable(tmp_path) -> None:
+    config = McpConfig(
+        home=tmp_path / "home",
+        database_url=None,
+        coc_skills_dir=tmp_path / "coc",
+        modulegen_skills_dir=tmp_path / "modulegen",
+    )
+    server = create_server(config)
+
+    async def exercise() -> tuple[str, str, str, dict]:
+        campaign = await call(
+            server,
+            "campaign_change",
+            {
+                "action": "create",
+                "data": {"name": "Forked case", "idempotency_key": "forked-campaign"},
+            },
+        )
+        campaign_id = campaign["id"]
+        original = (
+            await call(
+                server,
+                "branch_query",
+                {"action": "current", "campaign_id": campaign_id},
+            )
+        )["branch"]
+        baseline_args = {
+            "action": "create",
+            "campaign_id": campaign_id,
+            "data": {"label": "Lobby baseline", "expected_head_snapshot_id": ""},
+            "expected_revision": campaign["revision"],
+            "expected_branch_id": original["id"],
+            "idempotency_key": "snapshot-baseline",
+        }
+        baseline = await call(server, "snapshot_change", baseline_args)
+        assert await call(server, "snapshot_change", baseline_args) == baseline
+        verified = await call(
+            server,
+            "snapshot_query",
+            {"action": "verify", "campaign_id": campaign_id, "data": {"slot": 1}},
+        )
+        assert verified["valid"] is True
+
+        play = await call(
+            server,
+            "campaign_change",
+            {
+                "action": "set_phase",
+                "campaign_id": campaign_id,
+                "data": {"phase": "play", "expected_revision": campaign["revision"]},
+            },
+        )
+        play_save = await call(
+            server,
+            "snapshot_change",
+            {
+                "action": "create",
+                "campaign_id": campaign_id,
+                "data": {
+                    "label": "Play head",
+                    "expected_head_snapshot_id": baseline["id"],
+                },
+                "expected_revision": play["revision"],
+                "expected_branch_id": original["id"],
+                "idempotency_key": "snapshot-play",
+            },
+        )
+        fork_args = {
+            "action": "create",
+            "campaign_id": campaign_id,
+            "data": {
+                "name": "alternate-lobby",
+                "from_snapshot_id": baseline["id"],
+            },
+            "expected_revision": play["revision"],
+            "expected_branch_id": original["id"],
+            "idempotency_key": "branch-alternate",
+        }
+        forked = await call(server, "branch_change", fork_args)
+        assert await call(server, "branch_change", fork_args) == forked
+
+        checkout_fork_args = {
+            "action": "checkout",
+            "campaign_id": campaign_id,
+            "data": {"branch_id": forked["branch"]["id"]},
+            "expected_revision": play["revision"],
+            "expected_branch_id": original["id"],
+            "idempotency_key": "checkout-alternate",
+        }
+        checked_out = await call(server, "branch_change", checkout_fork_args)
+        assert await call(server, "branch_change", checkout_fork_args) == checked_out
+        assert (await call(server, "game_phase", {"campaign_id": campaign_id}))["phase"] == "lobby"
+
+        current = await call(
+            server,
+            "campaign_query",
+            {"action": "get", "campaign_id": campaign_id},
+        )
+        checkout_original = await call(
+            server,
+            "branch_change",
+            {
+                "action": "checkout",
+                "campaign_id": campaign_id,
+                "data": {"branch_id": original["id"]},
+                "expected_revision": current["revision"],
+                "expected_branch_id": forked["branch"]["id"],
+                "idempotency_key": "checkout-original",
+            },
+        )
+        assert checkout_original["snapshot"]["id"] == play_save["id"]
+        assert (await call(server, "game_phase", {"campaign_id": campaign_id}))["phase"] == "play"
+
+        current = await call(
+            server,
+            "campaign_query",
+            {"action": "get", "campaign_id": campaign_id},
+        )
+        restore_args = {
+            "action": "restore",
+            "campaign_id": campaign_id,
+            "data": {"slot": baseline["slot"]},
+            "expected_revision": current["revision"],
+            "expected_branch_id": original["id"],
+            "idempotency_key": "restore-lobby",
+        }
+        restored = await call(server, "snapshot_change", restore_args)
+        assert await call(server, "snapshot_change", restore_args) == restored
+        assert (await call(server, "game_phase", {"campaign_id": campaign_id}))["phase"] == "lobby"
+        restore_branch = (
+            await call(
+                server,
+                "branch_query",
+                {"action": "current", "campaign_id": campaign_id},
+            )
+        )["branch"]
+        assert restore_branch["id"] not in {original["id"], forked["branch"]["id"]}
+        comparison = await call(
+            server,
+            "branch_query",
+            {
+                "action": "compare",
+                "campaign_id": campaign_id,
+                "data": {
+                    "left_branch_id": original["id"],
+                    "right_branch_id": restore_branch["id"],
+                },
+            },
+        )
+        assert comparison["comparison"]["merge_policy"].startswith("explicit-per-fact")
+
+        current = await call(
+            server,
+            "campaign_query",
+            {"action": "get", "campaign_id": campaign_id},
+        )
+        roll = await call(
+            server,
+            "coc_dice_roll",
+            {
+                "kind": "d100",
+                "campaign_id": campaign_id,
+                "expected_revision": current["revision"],
+                "idempotency_key": "branch-roll",
+            },
+        )
+        history = await call(
+            server,
+            "state_revision",
+            {"action": "history", "campaign_id": campaign_id},
+        )
+        cursor = history["revisions"][0]["sequence"]
+        undo_args = {
+            "action": "undo",
+            "campaign_id": campaign_id,
+            "data": {"expected_history_sequence": cursor},
+            "idempotency_key": "undo-branch-roll",
+        }
+        undone = await call(server, "state_revision", undo_args)
+        assert await call(server, "state_revision", undo_args) == undone
+        after_undo = await call(
+            server,
+            "campaign_query",
+            {"action": "get", "campaign_id": campaign_id},
+        )
+        assert after_undo["state"]["random_stream"]["position"] == 0
+        redo_args = {
+            "action": "redo",
+            "campaign_id": campaign_id,
+            "data": {"expected_history_sequence": 0},
+            "idempotency_key": "redo-branch-roll",
+        }
+        redone = await call(server, "state_revision", redo_args)
+        assert await call(server, "state_revision", redo_args) == redone
+        after_redo = await call(
+            server,
+            "campaign_query",
+            {"action": "get", "campaign_id": campaign_id},
+        )
+        assert after_redo["state"]["random_stream"]["last_receipt"] == roll["random_stream_receipt"]
+        return campaign_id, restore_branch["id"], original["id"], restored
+
+    campaign_id, restore_branch_id, original_branch_id, restored = asyncio.run(exercise())
+    restarted = create_server(config)
+
+    async def verify_restart() -> None:
+        current = await call(
+            restarted,
+            "branch_query",
+            {"action": "current", "campaign_id": campaign_id},
+        )
+        assert current["branch"]["id"] == restore_branch_id
+        branches = await call(
+            restarted,
+            "branch_query",
+            {"action": "list", "campaign_id": campaign_id},
+        )
+        assert {item["id"] for item in branches["branches"]} >= {
+            restore_branch_id,
+            original_branch_id,
+        }
+        lineage = await call(
+            restarted,
+            "snapshot_query",
+            {
+                "action": "lineage",
+                "campaign_id": campaign_id,
+                "data": {"slot": restored["slot"]},
+            },
+        )
+        assert lineage["snapshots"][-1]["id"] == restored["id"]
+
+    asyncio.run(verify_restart())
+
+
 def test_exposure_registry_is_session_and_phase_scoped() -> None:
     registry = ExposureRegistry()
     alice = registry.open(
@@ -1072,12 +1324,24 @@ def test_stdio_client_can_discover_load_and_call(tmp_path) -> None:
                     "exposure",
                     {
                         "action": "set",
-                        "add_tool_ids": ["module_draft", "content_pack"],
+                        "add_tool_ids": [
+                            "module_draft",
+                            "content_pack",
+                            "campaign_change",
+                            "branch_query",
+                            "snapshot_change",
+                        ],
                     },
                 )
                 assert not loaded.isError
                 visible = {item.name for item in (await session.list_tools()).tools}
-                assert {"module_draft", "content_pack"} <= visible
+                assert {
+                    "module_draft",
+                    "content_pack",
+                    "campaign_change",
+                    "branch_query",
+                    "snapshot_change",
+                } <= visible
                 staged = await session.call_tool(
                     "module_draft",
                     {
@@ -1091,6 +1355,73 @@ def test_stdio_client_can_discover_load_and_call(tmp_path) -> None:
                     },
                 )
                 assert not staged.isError
+                campaign = await session.call_tool(
+                    "campaign_query",
+                    {"action": "get", "campaign_id": campaign_id},
+                )
+                campaign_value = json.loads(campaign.content[0].text)
+                branch = await session.call_tool(
+                    "branch_query",
+                    {"action": "current", "campaign_id": campaign_id},
+                )
+                branch_id = json.loads(branch.content[0].text)["branch"]["id"]
+                saved = await session.call_tool(
+                    "snapshot_change",
+                    {
+                        "action": "create",
+                        "campaign_id": campaign_id,
+                        "data": {
+                            "label": "stdio lobby",
+                            "expected_head_snapshot_id": "",
+                        },
+                        "expected_revision": campaign_value["revision"],
+                        "expected_branch_id": branch_id,
+                        "idempotency_key": "stdio-snapshot",
+                    },
+                )
+                assert not saved.isError
+                played = await session.call_tool(
+                    "campaign_change",
+                    {
+                        "action": "set_phase",
+                        "campaign_id": campaign_id,
+                        "data": {
+                            "phase": "play",
+                            "expected_revision": campaign_value["revision"],
+                        },
+                    },
+                )
+                assert not played.isError
+                play_value = json.loads(played.content[0].text)
+                play_tools = {item.name for item in (await session.list_tools()).tools}
+                assert "module_draft" not in play_tools
+                assert "content_pack" not in play_tools
+                assert "snapshot_change" in play_tools
+                restored = await session.call_tool(
+                    "snapshot_change",
+                    {
+                        "action": "restore",
+                        "campaign_id": campaign_id,
+                        "data": {"slot": 1},
+                        "expected_revision": play_value["revision"],
+                        "expected_branch_id": branch_id,
+                        "idempotency_key": "stdio-restore",
+                    },
+                )
+                assert not restored.isError
+                phase = await session.call_tool("game_phase", {"campaign_id": campaign_id})
+                assert json.loads(phase.content[0].text)["phase"] == "lobby"
+                reloaded = await session.call_tool(
+                    "exposure",
+                    {"action": "set", "add_tool_ids": ["module_draft"]},
+                )
+                assert not reloaded.isError
+                resumed = await session.call_tool(
+                    "module_draft",
+                    {"action": "get", "campaign_id": campaign_id},
+                )
+                assert not resumed.isError
+                assert json.loads(resumed.content[0].text)["jobs"]
 
     asyncio.run(exercise())
 

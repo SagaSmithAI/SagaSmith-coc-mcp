@@ -17,6 +17,12 @@ The native capability flow is:
 exposure(open) -> exposure(search) -> exposure(set) -> native domain tool
 ```
 
+Keeper recovery uses `branch_query/change`, `snapshot_query/change`, and
+`state_revision`. Every mutation requires explicit revision, branch or history-cursor
+guards plus an `idempotency_key`. When checkout, restore, undo, or redo changes the
+authoritative phase, the server emits `tools/list_changed`; after refreshing, the host can
+load and directly call the next legal native tool for that phase.
+
 ## Module Pack authoring
 
 CoC scenarios use the unified `sagasmith.content-package` schema version 2 lifecycle:
