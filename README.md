@@ -56,6 +56,10 @@ combat_start -> combat_query
 
 检定不会猜测线索含义或受众。`settle` 返回机械收据，再由 Agent 通过 `memory_change(action="commit")` 落账来源特定的叙述、客观事实、逐角色知识和孤注一掷失败代价。显然或不可缺少的线索完全绕过检定，直接使用连续性结算，不能因连续坏骰阻断模组。
 
+组合检定复用同一套可恢复流程，但一次 d100 会同时对比两个到八个从角色 sheet 读取的技能或特征。Keeper 必须明确选择 `requirement="any"` 或 `"all"`；花费 Luck 只能精确购买这个聚合要求，每个成功的技能分量分别获得成长标记。CoC 不会虚构 D&D 式“多数成功”团体规则。真正的团体 Luck 由 `group_luck_query/check` 读取现场所有参与者的当前 Luck，只允许最低 Luck 的调查员代表；最低值并列时必须由 Keeper 显式选择。
+
+会后成长只在 Lobby 开放。`development_query` 列出已勾选技能，`development_settle` 在一次战役随机流事务内完成全部成长骰、技能更新、首次 mastery SAN 奖励、勾选清空与审计回执；Cthulhu Mythos 会被明确标为不适用普通成长并清除错误勾选。写入边界同时校验角色控制权、战役/角色 revision、分支和幂等重放。
+
 ## Module Pack 创作流程
 
 CoC 模组使用统一的 `sagasmith.content-package` schema v2：

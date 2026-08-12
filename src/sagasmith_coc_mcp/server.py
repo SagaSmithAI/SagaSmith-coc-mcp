@@ -36,7 +36,12 @@ from sagasmith_coc.engine.checks.chase import (
 )
 from sagasmith_coc.engine.checks.combat import resolve_melee_attack, resolve_ranged_attack
 from sagasmith_coc.engine.checks.sanity import resolve_sanity_loss, roll_bout_of_madness
-from sagasmith_coc.engine.checks.skill import resolve_opposed_check, resolve_skill_check
+from sagasmith_coc.engine.checks.skill import (
+    group_luck_candidates,
+    resolve_combined_check,
+    resolve_opposed_check,
+    resolve_skill_check,
+)
 from sagasmith_coc.engine.combat_state import (
     advance_turn as advance_combat_turn,
 )
@@ -53,6 +58,7 @@ from sagasmith_coc.engine.combat_state import (
 from sagasmith_coc.engine.combat_state import (
     start_combat as build_combat_state,
 )
+from sagasmith_coc.engine.development import resolve_skill_development
 from sagasmith_coc.engine.dice.rolls import roll_d100, roll_dice_expression
 from sagasmith_coc.engine.health import apply_damage, apply_healing
 from sagasmith_coc.module_profile import CocModuleProfile
@@ -782,6 +788,38 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
                 ),
             )
         raise ValueError("trait_kind must be skill, characteristic, or luck")
+
+    def investigation_combined_traits(
+        sheet: dict[str, Any],
+        raw_traits: Any,
+        *,
+        default_difficulty: str = "regular",
+    ) -> list[dict[str, Any]]:
+        if not isinstance(raw_traits, list):
+            raise ValueError("data.traits must be an array for a combined check")
+        values = []
+        for raw in raw_traits:
+            if not isinstance(raw, dict):
+                raise ValueError("every combined trait must be an object")
+            kind, name, threshold = investigation_trait(
+                sheet,
+                str(raw.get("trait_kind") or raw.get("kind") or "skill"),
+                str(raw.get("trait_name") or raw.get("name") or ""),
+            )
+            if kind == "luck":
+                raise ValueError("Luck cannot be one component of a combined check")
+            values.append(
+                {
+                    "kind": kind,
+                    "name": name,
+                    "threshold": threshold,
+                    "difficulty": str(raw.get("difficulty") or default_difficulty),
+                }
+            )
+        return values
+
+    def development_skill_eligible(skill_name: str) -> bool:
+        return str(skill_name).strip().casefold() != "cthulhu mythos"
 
     def require_investigation_play(campaign_id: str) -> Any:
         campaign = campaigns.get(campaign_id)
@@ -3353,6 +3391,343 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
         )
 
     @mcp.tool()
+    def development_query(
+        campaign_id: str,
+        actor_id: str,
+        principal_id: str = LOCAL_SYSTEM_PRINCIPAL_ID,
+    ) -> dict[str, Any]:
+        """Read the checked skills awaiting end-of-session development."""
+
+        require_lobby(campaign_id, "development query")
+        actor_access(campaign_id, actor_id, principal_id)
+        campaign = campaigns.get(campaign_id)
+        actor = characters.get(actor_id)
+        sheet = validate_investigator_sheet(dict(actor.sheet))
+        checked = [
+            str(item).strip()
+            for item in list(dict(sheet.get("development") or {}).get("checked_skills") or [])
+            if str(item).strip()
+        ]
+        skills = dict(sheet.get("skills") or {})
+        actual_skill_names = {str(name).casefold(): str(name) for name in skills}
+        pending = []
+        for skill_name in checked:
+            canonical_name = actual_skill_names[skill_name.casefold()]
+            pending.append(
+                {
+                    "skill_name": canonical_name,
+                    "current_value": exact_sheet_value(skills, skill_name, "skill"),
+                    "eligible": development_skill_eligible(canonical_name),
+                    "reason": (
+                        None
+                        if development_skill_eligible(canonical_name)
+                        else "Cthulhu Mythos does not use ordinary development checks"
+                    ),
+                }
+            )
+        return {
+            "campaign_id": campaign_id,
+            "campaign_revision": campaign.revision,
+            "actor_id": actor_id,
+            "character_revision": actor.revision,
+            "pending": pending,
+        }
+
+    @mcp.tool()
+    def development_settle(
+        campaign_id: str,
+        actor_id: str,
+        source: str,
+        expected_revision: int,
+        expected_character_revision: int,
+        idempotency_key: str,
+        principal_id: str = LOCAL_SYSTEM_PRINCIPAL_ID,
+    ) -> dict[str, Any]:
+        """Atomically roll every checked skill and clear the check marks."""
+
+        actor_access(campaign_id, actor_id, principal_id, control=True)
+        source_value = " ".join(str(source or "").split()).strip()
+        if not source_value or len(source_value) > 500:
+            raise ValueError("source must contain 1 to 500 characters")
+        key = str(idempotency_key or "").strip()
+        if not key:
+            raise ValueError("idempotency_key is required")
+        branch_id = current_branch_id(campaign_id)
+        request = {
+            "campaign_id": campaign_id,
+            "actor_id": actor_id,
+            "source": source_value,
+            "expected_revision": int(expected_revision),
+            "expected_character_revision": int(expected_character_revision),
+            "branch_id": branch_id,
+        }
+        scope = f"development-settle:{campaign_id}:{branch_id}:{actor_id}:{principal_id}"
+        replay = replay_response(scope, key, request)
+        if replay is not None:
+            return replay
+        require_lobby(campaign_id, "development settlement")
+        campaign = campaigns.get(campaign_id)
+        actor = characters.get(actor_id)
+        if campaign.revision != int(expected_revision):
+            raise ValueError(
+                "campaign revision conflict: "
+                f"expected {expected_revision}, found {campaign.revision}"
+            )
+        if actor.revision != int(expected_character_revision):
+            raise ValueError(
+                "character revision conflict: "
+                f"expected {expected_character_revision}, found {actor.revision}"
+            )
+        sheet = validate_investigator_sheet(dict(actor.sheet))
+        development = dict(sheet.get("development") or {})
+        checked = [
+            str(item).strip()
+            for item in list(development.get("checked_skills") or [])
+            if str(item).strip()
+        ]
+        if not checked:
+            raise ValueError("actor has no checked skills awaiting development")
+        if len(set(name.casefold() for name in checked)) != len(checked):
+            raise ValueError("checked skill names must be unique")
+        skills = dict(sheet.get("skills") or {})
+        actual_skill_names = {str(name).casefold(): str(name) for name in skills}
+        stream = CampaignRandomStream.from_campaign_state(
+            campaign_id,
+            campaign.state,
+            operation="development_settle",
+            idempotency_key=key,
+        )
+        results: list[dict[str, Any]] = []
+        san_before = int(sheet["san"])
+        san_current = san_before
+        with use_random_stream(stream):
+            for skill_name in checked:
+                canonical_name = actual_skill_names[skill_name.casefold()]
+                current = exact_sheet_value(skills, skill_name, "skill")
+                if not development_skill_eligible(canonical_name):
+                    results.append(
+                        {
+                            "skill_name": canonical_name,
+                            "current_value": current,
+                            "eligible": False,
+                            "reason": "Cthulhu Mythos does not use ordinary development checks",
+                        }
+                    )
+                    continue
+                result = resolve_skill_development(current)
+                skills[canonical_name] = int(result["new_value"])
+                san_gain = min(
+                    int(result["san_recovery"]),
+                    max(0, int(sheet["san_max"]) - san_current),
+                )
+                san_current += san_gain
+                results.append(
+                    {
+                        "skill_name": canonical_name,
+                        "eligible": True,
+                        **result,
+                        "san_applied": san_gain,
+                    }
+                )
+        receipt = {
+            "sequence": len(list(development.get("history") or [])) + 1,
+            "source": source_value,
+            "actor_id": actor_id,
+            "results": results,
+            "san_before": san_before,
+            "san_after": san_current,
+        }
+        development["checked_skills"] = []
+        development["history"] = [
+            *list(development.get("history") or [])[-99:],
+            receipt,
+        ]
+        next_sheet = {
+            **sheet,
+            "skills": skills,
+            "san": san_current,
+            "development": development,
+        }
+        next_state = {
+            **dict(campaign.state),
+            "random_stream": stream.persisted_state(),
+        }
+        response = {
+            "campaign_id": campaign_id,
+            "campaign_revision": campaign.revision + 1,
+            "actor_id": actor_id,
+            "character_revision": actor.revision + 1,
+            "receipt": deepcopy(receipt),
+            "random_stream_receipt": stream.receipt(),
+        }
+        StateMutationService(storage.database).replace(
+            campaign_id,
+            campaign_state=next_state,
+            character_updates=[
+                CharacterStateUpdate(
+                    character_id=actor_id,
+                    sheet=validate_investigator_sheet(next_sheet),
+                    notes=dict(actor.notes),
+                    expected_revision=actor.revision,
+                )
+            ],
+            expected_campaign_revision=campaign.revision,
+            operation="coc.development.settle",
+            actor=principal_id,
+            branch_id=branch_id,
+            idempotency_key=key,
+            idempotency_write=IdempotencyWrite(
+                scope=scope,
+                payload=request,
+                response=response,
+            ),
+        )
+        stream.mark_persisted()
+        return response
+
+    def group_luck_context(campaign_id: str, actor_ids: list[str]) -> dict[str, Any]:
+        normalized = [str(item).strip() for item in actor_ids if str(item).strip()]
+        if len(normalized) != len(actor_ids):
+            raise ValueError("participant actor ids must not be empty")
+        participants = []
+        for actor_id in normalized:
+            actor = characters.get(actor_id)
+            if actor.campaign_id != campaign_id:
+                raise ValueError("every group Luck participant must belong to the campaign")
+            sheet = validate_investigator_sheet(dict(actor.sheet))
+            participants.append(
+                {"actor_id": actor_id, "name": actor.name, "luck": int(sheet["luck"])}
+            )
+        return {**group_luck_candidates(participants), "participants": participants}
+
+    @mcp.tool()
+    def group_luck_query(
+        campaign_id: str,
+        participant_actor_ids: list[str],
+        principal_id: str = LOCAL_SYSTEM_PRINCIPAL_ID,
+    ) -> dict[str, Any]:
+        """Identify the lowest-Luck investigator(s) present in the scene."""
+
+        require_dm(campaign_id, principal_id)
+        campaign = require_investigation_play(campaign_id)
+        context = group_luck_context(campaign_id, participant_actor_ids)
+        return {"campaign_id": campaign_id, "campaign_revision": campaign.revision, **context}
+
+    @mcp.tool()
+    def group_luck_check(
+        campaign_id: str,
+        participant_actor_ids: list[str],
+        source: str,
+        goal: str,
+        expected_revision: int,
+        idempotency_key: str,
+        selected_actor_id: str | None = None,
+        principal_id: str = LOCAL_SYSTEM_PRINCIPAL_ID,
+    ) -> dict[str, Any]:
+        """Roll once using the lowest current Luck among scene participants."""
+
+        require_dm(campaign_id, principal_id)
+        source_value = " ".join(str(source or "").split()).strip()
+        goal_value = " ".join(str(goal or "").split()).strip()
+        if not source_value or len(source_value) > 500:
+            raise ValueError("source must contain 1 to 500 characters")
+        if not goal_value or len(goal_value) > 500:
+            raise ValueError("goal must contain 1 to 500 characters")
+        key = str(idempotency_key or "").strip()
+        if not key:
+            raise ValueError("idempotency_key is required")
+        branch_id = current_branch_id(campaign_id)
+        request = {
+            "campaign_id": campaign_id,
+            "participant_actor_ids": [str(item) for item in participant_actor_ids],
+            "source": source_value,
+            "goal": goal_value,
+            "expected_revision": int(expected_revision),
+            "selected_actor_id": selected_actor_id,
+            "branch_id": branch_id,
+        }
+        scope = f"group-luck-check:{campaign_id}:{branch_id}:{principal_id}"
+        replay = replay_response(scope, key, request)
+        if replay is not None:
+            return replay
+        campaign = require_investigation_play(campaign_id)
+        if campaign.revision != int(expected_revision):
+            raise ValueError(
+                "campaign revision conflict: "
+                f"expected {expected_revision}, found {campaign.revision}"
+            )
+        context = group_luck_context(campaign_id, participant_actor_ids)
+        candidates = list(context["candidate_actor_ids"])
+        selected = str(selected_actor_id or "").strip()
+        if len(candidates) > 1 and not selected:
+            raise ValueError(
+                "selected_actor_id is required for tied lowest Luck candidates: "
+                + ", ".join(candidates)
+            )
+        if not selected:
+            selected = candidates[0]
+        if selected not in candidates:
+            raise ValueError("selected_actor_id must be one of the lowest-Luck candidates")
+        stream = CampaignRandomStream.from_campaign_state(
+            campaign_id,
+            campaign.state,
+            operation="group_luck_check",
+            idempotency_key=key,
+        )
+        with use_random_stream(stream):
+            roll = roll_d100()
+            outcome = resolve_skill_check(
+                int(roll["total"]),
+                int(context["lowest_luck"]),
+                roll_kind="luck",
+                skill_name="Group Luck",
+            )
+        history = list(campaign.state.get("group_luck_rolls") or [])
+        receipt = {
+            "sequence": len(history) + 1,
+            "source": source_value,
+            "goal": goal_value,
+            "participant_actor_ids": [item["actor_id"] for item in context["participants"]],
+            "candidate_actor_ids": candidates,
+            "selected_actor_id": selected,
+            "threshold": int(context["lowest_luck"]),
+            "roll": roll,
+            "outcome": outcome,
+        }
+        next_state = {
+            **dict(campaign.state),
+            "group_luck_rolls": [*history[-499:], receipt],
+            "random_stream": stream.persisted_state(),
+        }
+        response = {
+            "campaign_id": campaign_id,
+            "campaign_revision": campaign.revision + 1,
+            "receipt": deepcopy(receipt),
+            "random_stream_receipt": stream.receipt(),
+            "continuity_required": True,
+            "continuity_instruction": (
+                "Use memory_change(action='commit') for the Agent-decided group consequence, "
+                "audience, and resulting knowledge."
+            ),
+        }
+        StateMutationService(storage.database).replace(
+            campaign_id,
+            campaign_state=next_state,
+            expected_campaign_revision=campaign.revision,
+            operation="coc.group_luck.check",
+            actor=principal_id,
+            branch_id=branch_id,
+            idempotency_key=key,
+            idempotency_write=IdempotencyWrite(
+                scope=scope,
+                payload=request,
+                response=response,
+            ),
+        )
+        stream.mark_persisted()
+        return response
+
+    @mcp.tool()
     def investigation_query(
         campaign_id: str,
         actor_id: str,
@@ -3446,11 +3821,6 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
                 raise ValueError("data.source must contain 1 to 500 characters")
             if not goal or len(goal) > 500:
                 raise ValueError("data.goal must contain 1 to 500 characters")
-            trait_kind, trait_name, threshold = investigation_trait(
-                sheet,
-                str(data.get("trait_kind") or "skill"),
-                str(data.get("trait_name") or ""),
-            )
             difficulty = str(data.get("difficulty") or "regular")
             bonus_dice = int(data.get("bonus_dice", 0))
             penalty_dice = int(data.get("penalty_dice", 0))
@@ -3465,26 +3835,55 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
             )
             with use_random_stream(stream):
                 roll = roll_d100(bonus_dice=bonus_dice, penalty_dice=penalty_dice)
-                outcome = resolve_skill_check(
-                    int(roll["total"]),
-                    threshold,
-                    difficulty=difficulty,
-                    bonus_dice=bonus_dice,
-                    penalty_dice=penalty_dice,
-                    skill_name=trait_name,
-                    investigator_name=actor.name,
-                    roll_kind=trait_kind,
-                )
+                if data.get("traits") is not None:
+                    traits = investigation_combined_traits(
+                        sheet,
+                        data["traits"],
+                        default_difficulty=difficulty,
+                    )
+                    requirement = str(data.get("requirement") or "").strip().casefold()
+                    outcome = resolve_combined_check(
+                        int(roll["total"]),
+                        traits,
+                        requirement=requirement,
+                        bonus_dice=bonus_dice,
+                        penalty_dice=penalty_dice,
+                    )
+                    check_shape = {
+                        "check_kind": "combined",
+                        "traits": traits,
+                        "requirement": requirement,
+                    }
+                else:
+                    trait_kind, trait_name, threshold = investigation_trait(
+                        sheet,
+                        str(data.get("trait_kind") or "skill"),
+                        str(data.get("trait_name") or ""),
+                    )
+                    outcome = resolve_skill_check(
+                        int(roll["total"]),
+                        threshold,
+                        difficulty=difficulty,
+                        bonus_dice=bonus_dice,
+                        penalty_dice=penalty_dice,
+                        skill_name=trait_name,
+                        investigator_name=actor.name,
+                        roll_kind=trait_kind,
+                    )
+                    check_shape = {
+                        "check_kind": "single",
+                        "trait_kind": trait_kind,
+                        "trait_name": trait_name,
+                        "threshold": threshold,
+                        "difficulty": difficulty,
+                    }
             pending = {
                 "id": check_id,
                 "actor_id": actor_id,
                 "actor_revision": actor.revision,
                 "source": source,
                 "goal": goal,
-                "trait_kind": trait_kind,
-                "trait_name": trait_name,
-                "threshold": threshold,
-                "difficulty": difficulty,
+                **check_shape,
                 "bonus_dice": bonus_dice,
                 "penalty_dice": penalty_dice,
                 "roll": roll,
@@ -3540,17 +3939,27 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
             spent = int(data.get("luck_spent", 0))
             if spent <= 0 or spent > int(sheet["luck"]):
                 raise ValueError("luck_spent must be positive and no greater than current Luck")
-            outcome = resolve_skill_check(
-                int(dict(pending["roll"])["total"]),
-                int(pending["threshold"]),
-                difficulty=str(pending["difficulty"]),
-                bonus_dice=int(pending["bonus_dice"]),
-                penalty_dice=int(pending["penalty_dice"]),
-                luck_spent=spent,
-                skill_name=str(pending["trait_name"]),
-                investigator_name=actor.name,
-                roll_kind=str(pending["trait_kind"]),
-            )
+            if pending.get("check_kind") == "combined":
+                outcome = resolve_combined_check(
+                    int(dict(pending["roll"])["total"]),
+                    list(pending["traits"]),
+                    requirement=str(pending["requirement"]),
+                    bonus_dice=int(pending["bonus_dice"]),
+                    penalty_dice=int(pending["penalty_dice"]),
+                    luck_spent=spent,
+                )
+            else:
+                outcome = resolve_skill_check(
+                    int(dict(pending["roll"])["total"]),
+                    int(pending["threshold"]),
+                    difficulty=str(pending["difficulty"]),
+                    bonus_dice=int(pending["bonus_dice"]),
+                    penalty_dice=int(pending["penalty_dice"]),
+                    luck_spent=spent,
+                    skill_name=str(pending["trait_name"]),
+                    investigator_name=actor.name,
+                    roll_kind=str(pending["trait_kind"]),
+                )
             next_sheet = dict(sheet)
             next_sheet["luck"] = int(sheet["luck"]) - spent
             next_sheet["luck_events"] = [
@@ -3617,14 +4026,6 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
                 raise ValueError(
                     "data.failure_consequence must contain 1 to 500 characters"
                 )
-            trait_kind, trait_name, threshold = investigation_trait(
-                sheet,
-                str(data.get("trait_kind") or pending["trait_kind"]),
-                str(data.get("trait_name") or pending["trait_name"]),
-            )
-            if trait_kind not in {"skill", "characteristic"}:
-                raise ValueError("a pushed roll must use a skill or characteristic")
-            difficulty = str(data.get("difficulty") or pending["difficulty"])
             bonus_dice = int(data.get("bonus_dice", pending["bonus_dice"]))
             penalty_dice = int(data.get("penalty_dice", pending["penalty_dice"]))
             stream = CampaignRandomStream.from_campaign_state(
@@ -3635,23 +4036,51 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
             )
             with use_random_stream(stream):
                 roll = roll_d100(bonus_dice=bonus_dice, penalty_dice=penalty_dice)
-                outcome = resolve_skill_check(
-                    int(roll["total"]),
-                    threshold,
-                    difficulty=difficulty,
-                    bonus_dice=bonus_dice,
-                    penalty_dice=penalty_dice,
-                    skill_name=trait_name,
-                    investigator_name=actor.name,
-                    pushed=True,
-                    roll_kind=trait_kind,
-                )
+                if pending.get("check_kind") == "combined":
+                    traits = investigation_combined_traits(
+                        sheet,
+                        data.get("traits", pending["traits"]),
+                        default_difficulty=str(data.get("difficulty") or "regular"),
+                    )
+                    requirement = str(
+                        data.get("requirement") or pending["requirement"]
+                    ).strip().casefold()
+                    outcome = resolve_combined_check(
+                        int(roll["total"]),
+                        traits,
+                        requirement=requirement,
+                        bonus_dice=bonus_dice,
+                        penalty_dice=penalty_dice,
+                        pushed=True,
+                    )
+                    pushed_shape = {"traits": traits, "requirement": requirement}
+                else:
+                    trait_kind, trait_name, threshold = investigation_trait(
+                        sheet,
+                        str(data.get("trait_kind") or pending["trait_kind"]),
+                        str(data.get("trait_name") or pending["trait_name"]),
+                    )
+                    difficulty = str(data.get("difficulty") or pending["difficulty"])
+                    outcome = resolve_skill_check(
+                        int(roll["total"]),
+                        threshold,
+                        difficulty=difficulty,
+                        bonus_dice=bonus_dice,
+                        penalty_dice=penalty_dice,
+                        skill_name=trait_name,
+                        investigator_name=actor.name,
+                        pushed=True,
+                        roll_kind=trait_kind,
+                    )
+                    pushed_shape = {
+                        "trait_kind": trait_kind,
+                        "trait_name": trait_name,
+                        "threshold": threshold,
+                        "difficulty": difficulty,
+                    }
             pending = {
                 **pending,
-                "trait_kind": trait_kind,
-                "trait_name": trait_name,
-                "threshold": threshold,
-                "difficulty": difficulty,
+                **pushed_shape,
                 "bonus_dice": bonus_dice,
                 "penalty_dice": penalty_dice,
                 "roll": roll,
@@ -3753,12 +4182,26 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
         }
         character_updates = []
         next_character_revision = actor.revision
-        if bool(outcome.get("development_eligible")) and str(pending["trait_kind"]) == "skill":
+        marked_skills = []
+        if pending.get("check_kind") == "combined":
+            marked_skills = [
+                str(item)
+                for item in list(outcome.get("development_eligible_skills") or [])
+                if development_skill_eligible(str(item))
+            ]
+        elif (
+            bool(outcome.get("development_eligible"))
+            and str(pending["trait_kind"]) == "skill"
+            and development_skill_eligible(str(pending["trait_name"]))
+        ):
+            marked_skills = [str(pending["trait_name"])]
+        if marked_skills:
             next_sheet = dict(sheet)
             development = dict(next_sheet.get("development") or {})
             checked = [str(item) for item in development.get("checked_skills") or []]
-            if str(pending["trait_name"]) not in checked:
-                development["checked_skills"] = [*checked, str(pending["trait_name"])]
+            additions = [name for name in marked_skills if name not in checked]
+            if additions:
+                development["checked_skills"] = [*checked, *additions]
                 next_sheet["development"] = development
                 character_updates = [
                     CharacterStateUpdate(

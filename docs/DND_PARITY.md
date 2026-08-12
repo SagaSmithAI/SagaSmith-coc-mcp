@@ -9,9 +9,9 @@
 | 仓库 | 当前事实 | 结论 |
 | --- | --- | --- |
 | `sagasmith-dnd` | 107 个受版本控制文件、45 个 Python 测试文件 | 规则运行时参考实现 |
-| `sagasmith-coc` | 29 个受版本控制文件、5 个 Python 测试文件、32 项测试 | 已具备来源一致的判定、Luck/Push 规则、随机流、Combat/Chase 状态和 Module Pack 编译 |
+| `sagasmith-coc` | 29 个受版本控制文件、9 个 Python 测试文件、36 项测试 | 已具备来源一致的单人/组合/对抗判定、团体 Luck、Luck/Push、成长、随机流、Combat/Chase 状态和 Module Pack 编译 |
 | `SagaSmith-dnd-mcp` | 64 个 `public_tool`、80 个 Python 测试文件 | 全链路公共行为参考实现 |
-| `SagaSmith-coc-mcp` | 39 个 MCP 工具、3 个 Python 测试文件、20 项测试 | 已有创作、恢复、随机流、SAN/HP、调查/Luck/Push、事件连续性、权威战斗与追逐垂直切片，尚未形成完整运行时 |
+| `SagaSmith-coc-mcp` | 43 个 MCP 工具、4 个 Python 测试文件、24 项测试 | 已有创作、恢复、随机流、SAN/HP、单人/组合调查、团体 Luck、会后成长、事件连续性、权威战斗与追逐垂直切片，尚未形成完整运行时 |
 | `SagaSmith-dnd-skills` | 4,157 个受版本控制文件 | 包含完整技能、引用、模板和内容语料 |
 | `SagaSmith-coc-skills` | 34 个受版本控制文件 | 只有 Keeper、战役管理和少量静态引用 |
 | `sagasmith-dnd-ui` | 59 个受版本控制文件 | 含 Content Workbench、场景图谱和战斗工作区 |
@@ -62,9 +62,9 @@
 | 伤害、重伤、濒死 | 部分：已有权威单次及战斗内伤害/治疗结算 | `coc_hp_change` 与 `combat_attack(resolve)` 已覆盖 HP、major wound、CON、unconscious/dying/dead、急救/治疗、随机流与原子角色更新；仍需濒死轮次和自然/周治疗调度 |
 | 战斗 | 部分：权威 encounter 垂直切片可运行 | 公共 start/query/move/join/end-turn/attack/open-response-resolve/end 已覆盖 DEX/准备枪械顺序、稳定同值、下一轮加入、dodge/fight-back/dive、围攻、弹药、极难/贯穿伤害、Grid/Agent 和精确重放；仍缺 maneuver、枪械多发、护甲/掩体细节、濒死轮次与完整模组回测 |
 | 追逐 | 部分：权威 chase 垂直切片可运行 | 公共 start/query/action/end 已覆盖来源明确的速度技能、随机流、有效 MOV、最慢 MOV 行动点、DEX 顺序、路线/障碍检定、位置、玩家权限、战斗互斥、精确重放和重启；仍缺车辆碰撞/伤害、多人协助、追逐中战斗与真实模组回测 |
-| 调查 | 部分：单人来源检定全链路可运行 | 公共 query/check 覆盖 sheet 来源阈值、奖励/惩罚骰、待决选择、Luck、Push 新做法与失败代价、会后技能标记、重启和阶段互斥；连续性提交覆盖个人受众与秘密信息，显然线索直接结算不掷骰。仍缺组合/多人检定、组 Luck 和真实私有 Pack 回测 |
+| 调查 | 部分：单人、组合、多人独立检定与团体 Luck 全链路可运行 | 公共 query/check 覆盖 sheet 来源阈值、奖励/惩罚骰、待决选择、组合 `any/all`、Luck、Push 新做法与失败代价、逐技能成长标记、重启和阶段互斥；团体 Luck 强制由现场最低当前值代表，并列时要求 Keeper 显式选择。连续性提交覆盖个人受众与秘密信息，显然线索直接结算不掷骰。仍缺真实私有 Pack 回测 |
 | NPC 对话 | 缺失 | 每 NPC 隔离 worker、私有上下文、提案收敛、mechanic/场景变化前 close/abort |
-| 角色成长 | 部分：development 纯函数 | session 结束成长、技能勾选、年龄、信用评级和 Pack 来源同事务 |
+| 角色成长 | 部分：权威会后技能成长可运行 | Lobby 公共 query/settle 从 sheet 读取全部勾选技能，在单一随机流/角色事务中执行成长、首次 mastery SAN、清空勾选和审计历史；真实 stdio Host 已覆盖动态出现/消失和直接调用。仍缺年龄、信用评级、可选 Luck 恢复配置和 Pack 来源长期成长 |
 | 法术/典籍/神话 | 仅 Pack 目录字段 | 阅读时间、语言、神话技能、SAN、魔法值、法术学习/施放和来源收据 |
 
 ## UI、Skills 与回测

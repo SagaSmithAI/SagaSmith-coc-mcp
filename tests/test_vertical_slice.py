@@ -2437,12 +2437,50 @@ def test_stdio_client_can_discover_load_and_call(tmp_path) -> None:
                         "campaign_id": campaign_id,
                         "data": {
                             "name": "Stdio Investigator",
-                            "sheet": {"characteristics": {"dex": 60}},
+                            "sheet": {
+                                "characteristics": {"dex": 60},
+                                "skills": {"Spot Hidden": 0},
+                                "development": {"checked_skills": ["Spot Hidden"]},
+                            },
                         },
                     },
                 )
                 assert not investigator_result.isError
                 investigator = json.loads(investigator_result.content[0].text)
+                development_loaded = await session.call_tool(
+                    "exposure",
+                    {
+                        "action": "set",
+                        "add_tool_ids": ["development_query", "development_settle"],
+                    },
+                )
+                assert not development_loaded.isError
+                pending_development = await session.call_tool(
+                    "development_query",
+                    {"campaign_id": campaign_id, "actor_id": investigator["id"]},
+                )
+                assert not pending_development.isError
+                pending_development_value = json.loads(
+                    pending_development.content[0].text
+                )
+                settled_development = await session.call_tool(
+                    "development_settle",
+                    {
+                        "campaign_id": campaign_id,
+                        "actor_id": investigator["id"],
+                        "source": "Stdio end-of-session development fixture.",
+                        "expected_revision": pending_development_value["campaign_revision"],
+                        "expected_character_revision": pending_development_value[
+                            "character_revision"
+                        ],
+                        "idempotency_key": "stdio-development",
+                    },
+                )
+                assert not settled_development.isError
+                settled_development_value = json.loads(
+                    settled_development.content[0].text
+                )
+                investigator["revision"] = settled_development_value["character_revision"]
                 cultist_result = await session.call_tool(
                     "character_change",
                     {
@@ -2499,6 +2537,8 @@ def test_stdio_client_can_discover_load_and_call(tmp_path) -> None:
                 assert "module_draft" not in play_tools
                 assert "content_pack" not in play_tools
                 assert "snapshot_change" in play_tools
+                assert "development_query" not in play_tools
+                assert "development_settle" not in play_tools
                 continuity_loaded = await session.call_tool(
                     "exposure",
                     {
@@ -2508,10 +2548,37 @@ def test_stdio_client_can_discover_load_and_call(tmp_path) -> None:
                             "continuity_context",
                             "investigation_check",
                             "investigation_query",
+                            "group_luck_check",
+                            "group_luck_query",
                         ],
                     },
                 )
                 assert not continuity_loaded.isError
+                group_luck = await session.call_tool(
+                    "group_luck_query",
+                    {
+                        "campaign_id": campaign_id,
+                        "participant_actor_ids": [investigator["id"], cultist["id"]],
+                    },
+                )
+                assert not group_luck.isError
+                group_luck_value = json.loads(group_luck.content[0].text)
+                group_luck_result = await session.call_tool(
+                    "group_luck_check",
+                    {
+                        "campaign_id": campaign_id,
+                        "participant_actor_ids": [investigator["id"], cultist["id"]],
+                        "selected_actor_id": investigator["id"],
+                        "source": "Stdio group circumstance fixture.",
+                        "goal": "Determine whether transport arrives before the storm.",
+                        "expected_revision": group_luck_value["campaign_revision"],
+                        "idempotency_key": "stdio-group-luck",
+                    },
+                )
+                assert not group_luck_result.isError
+                play_value["revision"] = json.loads(
+                    group_luck_result.content[0].text
+                )["campaign_revision"]
                 opened_check_result = await session.call_tool(
                     "investigation_check",
                     {
@@ -2613,6 +2680,8 @@ def test_stdio_client_can_discover_load_and_call(tmp_path) -> None:
                 assert "continuity_context" in combat_tools
                 assert "investigation_check" not in combat_tools
                 assert "investigation_query" not in combat_tools
+                assert "group_luck_check" not in combat_tools
+                assert "group_luck_query" not in combat_tools
                 combat_loaded = await session.call_tool(
                     "exposure",
                     {

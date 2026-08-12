@@ -49,6 +49,7 @@ PHASE_TOOLS = {
         actor_knowledge_change actor_knowledge_query campaign_change character_change
         branch_change branch_query character_query coc_dice_roll coc_resolve
         campaign_event continuity_context memory_change memory_query state_revision
+        development_query development_settle
         content_pack module_change module_draft module_query
         snapshot_change snapshot_query
         """
@@ -59,6 +60,7 @@ PHASE_TOOLS = {
         branch_change branch_query character_query coc_dice_roll coc_hp_change
         chase_action chase_end chase_query chase_start coc_resolve coc_sanity_check
         combat_start campaign_event continuity_context memory_change memory_query state_revision
+        group_luck_check group_luck_query
         investigation_check investigation_query module_change module_query
         snapshot_change snapshot_query
         """
@@ -85,7 +87,8 @@ PHASE_DM_TOOLS = {
         """
         actor_knowledge_change branch_change campaign_change campaign_event memory_change
         memory_query module_change
-        chase_end chase_start combat_start snapshot_change snapshot_query state_revision
+        chase_end chase_start combat_start group_luck_check group_luck_query
+        snapshot_change snapshot_query state_revision
         """
     ),
     PROFILE_COMBAT: _names(
