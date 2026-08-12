@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import importlib
 import json
 import re
 from copy import deepcopy
@@ -114,6 +115,16 @@ from .tool_profiles import (
 )
 
 
+def _preload_optional_pdf_runtime() -> None:
+    """Load PDF native dependencies before the stdio host starts worker threads."""
+
+    try:
+        importlib.import_module("pypdfium2")
+    except ModuleNotFoundError as exc:
+        if exc.name != "pypdfium2":
+            raise
+
+
 class SessionExposureFastMCP(FastMCP):
     """Filter native tools/list by one server-owned MCP-session exposure."""
 
@@ -222,6 +233,7 @@ class SessionExposureFastMCP(FastMCP):
 
 
 def create_server(config: McpConfig | None = None) -> FastMCP:
+    _preload_optional_pdf_runtime()
     config = config or McpConfig.from_environment()
     storage = SagaSmithStorage(config)
     storage.migrate()

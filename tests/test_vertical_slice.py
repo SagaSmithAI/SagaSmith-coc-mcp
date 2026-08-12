@@ -14,6 +14,7 @@ from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 from sagasmith_coc.random_stream import initial_random_stream
 from sagasmith_core import ModuleService
 
+from sagasmith_coc_mcp import server as server_module
 from sagasmith_coc_mcp.config import McpConfig
 from sagasmith_coc_mcp.exposure import ExposureError, ExposureRegistry
 from sagasmith_coc_mcp.server import create_server
@@ -114,6 +115,25 @@ def synthetic_pack_decisions(receipt: dict, *, title: str = "Synthetic Case") ->
         "metadata": {"license": "private", "attribution": "Synthetic test"},
         "version": "1.0.0",
     }
+
+
+def test_create_server_preloads_optional_pdf_runtime(tmp_path, monkeypatch) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr(
+        server_module,
+        "_preload_optional_pdf_runtime",
+        lambda: calls.append("pdf"),
+    )
+    config = McpConfig(
+        home=tmp_path / "home",
+        database_url=None,
+        coc_skills_dir=tmp_path / "missing-coc-skills",
+        modulegen_skills_dir=tmp_path / "missing-modulegen-skills",
+    )
+
+    server_module.create_server(config)
+
+    assert calls == ["pdf"]
 
 
 def test_coc_mcp_persists_campaign_modules_and_actor_knowledge(tmp_path) -> None:
@@ -2350,9 +2370,24 @@ def test_native_tool_list_is_independent_per_session(tmp_path) -> None:
 
 
 def test_stdio_client_can_discover_load_and_call(tmp_path) -> None:
+    imports = tmp_path / "imports"
+    imports.mkdir()
+    source = imports / "stdio-module.pdf"
+    write_text_pdf(
+        source,
+        [
+            "# Stdio Module",
+            "## Arrival",
+            "The investigator arrives in Arkham.",
+            "## Ending",
+            "The investigation is resolved.",
+        ],
+    )
+
     async def exercise() -> None:
         env = dict(os.environ)
         env["SAGASMITH_COC_MCP_HOME"] = str(tmp_path / "home")
+        env["SAGASMITH_COC_MCP_MODULE_IMPORT_ROOTS"] = str(imports)
         params = StdioServerParameters(
             command=sys.executable,
             args=["-m", "sagasmith_coc_mcp.server"],
@@ -2387,6 +2422,25 @@ def test_stdio_client_can_discover_load_and_call(tmp_path) -> None:
                     {"action": "open", "campaign_id": campaign_id},
                 )
                 assert not rebound.isError
+                loaded_module_draft = await session.call_tool(
+                    "exposure",
+                    {"action": "set", "add_tool_ids": ["module_draft"]},
+                )
+                assert not loaded_module_draft.isError
+                imported = await session.call_tool(
+                    "module_draft",
+                    {
+                        "action": "start",
+                        "campaign_id": campaign_id,
+                        "data": {
+                            "source_path": str(source),
+                            "source_key": "test.stdio.pdf",
+                        },
+                        "idempotency_key": "stdio-pdf-import",
+                    },
+                )
+                assert not imported.isError
+                assert json.loads(imported.content[0].text)["job"]["state"] == "imported"
                 listed_skills = await session.call_tool(
                     "skill_query",
                     {"action": "list", "campaign_id": campaign_id},
