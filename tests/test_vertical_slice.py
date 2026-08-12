@@ -728,7 +728,7 @@ def test_module_source_path_must_be_inside_configured_import_roots(tmp_path) -> 
     asyncio.run(exercise())
 
 
-def test_module_draft_content_asset_and_actor_edits_enter_final_pack(tmp_path) -> None:
+def test_module_draft_content_asset_and_actor_edits_enter_final_pack(tmp_path, monkeypatch) -> None:
     allowed = tmp_path / "allowed"
     allowed.mkdir()
     handout = allowed / "handout.txt"
@@ -943,6 +943,112 @@ def test_module_draft_content_asset_and_actor_edits_enter_final_pack(tmp_path) -
             },
         )
         assert stored["reviews"][0]["content_key"] == "clue:lantern-mark"
+
+        target = await call(
+            server,
+            "campaign_change",
+            {
+                "action": "create",
+                "data": {"name": "Recovered import", "idempotency_key": "recovered-campaign"},
+            },
+        )
+        import_args = {
+            "action": "import",
+            "campaign_id": target["id"],
+            "data": {"artifact": finalized["artifact"]},
+            "expected_revision": target["revision"],
+            "idempotency_key": "recovered-pack-import",
+        }
+        original_bind = ModuleService.bind_actor
+        interrupted = False
+
+        def interrupt_after_binding(self, *args, **kwargs):
+            nonlocal interrupted
+            result = original_bind(self, *args, **kwargs)
+            if not interrupted:
+                interrupted = True
+                raise RuntimeError("simulated interruption after actor binding")
+            return result
+
+        monkeypatch.setattr(ModuleService, "bind_actor", interrupt_after_binding)
+        with pytest.raises(Exception, match="simulated interruption"):
+            await call(server, "content_pack", import_args)
+        monkeypatch.setattr(ModuleService, "bind_actor", original_bind)
+        imported = await call(server, "content_pack", import_args)
+        assert await call(server, "content_pack", import_args) == imported
+        target_modules = await call(
+            server,
+            "content_pack",
+            {"action": "list", "campaign_id": target["id"]},
+        )
+        assert [item["id"] for item in target_modules["packs"]] == [imported["module_id"]]
+        target_characters = await call(
+            server,
+            "character_query",
+            {"action": "list", "campaign_id": target["id"]},
+        )
+        assert [item["name"] for item in target_characters["characters"]] == ["Mr Marsh"]
+
+        roll_one = await call(
+            server,
+            "coc_dice_roll",
+            {
+                "kind": "d100",
+                "campaign_id": target["id"],
+                "expected_revision": target["revision"],
+                "idempotency_key": "recovered-roll-1",
+            },
+        )
+        assert await call(server, "content_pack", import_args) == imported
+        activate_args = {
+            "action": "activate",
+            "campaign_id": target["id"],
+            "data": {"module_id": imported["module_id"]},
+            "expected_revision": roll_one["campaign_revision"],
+            "idempotency_key": "recovered-activate",
+        }
+        activated = await call(server, "content_pack", activate_args)
+        roll_two = await call(
+            server,
+            "coc_dice_roll",
+            {
+                "kind": "d100",
+                "campaign_id": target["id"],
+                "expected_revision": roll_one["campaign_revision"],
+                "idempotency_key": "recovered-roll-2",
+            },
+        )
+        assert await call(server, "content_pack", activate_args) == activated
+        deactivate_args = {
+            "action": "deactivate",
+            "campaign_id": target["id"],
+            "data": {"module_id": imported["module_id"]},
+            "expected_revision": roll_two["campaign_revision"],
+            "idempotency_key": "recovered-deactivate",
+        }
+        deactivated = await call(server, "content_pack", deactivate_args)
+        assert deactivated["deactivation"]["active"] is False
+        roll_three = await call(
+            server,
+            "coc_dice_roll",
+            {
+                "kind": "d100",
+                "campaign_id": target["id"],
+                "expected_revision": roll_two["campaign_revision"],
+                "idempotency_key": "recovered-roll-3",
+            },
+        )
+        assert await call(server, "content_pack", deactivate_args) == deactivated
+        remove_args = {
+            "action": "remove",
+            "campaign_id": target["id"],
+            "data": {"module_id": imported["module_id"]},
+            "expected_revision": roll_three["campaign_revision"],
+            "idempotency_key": "recovered-remove",
+        }
+        removed = await call(server, "content_pack", remove_args)
+        assert removed == {"module_id": imported["module_id"], "removed": True}
+        assert await call(server, "content_pack", remove_args) == removed
 
     asyncio.run(exercise())
 

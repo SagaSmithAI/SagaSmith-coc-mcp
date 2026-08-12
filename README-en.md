@@ -36,11 +36,19 @@ module_draft(start)
   -> module_draft(finalize)
   -> content_pack(import)
   -> content_pack(activate)
+  -> content_pack(deactivate|remove)
 ```
 
 `start` accepts either an allowlisted PDF/Markdown/text `source_path` or generated `name` plus `content`. Mechanical import creates an inactive draft; `advance` resumes from a committed intermediate step after interruption. `evidence` exposes bounded chunks, managed PDF-page render receipts, assets, and content reviews. `edit` supports checksum-bound PDF transcription repair, reviewed CoC content, current CoC statblock-schema validation, allowlisted assets, actor bindings, and Pack decisions. Statblocks may preserve source-true partial non-combat NPC data; only an explicit `combat_ready` declaration requires combat fields. Any source-text repair creates a new inactive mechanical revision and invalidates downstream draft decisions. Pack profile and catalog decisions must use the exact source receipts returned by `evidence`. Finalization requires an explicit Agent confirmation and writes an immutable `.sagasmith-pack` archive. Only a module re-imported from that finalized archive may be activated.
 
 Commercial rulebooks and scenarios remain local. Configure allowed source roots with `SAGASMITH_COC_MCP_MODULE_IMPORT_ROOTS`, separated by the platform path separator. Source books and extracted assets are never bundled in this repository.
+
+Pack import uses a deterministic recovery protocol. The Pack checksum belongs to candidate
+version identity, while module, asset, content-review, actor, and binding steps converge by
+content identity or child idempotency keys. If the process stops before the final receipt,
+retry the original request and `idempotency_key`; no duplicate runtime objects are created.
+Activation, deactivation, and removal each commit an exact receipt, including replay after
+the target was removed.
 
 ## Run
 

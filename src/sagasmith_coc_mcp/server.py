@@ -1947,7 +1947,7 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
 
     @mcp.tool()
     def content_pack(
-        action: Literal["list", "get", "import", "export", "activate", "remove"],
+        action: Literal["list", "get", "import", "export", "activate", "deactivate", "remove"],
         campaign_id: str,
         data: dict[str, Any] | None = None,
         expected_revision: int | None = None,
@@ -2014,11 +2014,6 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
             }
 
         revision, key = require_write_contract(expected_revision, idempotency_key)
-        campaign = campaigns.get(campaign_id)
-        if campaign.revision != revision:
-            raise ValueError(
-                f"campaign revision conflict: expected {revision}, found {campaign.revision}"
-            )
         if action == "import":
             choices = [name for name in ("artifact", "source_path") if data.get(name)]
             if len(choices) != 1:
@@ -2033,6 +2028,7 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
             replay = replay_response(scope, key, request)
             if replay is not None:
                 return replay
+            require_campaign_revision(campaign_id, revision)
             package, blobs = storage.read_content_archive(
                 artifact=(str(data["artifact"]) if choices[0] == "artifact" else None),
                 source_path=(data["source_path"] if choices[0] == "source_path" else None),
@@ -2115,6 +2111,16 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
         module_id = str(data.get("module_id") or "").strip()
         if not module_id:
             raise ValueError("data.module_id is required")
+        if action == "remove":
+            remove_request = {
+                "operation": "remove_content_module",
+                "module_id": module_id,
+                "expected_revision": revision,
+            }
+            remove_scope = f"content-pack-remove:{campaign_id}:{principal_id}"
+            replay = replay_response(remove_scope, key, remove_request)
+            if replay is not None:
+                return replay
         module = next(
             (
                 item
@@ -2174,6 +2180,7 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
             replay = replay_response(scope, key, request)
             if replay is not None:
                 return replay
+            require_campaign_revision(campaign_id, revision)
             activation = modules.activate_candidate(
                 campaign_id,
                 module_id,
@@ -2196,25 +2203,41 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
                     "progress_remap_rulings": rulings,
                 }
             }
-        if action == "remove":
-            if bool(module.get("active")):
-                raise ValueError("deactivate or replace the active module before removal")
+        if action == "deactivate":
             request = {
-                "operation": "remove_content_module",
+                "operation": "deactivate_content_module",
                 "module_id": module_id,
                 "expected_revision": revision,
             }
-            scope = f"content-pack-remove:{campaign_id}:{principal_id}"
+            scope = f"content-pack-deactivate:{campaign_id}:{principal_id}"
             replay = replay_response(scope, key, request)
             if replay is not None:
                 return replay
-            modules.delete(campaign_id, module_id)
-            return remember_response(
-                scope,
-                key,
-                request,
-                {"module_id": module_id, "removed": True},
-                campaign_id=campaign_id,
+            require_campaign_revision(campaign_id, revision)
+            deactivation = modules.deactivate_candidate(
+                campaign_id,
+                module_id,
+                idempotency_key=key,
+                idempotency_write=IdempotencyWrite(
+                    scope=scope,
+                    payload=request,
+                    response=lambda value: {"deactivation": dict(value)},
+                ),
+            )
+            return {"deactivation": deactivation}
+        if action == "remove":
+            if bool(module.get("active")):
+                raise ValueError("deactivate or replace the active module before removal")
+            require_campaign_revision(campaign_id, revision)
+            return modules.delete_candidate(
+                campaign_id,
+                module_id,
+                idempotency_key=key,
+                idempotency_write=IdempotencyWrite(
+                    scope=remove_scope,
+                    payload=remove_request,
+                    response=lambda value: dict(value),
+                ),
             )
         raise ValueError(f"unsupported content_pack action: {action}")
 

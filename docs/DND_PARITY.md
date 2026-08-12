@@ -46,8 +46,8 @@
 | 当前 Pack schema | unified `sagasmith.content-package` v2 | 完成模块层 | CoC 模块 validator、archive round trip、跨战役导入 |
 | Module Draft | `start/get/evidence/edit/finalize`；source/content/statblock/asset/actor/package/advance | 部分：功能面已具备 PDF 页证据、source/content/statblock/asset/actor/package/advance；尚缺真实私有 PDF 全流程证据 | CoC statblock 校验和中断后 advance 已通过当前 facade；真实用户 PDF 完成一次全流程 |
 | 终结信任边界 | Agent 明确确认；最终档不可变 | 完成基础层 | 精确幂等重放、重启后不可变、新修改只能创建新版本 |
-| Pack 管理 | list/get/import/export/activate/deactivate/remove | 部分：缺 deactivate；remove 仅非活动模块 | 导入、激活、停用、删除均有 revision、幂等、并发和进度重映射证据 |
-| Pack 导入原子性 | MCP 负责结果与幂等 | 部分：正常重放成立，崩溃窗口仍可能重复导入 | 整个模块、演员、资产、archive 注册与幂等响应同一可恢复事务或可证明的确定性恢复协议 |
+| Pack 管理 | list/get/import/export/activate/deactivate/remove | 完成 | 全部动作由当前 facade 提供；激活含 Agent 进度重映射，停用与删除具有原子精确回执，删除后仍可重放 |
+| Pack 导入可恢复性 | MCP 负责结果与幂等 | 完成 | Pack checksum 区分候选版本；module/actor/asset/review/binding 逐步确定性收敛；演员绑定后故障注入证明重试不重复并产生精确最终响应 |
 | Rulebook Draft | `rulebook_draft` | 缺失 | CoC 7e 规则书机械首遍、Agent 修订、规则 Pack 终结和私有源边界 |
 | Content Solution | `content_solution` | 缺失 | 缺失/冲突内容通过来源、Pack 或 Agent 裁定解决，不能由 MCP 猜测 |
 | ModuleGen | 当前 schema Pack 创作 Skill | 部分：通用 Skill 已升级，CoC 专用流程未接入 | Skill 通过真实 `module_draft` facade 构建一个用户 PDF 私有 Pack |
@@ -81,7 +81,7 @@
 
 ## 当前最短关键路径
 
-1. 关闭 Pack 导入崩溃重复窗口，并以真实私有 PDF 证明 Module Draft 全流程。
+1. 以真实私有 PDF 证明 Module Draft 与 Pack 导入全流程。
 2. 实现规则书 Draft/Pack 与 CoC 规则检索，使 Quick-Start 能成为本地规则依据。
 3. 实现 event、continuity 与面向玩家/私有 NPC 的受众结算。
 4. 实现 SAN、调查、战斗、追逐和 NPC 对话的权威结算。
