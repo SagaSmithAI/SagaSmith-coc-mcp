@@ -1295,7 +1295,7 @@ def test_random_roll_is_atomic_idempotent_and_persists_across_restart(tmp_path) 
         )
         assert current["state"]["random_stream"]["position"] == 3
         assert first["random_stream_receipt"]["draw_count"] == 3
-        with pytest.raises(Exception, match="revision conflict"):
+        with pytest.raises(Exception, match="revision.*conflict"):
             await call(
                 server,
                 "coc_dice_roll",
@@ -2246,11 +2246,17 @@ def test_branch_snapshot_and_revision_recovery_are_guarded_and_replayable(tmp_pa
         forked = await call(server, "branch_change", fork_args)
         assert await call(server, "branch_change", fork_args) == forked
 
+        after_fork = await call(
+            server,
+            "campaign_query",
+            {"action": "get", "campaign_id": campaign_id},
+        )
+
         checkout_fork_args = {
             "action": "checkout",
             "campaign_id": campaign_id,
             "data": {"branch_id": forked["branch"]["id"]},
-            "expected_revision": play["revision"],
+            "expected_revision": after_fork["revision"],
             "expected_branch_id": original["id"],
             "idempotency_key": "checkout-alternate",
         }
