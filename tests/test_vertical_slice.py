@@ -2245,12 +2245,14 @@ def test_branch_snapshot_and_revision_recovery_are_guarded_and_replayable(tmp_pa
         }
         forked = await call(server, "branch_change", fork_args)
         assert await call(server, "branch_change", fork_args) == forked
+        assert forked["campaign_revision"] == play["revision"] + 1
 
         after_fork = await call(
             server,
             "campaign_query",
             {"action": "get", "campaign_id": campaign_id},
         )
+        assert after_fork["revision"] == forked["campaign_revision"]
 
         checkout_fork_args = {
             "action": "checkout",
@@ -2262,6 +2264,7 @@ def test_branch_snapshot_and_revision_recovery_are_guarded_and_replayable(tmp_pa
         }
         checked_out = await call(server, "branch_change", checkout_fork_args)
         assert await call(server, "branch_change", checkout_fork_args) == checked_out
+        assert checked_out["campaign_revision"] == after_fork["revision"] + 1
         assert (await call(server, "game_phase", {"campaign_id": campaign_id}))["phase"] == "lobby"
 
         current = await call(
@@ -2281,6 +2284,7 @@ def test_branch_snapshot_and_revision_recovery_are_guarded_and_replayable(tmp_pa
                 "idempotency_key": "checkout-original",
             },
         )
+        assert checkout_original["campaign_revision"] == current["revision"] + 1
         assert checkout_original["snapshot"]["id"] == play_save["id"]
         assert (await call(server, "game_phase", {"campaign_id": campaign_id}))["phase"] == "play"
 

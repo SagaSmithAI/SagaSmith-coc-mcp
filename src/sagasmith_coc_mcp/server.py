@@ -75,6 +75,7 @@ from sagasmith_coc.random_stream import (
     initial_random_stream,
     use_random_stream,
 )
+from sagasmith_coc.retrieval import COC7E_QUERY_HINTS
 from sagasmith_coc.statblocks import coc7e_statblock_readiness, validate_coc7e_statblock
 from sagasmith_coc.system import validate_investigator_sheet
 from sagasmith_core import (
@@ -1698,6 +1699,7 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
                         for hit in rules.search(
                             system_id="coc7e",
                             query=query,
+                            query_hints=COC7E_QUERY_HINTS,
                             source_ids=[source_id],
                             top_k=max(1, min(20, int(data.get("top_k", 8)))),
                         )
@@ -1798,6 +1800,7 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
                     for hit in rules.search(
                         system_id="coc7e",
                         query=query,
+                        query_hints=COC7E_QUERY_HINTS,
                         edition="7e",
                         top_k=max(1, min(20, int(data.get("top_k", 8)))),
                     )
@@ -3348,7 +3351,11 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
             }
         if not data.get("query"):
             raise ValueError("data.query is required")
-        hits = modules.search(campaign_id=campaign_id, query=str(data["query"]))
+        hits = modules.search(
+            campaign_id=campaign_id,
+            query=str(data["query"]),
+            query_hints=COC7E_QUERY_HINTS,
+        )
         values = [asdict(item) for item in hits]
         return {
             "hits": values
@@ -4739,12 +4746,15 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
                     str(data["from_snapshot_id"]) if data.get("from_snapshot_id") else None
                 ),
                 checkout=bool(data.get("checkout", False)),
+                expected_revision=int(expected_revision),
+                expected_branch_id=branch_guard,
                 idempotency_key=key,
                 idempotency_write=IdempotencyWrite(
                     scope=scope,
                     payload=payload,
                     response=lambda value: {
                         "branch": asdict(value["branch"]),
+                        "campaign_revision": int(expected_revision) + 1,
                         "snapshot": (
                             asdict(value["snapshot"]) if value["snapshot"] is not None else None
                         ),
@@ -4753,6 +4763,7 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
             )
             return {
                 "branch": asdict(created),
+                "campaign_revision": campaigns.get(campaign_id).revision,
                 "snapshot": (
                     asdict(
                         next(
@@ -4771,12 +4782,16 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
         checked_out = branches.checkout(
             campaign_id,
             branch_id,
+            expected_revision=int(expected_revision),
+            expected_branch_id=branch_guard,
             idempotency_key=key,
             idempotency_write=IdempotencyWrite(
                 scope=scope,
                 payload=payload,
                 response=lambda value: {
                     "branch": asdict(value["branch"]),
+                    "campaign_revision": int(expected_revision)
+                    + int(branch_id != branch_guard),
                     "snapshot": (
                         asdict(value["snapshot"]) if value["snapshot"] is not None else None
                     ),
@@ -4794,6 +4809,7 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
         )
         return {
             "branch": asdict(checked_out),
+            "campaign_revision": campaigns.get(campaign_id).revision,
             "snapshot": asdict(snapshot) if snapshot is not None else None,
         }
 
