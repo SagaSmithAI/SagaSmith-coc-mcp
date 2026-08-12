@@ -7,7 +7,7 @@
 ## 为什么是独立 MCP
 
 - **状态归 MCP 所有**：SQLite 与导入产物都位于 `.sagasmith-coc-mcp/`，不依赖某个 Agent 的工作目录。
-- **Exposure 在服务端**：每个原生 MCP session 独立维护已加载工具组、TTL 与 Lobby/Play/Combat 阶段，不要求 Agent 复制工具分类。
+- **Exposure 在服务端**：每个原生 MCP session 独立维护已加载原生工具、TTL 与 Lobby/Play/Combat 阶段，不要求 Agent 复制工具分类。
 - **角色知识真正隔离**：PC、NPC、怪物的 belief/rumor/false belief 分别按 actor 与 branch 保存；玩家只能读取或修改被授权角色。
 - **判定与写状态分离**：`coc_resolve` 返回规则结算；角色卡、SAN、HP 或战役状态必须通过显式写工具提交，避免“调用检查就偷偷改卡”。
 - **Keeper 信息不外泄**：玩家的模组索引与搜索只返回 `visibility=player` 的 handout 场景。
@@ -23,22 +23,15 @@ flowchart LR
 
 ## 工具阶段
 
-| 阶段 | 能力组 | 用途 |
-|---|---|---|
-| Lobby | `lobby.bootstrap` | 建战役、成员与角色授权 |
-| Lobby | `lobby.characters` | 车卡、NPC/怪物、角色卡维护 |
-| Lobby | `lobby.modules` | 导入模组、检查 scene index |
-| Lobby | `lobby.continuity` | 记忆、角色知识、Snapshot、Skills |
-| Play | `play.investigation` | 场景推进、调查判定、SAN、追逐与连续性 |
-| Combat | `combat.resolve` | 近战/远程判定与 Keeper 显式状态写入 |
+服务端为每个工具保存唯一的阶段、角色、是否需要战役和是否仅限本机策略。Agent 通过一个 `exposure` facade 搜索并增删需要的原生工具；阶段或恢复操作变化时，服务端裁剪非法工具并发送 `tools/list_changed`。
 
 Agent 首次只会看到目录级核心工具。标准流程是：
 
 ```text
-exposure_open → exposure_search → exposure_inspect → exposure_load → domain tool
+exposure(open) → exposure(search) → exposure(set) → native domain tool
 ```
 
-不支持动态刷新工具列表的 Host 可以使用 `exposure_call`，权限与 TTL 仍由 MCP 服务端校验。
+Host 必须支持原生动态工具列表刷新；不再提供固定全集、文本模拟或 `exposure_call` fallback。
 
 ## 快速开始
 

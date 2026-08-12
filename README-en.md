@@ -19,7 +19,7 @@ sagasmith-coc-mcp
 
 State defaults to `.sagasmith-coc-mcp/`. Configure `SAGASMITH_COC_MCP_HOME`, `SAGASMITH_COC_SKILLS_DIR`, and `SAGASMITH_MODULEGEN_SKILLS_DIR` when embedding the server in another Agent runtime.
 
-The capability flow is `exposure_open → exposure_search → exposure_inspect → exposure_load`. Hosts that cannot refresh native tool schemas may use `exposure_call` without bypassing server-side scope and TTL checks.
+The capability flow is `exposure(open) → exposure(search) → exposure(set) → native domain tool`. Hosts must refresh native tool schemas; there is no fixed-superset, text imitation, or `exposure_call` fallback.
 
 ## Development
 

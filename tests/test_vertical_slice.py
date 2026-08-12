@@ -187,13 +187,14 @@ def test_exposure_registry_is_session_and_phase_scoped() -> None:
         campaign_id="campaign:one",
         phase="play",
     )
-    registry.load(alice, "play.investigation")
+    registry.set_tools(alice, add=["coc_resolve"])
     assert "coc_resolve" in registry.visible_tools(alice)
     assert "coc_resolve" not in registry.visible_tools(bob)
     registry.require_tool(alice, "coc_resolve")
     assert "coc_resolve" in registry.visible_tools(alice)
+    registry.refresh_phase(bob, "combat")
     with pytest.raises(ExposureError):
-        registry.load(bob, "lobby.characters")
+        registry.set_tools(bob, add=["module_change"])
 
 
 def test_native_tool_list_is_independent_per_session(tmp_path) -> None:
@@ -209,7 +210,7 @@ def test_native_tool_list_is_independent_per_session(tmp_path) -> None:
             campaign_id=None,
             phase="lobby",
         )
-        server.exposure_registry.load(exposure, "lobby.bootstrap")
+        server.exposure_registry.set_tools(exposure, add=["campaign_change"])
         assert "campaign_change" in {tool.name for tool in await server.list_tools()}
         server._request_session = lambda: ("mcp:bob", object())  # type: ignore[method-assign]
         assert {tool.name for tool in await server.list_tools()} == set(CORE_TOOLS)
@@ -230,30 +231,32 @@ def test_stdio_client_can_discover_load_and_call(tmp_path) -> None:
         async with stdio_client(params) as (read, write):
             async with ClientSession(read, write) as session:
                 await session.initialize()
-                assert {item.name for item in (await session.list_tools()).tools} == set(
-                    CORE_TOOLS
-                )
-                opened = await session.call_tool("exposure_open", {})
-                exposure_id = json.loads(opened.content[0].text)["exposure_id"]
+                assert {item.name for item in (await session.list_tools()).tools} == set(CORE_TOOLS)
+                opened = await session.call_tool("exposure", {"action": "open"})
+                assert json.loads(opened.content[0].text)["native_dynamic_tools"] is True
                 loaded = await session.call_tool(
-                    "exposure_load",
-                    {"exposure_id": exposure_id, "group_id": "lobby.bootstrap"},
+                    "exposure",
+                    {"action": "set", "add_tool_ids": ["campaign_change"]},
                 )
                 assert not loaded.isError
                 assert "campaign_change" in {
                     item.name for item in (await session.list_tools()).tools
                 }
                 created = await session.call_tool(
-                    "exposure_call",
+                    "campaign_change",
                     {
-                        "exposure_id": exposure_id,
-                        "tool_id": "campaign_change",
-                        "arguments": {
-                            "action": "create",
-                            "data": {"name": "Stdio", "idempotency_key": "stdio-create"},
-                        },
+                        "action": "create",
+                        "data": {"name": "Stdio", "idempotency_key": "stdio-create"},
                     },
                 )
                 assert not created.isError
 
     asyncio.run(exercise())
+
+
+def test_only_one_exposure_facade_is_registered(tmp_path) -> None:
+    config = McpConfig(tmp_path / "home", None, tmp_path / "coc", tmp_path / "modulegen")
+    names = {tool.name for tool in create_server(config)._tool_manager.list_tools()}
+
+    assert "exposure" in names
+    assert not any(name.startswith("exposure_") for name in names)

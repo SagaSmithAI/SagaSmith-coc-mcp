@@ -1,8 +1,12 @@
-"""Server-owned Lobby/Play/Combat capability catalogue."""
+"""One authoritative phase and role policy per public CoC MCP tool."""
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from typing import Any
+
+from sagasmith_core.access import CAMPAIGN_DM_ROLES
 
 PROFILE_LOBBY = "lobby"
 PROFILE_PLAY = "play"
@@ -10,123 +14,142 @@ PROFILE_COMBAT = "combat"
 PROFILES = (PROFILE_LOBBY, PROFILE_PLAY, PROFILE_COMBAT)
 
 
-@dataclass(frozen=True)
-class ToolGroup:
-    id: str
-    phase: str
-    title: str
-    description: str
-    risk: str
-    tools: frozenset[str]
-    requires_campaign: bool = True
-    local_only: bool = False
+def campaign_phase(state: Mapping[str, Any] | None) -> str:
+    """Resolve the authoritative phase from persisted campaign state."""
+
+    value = dict(state or {})
+    combat = value.get("combat")
+    if isinstance(combat, Mapping) and bool(combat.get("active", False)):
+        return PROFILE_COMBAT
+    phase = str(value.get("game_phase") or PROFILE_LOBBY)
+    if phase not in {PROFILE_LOBBY, PROFILE_PLAY}:
+        raise ValueError(f"unsupported persisted campaign phase: {phase}")
+    return phase
 
 
 CORE_TOOLS = frozenset(
     {
-        "exposure_open",
-        "exposure_status",
-        "exposure_search",
-        "exposure_inspect",
-        "exposure_load",
-        "exposure_unload",
-        "exposure_call",
+        "exposure",
         "server_capabilities",
         "storage_status",
         "campaign_query",
         "game_phase",
+        "skill_query",
     }
 )
 
 
-def _group(
-    id: str,
-    phase: str,
-    title: str,
-    description: str,
-    risk: str,
-    *tools: str,
-    requires_campaign: bool = True,
-    local_only: bool = False,
-) -> ToolGroup:
-    return ToolGroup(
-        id, phase, title, description, risk, frozenset(tools), requires_campaign, local_only
+def _names(value: str) -> frozenset[str]:
+    return frozenset(value.split())
+
+
+PHASE_TOOLS = {
+    PROFILE_LOBBY: _names(
+        """
+        actor_knowledge_change actor_knowledge_query campaign_change character_change
+        character_query coc_resolve memory_change memory_query module_change module_query
+        snapshot_change snapshot_query
+        """
+    ),
+    PROFILE_PLAY: _names(
+        """
+        actor_knowledge_change actor_knowledge_query campaign_change character_change
+        character_query coc_resolve memory_change memory_query module_change module_query
+        snapshot_change snapshot_query
+        """
+    ),
+    PROFILE_COMBAT: _names(
+        """
+        actor_knowledge_query character_change character_query coc_resolve memory_query
+        module_query snapshot_change snapshot_query
+        """
+    ),
+}
+
+PHASE_DM_TOOLS = {
+    PROFILE_LOBBY: _names(
+        """
+        actor_knowledge_change character_change memory_change module_change
+        snapshot_change
+        """
+    ),
+    PROFILE_PLAY: _names(
+        """
+        actor_knowledge_change campaign_change memory_change module_change snapshot_change
+        """
+    ),
+    PROFILE_COMBAT: _names("snapshot_change"),
+}
+
+NO_CAMPAIGN_TOOLS = frozenset({"campaign_change"})
+LOCAL_ONLY_TOOLS = frozenset()
+
+
+@dataclass(frozen=True)
+class ToolPolicy:
+    id: str
+    phases: frozenset[str]
+    roles_by_phase: Mapping[str, frozenset[str]]
+    requires_campaign: bool
+    local_only: bool
+
+    def roles(self, phase: str) -> frozenset[str]:
+        return self.roles_by_phase.get(phase, frozenset())
+
+
+def _build_policies() -> dict[str, ToolPolicy]:
+    tool_ids = frozenset().union(*PHASE_TOOLS.values())
+    return {
+        tool_id: ToolPolicy(
+            id=tool_id,
+            phases=frozenset(phase for phase in PROFILES if tool_id in PHASE_TOOLS[phase]),
+            roles_by_phase={
+                phase: frozenset(CAMPAIGN_DM_ROLES)
+                for phase in PROFILES
+                if tool_id in PHASE_DM_TOOLS[phase]
+            },
+            requires_campaign=tool_id not in NO_CAMPAIGN_TOOLS,
+            local_only=tool_id in LOCAL_ONLY_TOOLS,
+        )
+        for tool_id in tool_ids
+    }
+
+
+TOOL_POLICIES = _build_policies()
+
+
+def policy_for_tool(name: str) -> ToolPolicy | None:
+    return TOOL_POLICIES.get(name)
+
+
+def tools_for_phase(phase: str) -> frozenset[str]:
+    if phase not in PHASE_TOOLS:
+        raise ValueError(f"unsupported tool phase: {phase}")
+    return PHASE_TOOLS[phase] | CORE_TOOLS
+
+
+def validate_profile_coverage(tool_names: Iterable[str]) -> None:
+    missing = sorted(
+        name for name in tool_names if name not in CORE_TOOLS and name not in TOOL_POLICIES
     )
+    if missing:
+        raise RuntimeError(f"MCP tools missing a tool policy: {', '.join(missing)}")
 
 
-TOOL_GROUPS = (
-    _group(
-        "lobby.bootstrap",
-        PROFILE_LOBBY,
-        "Campaign bootstrap",
-        "Create a CoC campaign and grant explicit campaign or actor access.",
-        "write",
-        "campaign_change",
-        requires_campaign=False,
-    ),
-    _group(
-        "lobby.characters",
-        PROFILE_LOBBY,
-        "Investigator creation",
-        "Create and update validated investigator, NPC and creature sheets.",
-        "write",
-        "character_query",
-        "character_change",
-    ),
-    _group(
-        "lobby.modules",
-        PROFILE_LOBBY,
-        "Scenario import",
-        "Import structured scenario Markdown and inspect the scene index.",
-        "write",
-        "module_change",
-        "module_query",
-    ),
-    _group(
-        "lobby.continuity",
-        PROFILE_LOBBY,
-        "Continuity and actor knowledge",
-        "Maintain branch-scoped campaign facts and separate actor beliefs.",
-        "write",
-        "memory_query",
-        "memory_change",
-        "actor_knowledge_query",
-        "actor_knowledge_change",
-        "snapshot_query",
-        "snapshot_change",
-        "skill_query",
-    ),
-    _group(
-        "play.investigation",
-        PROFILE_PLAY,
-        "Investigation play",
-        "Read and advance scenes, resolve checks, and update continuity.",
-        "write",
-        "module_query",
-        "module_change",
-        "character_query",
-        "character_change",
-        "memory_query",
-        "memory_change",
-        "actor_knowledge_query",
-        "actor_knowledge_change",
-        "coc_resolve",
-        "snapshot_query",
-        "snapshot_change",
-    ),
-    _group(
-        "combat.resolve",
-        PROFILE_COMBAT,
-        "Combat resolution",
-        "Resolve CoC attacks and checks while state writes remain explicit.",
-        "write",
-        "character_query",
-        "character_change",
-        "coc_resolve",
-        "memory_query",
-        "actor_knowledge_query",
-        "snapshot_change",
-    ),
-)
+def profile_catalog() -> dict[str, list[str]]:
+    return {profile: sorted(tools_for_phase(profile)) for profile in PROFILES}
 
-GROUP_BY_ID = {group.id: group for group in TOOL_GROUPS}
+
+def tool_catalog() -> list[dict[str, object]]:
+    return [
+        {
+            "id": policy.id,
+            "phases": sorted(policy.phases),
+            "roles_by_phase": {
+                phase: sorted(roles) for phase, roles in policy.roles_by_phase.items()
+            },
+            "requires_campaign": policy.requires_campaign,
+            "local_only": policy.local_only,
+        }
+        for policy in sorted(TOOL_POLICIES.values(), key=lambda item: item.id)
+    ]
