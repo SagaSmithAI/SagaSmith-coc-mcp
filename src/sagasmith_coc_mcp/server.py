@@ -7,6 +7,7 @@ import hashlib
 import importlib
 import json
 import re
+import time
 from copy import deepcopy
 from dataclasses import asdict
 from difflib import SequenceMatcher
@@ -18,7 +19,13 @@ from weakref import WeakValueDictionary
 from mcp.server.fastmcp import FastMCP
 from sagasmith_coc.content_packages import (
     build_module_content_package,
+    build_rule_content_package,
     validate_coc_content_package,
+)
+from sagasmith_coc.engine.character_state import (
+    change_inventory,
+    change_money,
+    settle_source_study,
 )
 from sagasmith_coc.engine.chase_state import (
     advance_chase_turn,
@@ -59,7 +66,7 @@ from sagasmith_coc.engine.combat_state import (
 from sagasmith_coc.engine.combat_state import (
     start_combat as build_combat_state,
 )
-from sagasmith_coc.engine.development import resolve_skill_development
+from sagasmith_coc.engine.development import resolve_luck_development, resolve_skill_development
 from sagasmith_coc.engine.dice.rolls import roll_d100, roll_dice_expression
 from sagasmith_coc.engine.health import apply_damage, apply_healing
 from sagasmith_coc.module_profile import CocModuleProfile
@@ -86,6 +93,8 @@ from sagasmith_core import (
     MemoryService,
     ModuleService,
     RevisionService,
+    RulePackService,
+    RuleService,
     SnapshotService,
     StateMutationService,
     apply_document_page_revisions,
@@ -97,11 +106,20 @@ from sagasmith_core import (
     validate_subject_context_fact,
 )
 from sagasmith_core.access import LOCAL_SYSTEM_PRINCIPAL_ID
+from sagasmith_core.integrity import canonical_json
 from sagasmith_core.modules import MarkdownModuleParser
 from sagasmith_core.visibility import PLAYER_MODULE_VISIBILITY_SCOPES
 
+from .bounded_evaluations import (
+    BOUNDED_EVALUATION_PURPOSES,
+    BOUNDED_OUTPUT_CONTRACTS,
+    normalize_bounded_proposal,
+    validate_bounded_proposal_refs,
+)
 from .config import McpConfig
 from .exposure import Exposure, ExposureError, ExposureRegistry
+from .npc_conversations import ConversationStore, normalize_audience_facts
+from .receipt_signing import sign_receipt, verify_receipt_signature
 from .skills import SkillCatalog
 from .storage import SagaSmithStorage
 from .tool_profiles import (
@@ -248,10 +266,13 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
     continuity = ContinuityService(storage.database)
     continuity_commits = ContinuityCommitService(storage.database)
     modules = ModuleService(storage.database)
+    rules = RuleService(storage.database)
+    rule_packs = RulePackService(storage.database)
     import_jobs = ImportJobService(storage.database)
     snapshots = SnapshotService(storage.database)
     revisions = RevisionService(storage.database)
     idempotency = IdempotencyService(storage.database)
+    npc_conversations = ConversationStore(config.npc_conversations_dir)
     default_local_principal(storage.database)
     parser = MarkdownModuleParser(profile=CocModuleProfile())
     skills = SkillCatalog(
@@ -259,6 +280,14 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
         modulegen_root=config.modulegen_skills_dir,
     )
     exposures = ExposureRegistry()
+    bounded_receipt_secret = uuid4().bytes + uuid4().bytes
+    bounded_receipt_ttl_ns = 10 * 60 * 1_000_000_000
+
+    def principal_fingerprint(principal_id: str) -> str:
+        return hashlib.sha256(principal_id.encode("utf-8")).hexdigest()
+
+    def bounded_context_digest(value: dict[str, Any]) -> str:
+        return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
 
     def authoritative_phase(campaign_id: str) -> str:
         from .tool_profiles import campaign_phase
@@ -515,6 +544,12 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
             raise LookupError(job_id)
         return job
 
+    def require_rule_job(campaign_id: str, job_id: str) -> Any:
+        job = import_jobs.get(job_id)
+        if job.campaign_id != campaign_id or job.kind != "rulebook":
+            raise LookupError(job_id)
+        return job
+
     def import_page_revisions(job: Any) -> list[dict[str, Any]]:
         revisions = dict(job.inspection or {}).get("page_revisions", [])
         if not isinstance(revisions, list):
@@ -727,6 +762,17 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
 
     def current_branch_id(campaign_id: str) -> str:
         return branches.current(campaign_id).id
+
+    def require_no_active_npc_conversation(campaign_id: str, operation: str) -> None:
+        active = npc_conversations.active_ids(
+            campaign_id=campaign_id,
+            branch_id=current_branch_id(campaign_id),
+        )
+        if active:
+            raise ValueError(
+                f"close or abort active NPC conversation(s) before {operation}: "
+                + ", ".join(active)
+            )
 
     def readable_branch_id(
         campaign_id: str, branch_id: str | None, principal_id: str
@@ -967,7 +1013,7 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
             "content_pack": {
                 "format": "sagasmith.content-package",
                 "schema_version": 2,
-                "kinds": ["module"],
+                "kinds": ["module", "core_rules"],
                 "draft_stages": [
                     "module_draft(start)",
                     "module_draft(edit:advance)",
@@ -975,6 +1021,7 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
                     "module_draft(edit:source_text|content|statblock|asset|actor)",
                     "module_draft(edit:package)",
                     "module_draft(finalize)",
+                    "rulebook_draft(start|evidence|finalize)",
                     "content_pack(import)",
                     "content_pack(activate)",
                 ],
@@ -1045,6 +1092,8 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
                     "phase must be lobby or play; combat is derived from combat.active"
                 )
             current = campaigns.get(campaign_id)
+            if phase != authoritative_phase(campaign_id):
+                require_no_active_npc_conversation(campaign_id, "changing phase")
             if phase == PROFILE_LOBBY and investigation_ledger(dict(current.state))["pending"]:
                 raise ValueError(
                     "settle or abort pending investigation checks before returning to lobby"
@@ -1184,6 +1233,581 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
                 expected_revision=int(data.get("expected_revision", current.revision)),
             )
         )
+
+    @mcp.tool()
+    def inventory_change(
+        action: Literal["add", "update", "remove", "consume"],
+        campaign_id: str,
+        actor_id: str,
+        data: dict[str, Any],
+        expected_revision: int,
+        expected_character_revision: int,
+        idempotency_key: str,
+        principal_id: str = LOCAL_SYSTEM_PRINCIPAL_ID,
+    ) -> dict[str, Any]:
+        """Atomically mutate one stable CoC inventory item."""
+
+        actor_access(campaign_id, actor_id, principal_id, control=True)
+        key = str(idempotency_key or "").strip()
+        if not key:
+            raise ValueError("idempotency_key is required")
+        branch_id = current_branch_id(campaign_id)
+        request = {
+            "operation": f"inventory_change.{action}",
+            "campaign_id": campaign_id,
+            "actor_id": actor_id,
+            "data": deepcopy(data),
+            "expected_revision": int(expected_revision),
+            "expected_character_revision": int(expected_character_revision),
+            "branch_id": branch_id,
+        }
+        scope = f"coc-inventory:{campaign_id}:{branch_id}:{actor_id}:{principal_id}:{action}"
+        replay = replay_response(scope, key, request)
+        if replay is not None:
+            return replay
+        campaign = require_campaign_revision(campaign_id, int(expected_revision))
+        actor = characters.get(actor_id)
+        if actor.campaign_id != campaign_id:
+            raise ValueError("actor must belong to the target campaign")
+        if actor.revision != int(expected_character_revision):
+            raise ValueError(
+                "character revision conflict: "
+                f"expected {expected_character_revision}, found {actor.revision}"
+            )
+        next_sheet, receipt = change_inventory(
+            dict(actor.sheet),
+            action=action,
+            item=(dict(data["item"]) if isinstance(data.get("item"), dict) else None),
+            item_id=(str(data["item_id"]) if data.get("item_id") is not None else None),
+            quantity=(int(data["quantity"]) if data.get("quantity") is not None else None),
+        )
+        response = {
+            "campaign_revision": campaign.revision + 1,
+            "character_revision": actor.revision + 1,
+            "actor_id": actor_id,
+            "receipt": receipt,
+            "inventory": deepcopy(next_sheet["inventory"]),
+        }
+        StateMutationService(storage.database).replace(
+            campaign_id,
+            campaign_state=dict(campaign.state),
+            character_updates=[
+                CharacterStateUpdate(
+                    character_id=actor_id,
+                    sheet=next_sheet,
+                    notes=dict(actor.notes),
+                    expected_revision=actor.revision,
+                )
+            ],
+            expected_campaign_revision=campaign.revision,
+            operation=f"coc.inventory.{action}",
+            actor=principal_id,
+            branch_id=branch_id,
+            idempotency_key=key,
+            idempotency_write=IdempotencyWrite(scope=scope, payload=request, response=response),
+        )
+        return response
+
+    @mcp.tool()
+    def wallet_change(
+        action: Literal["set", "adjust"],
+        campaign_id: str,
+        actor_id: str,
+        data: dict[str, Any],
+        expected_revision: int,
+        expected_character_revision: int,
+        idempotency_key: str,
+        principal_id: str = LOCAL_SYSTEM_PRINCIPAL_ID,
+    ) -> dict[str, Any]:
+        """Atomically set or adjust a campaign-defined monetary field."""
+
+        actor_access(campaign_id, actor_id, principal_id, control=True)
+        key = str(idempotency_key or "").strip()
+        if not key:
+            raise ValueError("idempotency_key is required")
+        branch_id = current_branch_id(campaign_id)
+        request = {
+            "operation": f"wallet_change.{action}",
+            "campaign_id": campaign_id,
+            "actor_id": actor_id,
+            "data": deepcopy(data),
+            "expected_revision": int(expected_revision),
+            "expected_character_revision": int(expected_character_revision),
+            "branch_id": branch_id,
+        }
+        scope = f"coc-wallet:{campaign_id}:{branch_id}:{actor_id}:{principal_id}:{action}"
+        replay = replay_response(scope, key, request)
+        if replay is not None:
+            return replay
+        campaign = require_campaign_revision(campaign_id, int(expected_revision))
+        actor = characters.get(actor_id)
+        if actor.campaign_id != campaign_id:
+            raise ValueError("actor must belong to the target campaign")
+        if actor.revision != int(expected_character_revision):
+            raise ValueError(
+                "character revision conflict: "
+                f"expected {expected_character_revision}, found {actor.revision}"
+            )
+        next_sheet, receipt = change_money(
+            dict(actor.sheet),
+            action=action,
+            field=str(data.get("field") or ""),
+            amount=data.get("amount"),
+            value=data.get("value"),
+        )
+        response = {
+            "campaign_revision": campaign.revision + 1,
+            "character_revision": actor.revision + 1,
+            "actor_id": actor_id,
+            "receipt": receipt,
+            "monetary": deepcopy(next_sheet["monetary"]),
+        }
+        StateMutationService(storage.database).replace(
+            campaign_id,
+            campaign_state=dict(campaign.state),
+            character_updates=[
+                CharacterStateUpdate(
+                    character_id=actor_id,
+                    sheet=next_sheet,
+                    notes=dict(actor.notes),
+                    expected_revision=actor.revision,
+                )
+            ],
+            expected_campaign_revision=campaign.revision,
+            operation=f"coc.wallet.{action}",
+            actor=principal_id,
+            branch_id=branch_id,
+            idempotency_key=key,
+            idempotency_write=IdempotencyWrite(scope=scope, payload=request, response=response),
+        )
+        return response
+
+    @mcp.tool()
+    def long_term_change(
+        action: Literal["luck_recovery", "therapy", "aging", "source_study"],
+        campaign_id: str,
+        actor_id: str,
+        data: dict[str, Any],
+        expected_revision: int,
+        expected_character_revision: int,
+        idempotency_key: str,
+        principal_id: str = LOCAL_SYSTEM_PRINCIPAL_ID,
+    ) -> dict[str, Any]:
+        """Settle source-bound downtime, aging, Luck, tome, and spell changes."""
+
+        require_dm(campaign_id, principal_id)
+        require_lobby(campaign_id, f"long_term_change({action})")
+        key = str(idempotency_key or "").strip()
+        if not key:
+            raise ValueError("idempotency_key is required")
+        source = " ".join(str(data.get("source") or "").split()).strip()
+        if not source or len(source) > 1000:
+            raise ValueError("data.source must contain 1 to 1000 characters")
+        branch_id = current_branch_id(campaign_id)
+        request = {
+            "operation": f"long_term_change.{action}",
+            "campaign_id": campaign_id,
+            "actor_id": actor_id,
+            "data": deepcopy(data),
+            "expected_revision": int(expected_revision),
+            "expected_character_revision": int(expected_character_revision),
+            "branch_id": branch_id,
+        }
+        scope = f"coc-long-term:{campaign_id}:{branch_id}:{actor_id}:{action}"
+        replay = replay_response(scope, key, request)
+        if replay is not None:
+            return replay
+        campaign = require_campaign_revision(campaign_id, int(expected_revision))
+        actor = characters.get(actor_id)
+        if actor.campaign_id != campaign_id or actor.revision != int(expected_character_revision):
+            raise ValueError("actor campaign or character revision conflict")
+        sheet = validate_investigator_sheet(dict(actor.sheet))
+        stream = CampaignRandomStream.from_campaign_state(
+            campaign_id,
+            campaign.state,
+            operation=f"long_term_change.{action}",
+            idempotency_key=key,
+        )
+        with use_random_stream(stream):
+            if action == "luck_recovery":
+                if not bool(campaign.settings.get("luck_recovery", False)):
+                    raise ValueError("campaign settings do not enable optional Luck recovery")
+                receipt = resolve_luck_development(int(sheet["luck"]))
+                sheet["luck"] = int(receipt["new_value"])
+            elif action == "therapy":
+                amount_fields = [field for field in ("amount", "expression") if field in data]
+                if len(amount_fields) != 1:
+                    raise ValueError("therapy requires exactly one of amount or expression")
+                rolled = None
+                if amount_fields[0] == "expression":
+                    rolled = roll_dice_expression(str(data["expression"]))
+                    amount = int(rolled["total"])
+                else:
+                    amount = int(data["amount"])
+                if amount < 0:
+                    raise ValueError("therapy SAN recovery must be non-negative")
+                before = int(sheet["san"])
+                sheet["san"] = min(int(sheet["san_max"]), before + amount)
+                receipt = {
+                    "source": source,
+                    "roll": rolled,
+                    "san": {"before": before, "gain": amount, "after": sheet["san"]},
+                }
+            elif action == "aging":
+                changes = data.get("characteristic_changes")
+                if not isinstance(changes, dict) or not changes:
+                    raise ValueError("aging requires source-reviewed characteristic_changes")
+                before = deepcopy(sheet["characteristics"])
+                for name, delta in changes.items():
+                    key_name = str(name).casefold()
+                    if (
+                        key_name not in before
+                        or isinstance(delta, bool)
+                        or not isinstance(delta, int)
+                    ):
+                        raise ValueError("aging characteristic changes must be integer core deltas")
+                    sheet["characteristics"][key_name] = before[key_name] + delta
+                sheet = validate_investigator_sheet(sheet)
+                receipt = {
+                    "source": source,
+                    "before": before,
+                    "after": deepcopy(sheet["characteristics"]),
+                }
+            else:
+                sheet, receipt = settle_source_study(
+                    sheet,
+                    kind=str(data.get("kind") or ""),
+                    source_id=str(data.get("source_id") or ""),
+                    title=str(data.get("title") or ""),
+                    sanity_loss=int(data.get("sanity_loss", 0)),
+                    mythos_gain=int(data.get("mythos_gain", 0)),
+                    spell=(dict(data["spell"]) if isinstance(data.get("spell"), dict) else None),
+                )
+                receipt["source"] = source
+        next_state = {**dict(campaign.state), "random_stream": stream.persisted_state()}
+        response = {
+            "campaign_revision": campaign.revision + 1,
+            "character_revision": actor.revision + 1,
+            "actor_id": actor_id,
+            "action": action,
+            "receipt": receipt,
+            "random_stream_receipt": stream.receipt(),
+        }
+        StateMutationService(storage.database).replace(
+            campaign_id,
+            campaign_state=next_state,
+            character_updates=[
+                CharacterStateUpdate(
+                    character_id=actor_id,
+                    sheet=validate_investigator_sheet(sheet),
+                    notes=dict(actor.notes),
+                    expected_revision=actor.revision,
+                )
+            ],
+            expected_campaign_revision=campaign.revision,
+            operation=f"coc.long_term.{action}",
+            actor=principal_id,
+            branch_id=branch_id,
+            idempotency_key=key,
+            idempotency_write=IdempotencyWrite(scope=scope, payload=request, response=response),
+        )
+        stream.mark_persisted()
+        return response
+
+    @mcp.tool()
+    def rulebook_draft(
+        action: Literal["start", "get", "evidence", "finalize"],
+        campaign_id: str,
+        data: dict[str, Any] | None = None,
+        expected_revision: int | None = None,
+        idempotency_key: str | None = None,
+        principal_id: str = "system:local",
+    ) -> dict[str, Any]:
+        """Create, review, and finalize one private CoC rules Pack draft."""
+
+        require_dm(campaign_id, principal_id)
+        require_lobby(campaign_id, f"rulebook_draft({action})")
+        data = dict(data or {})
+        if action == "get":
+            if data.get("job_id"):
+                return {"job": import_job_view(require_rule_job(campaign_id, str(data["job_id"])))}
+            return {
+                "order": "newest_first",
+                "jobs": [
+                    import_job_handle(item)
+                    for item in import_jobs.list(campaign_id, kind="rulebook")
+                ],
+            }
+
+        if action == "start":
+            key = str(idempotency_key or "").strip()
+            source_path = str(data.get("source_path") or "").strip()
+            if not key or not source_path:
+                raise ValueError("rulebook start requires source_path and idempotency_key")
+            staged = storage.stage_rule(source_path)
+            title = str(data.get("title") or Path(source_path).stem).strip()
+            source_key = str(data.get("source_key") or Path(source_path).name).strip()
+            request = {
+                "operation": "start_rulebook_draft",
+                "artifact": staged["artifact"],
+                "checksum": staged["checksum"],
+                "title": title,
+                "source_key": source_key,
+            }
+            scope = f"rulebook-draft-start:{campaign_id}:{principal_id}"
+            replay = replay_response(scope, key, request)
+            if replay is not None:
+                return replay
+            create_scope = f"rulebook-draft-job:{campaign_id}:{principal_id}:create"
+            create_key = f"{key}:create"
+            created = replay_response(create_scope, create_key, request)
+            if created is None:
+                job = import_jobs.create(
+                    campaign_id=campaign_id,
+                    kind="rulebook",
+                    artifact=str(staged["artifact"]),
+                    artifact_checksum=str(staged["checksum"]),
+                    payload={"title": title, "source_key": source_key},
+                    idempotency_key=create_key,
+                    idempotency_write=IdempotencyWrite(
+                        scope=create_scope,
+                        payload=request,
+                        response=lambda value: {"job_id": value.id},
+                    ),
+                )
+            else:
+                job = require_rule_job(campaign_id, str(created["job_id"]))
+            source = storage.artifact_rule_path(job.artifact)
+            inspection = rules.inspect_path(
+                source,
+                document_cache_dir=config.normalized_rules_dir,
+                expected_checksum=job.artifact_checksum,
+            )
+            inspection_scope = f"rulebook-draft-job:{campaign_id}:{job.id}:inspect"
+            inspection_key = f"{key}:inspect"
+            inspected = replay_response(inspection_scope, inspection_key, inspection)
+            if inspected is None:
+                job = import_jobs.record_inspection(
+                    job.id,
+                    inspection,
+                    expected_revision=job.revision,
+                    idempotency_key=inspection_key,
+                    idempotency_write=IdempotencyWrite(
+                        scope=inspection_scope,
+                        payload=inspection,
+                        response=lambda value: {"job_id": value.id},
+                    ),
+                )
+            else:
+                job = require_rule_job(campaign_id, str(inspected["job_id"]))
+            validation = {
+                "valid": bool(inspection.get("sections")) and bool(inspection.get("chunks")),
+                "errors": (
+                    []
+                    if inspection.get("sections") and inspection.get("chunks")
+                    else ["rule source did not produce indexed sections and chunks"]
+                ),
+                "warnings": list(inspection.get("warnings") or []),
+            }
+            validation_scope = f"rulebook-draft-job:{campaign_id}:{job.id}:validate"
+            validation_key = f"{key}:validate"
+            validated = replay_response(validation_scope, validation_key, validation)
+            if validated is None:
+                job = import_jobs.record_validation(
+                    job.id,
+                    validation,
+                    expected_revision=job.revision,
+                    idempotency_key=validation_key,
+                    idempotency_write=IdempotencyWrite(
+                        scope=validation_scope,
+                        payload=validation,
+                        response=lambda value: {"job_id": value.id},
+                    ),
+                )
+            else:
+                job = require_rule_job(campaign_id, str(validated["job_id"]))
+            if not validation["valid"]:
+                response = {"job": import_job_view(job), "status": "needs_repair"}
+                return remember_response(scope, key, request, response, campaign_id=campaign_id)
+            ingest_scope = f"rulebook-draft-job:{campaign_id}:{job.id}:ingest"
+            ingest_key = f"{key}:ingest"
+            ingest_request = {"job_id": job.id, "source_key": source_key, "title": title}
+            imported = replay_response(ingest_scope, ingest_key, ingest_request)
+            if imported is None:
+                result = rules.ingest_path(
+                    system_id="coc7e",
+                    path=source,
+                    source_key=source_key,
+                    title=title,
+                    locale=str(data.get("locale") or "en"),
+                    edition="7e",
+                    version=str(data.get("version") or ""),
+                    publication_id=str(data.get("publication_id") or ""),
+                    authority=str(data.get("authority") or "primary"),
+                    document_cache_dir=config.normalized_rules_dir,
+                    expected_checksum=job.artifact_checksum,
+                    idempotency_campaign_id=campaign_id,
+                    idempotency_key=ingest_key,
+                    idempotency_write=IdempotencyWrite(
+                        scope=ingest_scope,
+                        payload=ingest_request,
+                        response=lambda value: {"source_id": value["result"].source_id},
+                    ),
+                )
+                imported = {"source_id": result.source_id}
+            record_scope = f"rulebook-draft-job:{campaign_id}:{job.id}:record-import"
+            record_key = f"{key}:record-import"
+            recorded = replay_response(record_scope, record_key, imported)
+            if recorded is None:
+                job = import_jobs.record_result(
+                    job.id,
+                    {"source_id": imported["source_id"], "draft_edit_history": []},
+                    state="imported",
+                    expected_revision=job.revision,
+                    idempotency_key=record_key,
+                    idempotency_write=IdempotencyWrite(
+                        scope=record_scope,
+                        payload=imported,
+                        response=lambda value: {"job_id": value.id},
+                    ),
+                )
+            else:
+                job = require_rule_job(campaign_id, str(recorded["job_id"]))
+            response = {
+                "job": import_job_view(job),
+                "source_id": str(imported["source_id"]),
+                "inspection": inspection,
+                "validation": validation,
+                "status": "editing",
+            }
+            return remember_response(scope, key, request, response, campaign_id=campaign_id)
+
+        job_id = str(data.get("job_id") or "").strip()
+        if not job_id:
+            raise ValueError("data.job_id is required")
+        job = require_rule_job(campaign_id, job_id)
+        source_id = str(dict(job.result or {}).get("source_id") or "")
+        if not source_id:
+            raise ValueError("rulebook draft has no indexed source")
+        if action == "evidence":
+            query = str(data.get("query") or "").strip()
+            if query:
+                return {
+                    "hits": [
+                        asdict(hit)
+                        for hit in rules.search(
+                            system_id="coc7e",
+                            query=query,
+                            source_ids=[source_id],
+                            top_k=max(1, min(20, int(data.get("top_k", 8)))),
+                        )
+                    ]
+                }
+            return {"source": rules.source(source_id), "chunks": rules.source_chunks(source_id)}
+        if action != "finalize":
+            raise ValueError(f"unsupported rulebook_draft action: {action}")
+        revision, key = require_write_contract(expected_revision, idempotency_key)
+        if revision != job.revision:
+            raise ValueError(
+                f"rulebook draft revision conflict: expected {revision}, found {job.revision}"
+            )
+        confirmation = data.get("confirmation")
+        if not isinstance(confirmation, dict) or confirmation.get("confirmed") is not True:
+            raise ValueError("rulebook finalization requires explicit Agent confirmation")
+        note = str(confirmation.get("note") or "").strip()
+        if not note or len(note) > 2000:
+            raise ValueError("rulebook finalization confirmation note is required")
+        package_id = str(data.get("package_id") or "").strip()
+        version = str(data.get("version") or "1.0.0").strip()
+        title = str(data.get("title") or dict(job.payload or {}).get("title") or "").strip()
+        request = {
+            "operation": "finalize_rulebook_draft",
+            "job_id": job.id,
+            "expected_revision": revision,
+            "package_id": package_id,
+            "version": version,
+            "title": title,
+            "confirmation": {"confirmed": True, "note": note},
+        }
+        scope = f"rulebook-draft-finalize:{campaign_id}:{job.id}:{principal_id}"
+        replay = replay_response(scope, key, request)
+        if replay is not None:
+            return replay
+        exported = rules.export_content_source(source_id)
+        package, blobs = build_rule_content_package(
+            package_id=package_id,
+            version=version,
+            title=title,
+            exported_sources=[exported],
+            metadata={
+                "agent_finalization": {
+                    "confirmed": True,
+                    "reviewer": principal_id,
+                    "note": note,
+                }
+            },
+            dependencies=list(data.get("dependencies") or []),
+            artifacts=list(data.get("artifacts") or []),
+            mechanics=list(data.get("mechanics") or []),
+        )
+        stored = storage.write_content_archive(package, blobs)
+        finalized = {
+            "artifact": stored["artifact"],
+            "summary": {
+                "id": package["id"],
+                "version": package["version"],
+                "checksum": package["checksum"],
+                "sources": len(package["sources"]),
+            },
+            "confirmation": package["metadata"]["agent_finalization"],
+        }
+        updated = import_jobs.record_result(
+            job.id,
+            {**dict(job.result or {}), "finalized_package": finalized},
+            state="compiled",
+            expected_revision=revision,
+            idempotency_key=key,
+            idempotency_write=IdempotencyWrite(
+                scope=scope,
+                payload=request,
+                response=lambda value: {"job": import_job_view(value), **finalized},
+            ),
+        )
+        return {"job": import_job_view(updated), **finalized}
+
+    @mcp.tool()
+    def rule_query(
+        action: Literal["sources", "search", "expand", "effective"],
+        campaign_id: str,
+        data: dict[str, Any] | None = None,
+        principal_id: str = "system:local",
+    ) -> dict[str, Any]:
+        """Read indexed CoC rules and the branch-locked effective ruleset."""
+
+        access.require_campaign(campaign_id, principal_id)
+        data = dict(data or {})
+        if action == "sources":
+            return {"sources": rules.sources(system_id="coc7e")}
+        if action == "search":
+            query = str(data.get("query") or "").strip()
+            if not query:
+                raise ValueError("rule search requires data.query")
+            return {
+                "hits": [
+                    asdict(hit)
+                    for hit in rules.search(
+                        system_id="coc7e",
+                        query=query,
+                        edition="7e",
+                        top_k=max(1, min(20, int(data.get("top_k", 8)))),
+                    )
+                ]
+            }
+        if action == "expand":
+            return rules.expand(str(data.get("chunk_id") or ""))
+        if action == "effective":
+            return asdict(rule_packs.effective_ruleset(campaign_id))
+        raise ValueError(f"unsupported rule_query action: {action}")
 
     @mcp.tool()
     def module_draft(
@@ -2279,7 +2903,7 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
         idempotency_key: str | None = None,
         principal_id: str = "system:local",
     ) -> dict[str, Any]:
-        """Inspect and manage finalized CoC Module Pack archives."""
+        """Inspect and manage finalized CoC Module and rules Pack archives."""
 
         require_dm(campaign_id, principal_id)
         data = dict(data or {})
@@ -2294,9 +2918,11 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
                 ],
                 "finalized_drafts": [
                     import_job_handle(item)
-                    for item in import_jobs.list(campaign_id, kind="module")
+                    for kind in ("module", "rulebook")
+                    for item in import_jobs.list(campaign_id, kind=kind)
                     if dict(item.result or {}).get("finalized_package")
                 ],
+                "rule_packs": [asdict(item) for item in rule_packs.list_versions()],
             }
         if action == "get":
             choices = [name for name in ("artifact", "source_path") if data.get(name)]
@@ -2359,9 +2985,84 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
                 source_path=(data["source_path"] if choices[0] == "source_path" else None),
             )
             package = validate_coc_content_package(package)
-            if package["kind"] != "module" or package["system_id"] != "coc7e":
-                raise ValueError("content package must be a coc7e module")
+            if package["kind"] not in {"module", "core_rules"} or package["system_id"] != "coc7e":
+                raise ValueError("content package must be a coc7e module or core_rules Pack")
             managed = storage.write_content_archive(package, blobs)
+            if package["kind"] == "core_rules":
+                assets = {str(item["asset_key"]): item for item in package["assets"]}
+                source_map: dict[str, str] = {}
+                existing_sources = {
+                    str(item["source_key"]): item for item in rules.sources(system_id="coc7e")
+                }
+                for source in package["sources"]:
+                    source_key = str(source["source_key"])
+                    existing = existing_sources.get(source_key)
+                    expected_source_checksum = str(
+                        dict(source.get("metadata") or {}).get("source_checksum") or ""
+                    )
+                    if (
+                        existing is not None
+                        and str(existing["checksum"]) == expected_source_checksum
+                    ):
+                        source_map[source_key] = str(existing["id"])
+                        continue
+                    asset = assets[str(source["normalized_document_asset_key"])]
+                    imported_source = rules.import_content_source(
+                        source,
+                        blobs[str(asset["checksum"])],
+                        system_id="coc7e",
+                    )
+                    source_map[source_key] = str(imported_source["source_id"])
+                content = dict(package["content"])
+                manifest = {
+                    "id": package["id"],
+                    "version": package["version"],
+                    "system_id": "coc7e",
+                    "title": str(package["manifest"].get("title") or package["id"]),
+                    "namespace": package["id"],
+                    "editions": list(content.get("editions") or ["7e"]),
+                    "dependencies": [
+                        {
+                            "id": str(item["id"]),
+                            "version": str(item.get("version") or ""),
+                            "checksum": str(item.get("checksum") or ""),
+                        }
+                        for item in package.get("dependencies") or []
+                        if str(item.get("kind") or "") in {"addon", "core_rules"}
+                    ],
+                    "conflicts": list(content.get("conflicts") or []),
+                    "capabilities": sorted(
+                        {
+                            str(item.get("event") or "")
+                            for item in content.get("mechanics") or []
+                            if str(item.get("event") or "")
+                        }
+                    ),
+                    "native_mechanic_refs": [],
+                    "native_provider_locks": [],
+                }
+                draft = rule_packs.save_draft(
+                    manifest=manifest,
+                    artifacts=list(content.get("artifacts") or []),
+                    mechanics=list(content.get("mechanics") or []),
+                    provenance={
+                        "content_package_id": package["id"],
+                        "content_package_version": package["version"],
+                        "content_package_checksum": package["checksum"],
+                        "content_archive_artifact": managed["artifact"],
+                        "source_map": source_map,
+                    },
+                )
+                installed = rule_packs.install(draft.pack_id, draft.version)
+                response = {
+                    "pack_id": installed.pack_id,
+                    "version": installed.version,
+                    "status": installed.status,
+                    "source_map": source_map,
+                    "artifact": managed,
+                    "activated": False,
+                }
+                return remember_response(scope, key, request, response, campaign_id=campaign_id)
             imported = modules.import_content_package(
                 campaign_id,
                 package,
@@ -2432,6 +3133,43 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
                 "activated": False,
             }
             return remember_response(scope, key, request, response, campaign_id=campaign_id)
+
+        pack_id = str(data.get("pack_id") or "").strip()
+        if pack_id:
+            version = str(data.get("version") or "").strip()
+            if not version:
+                raise ValueError("rules Pack management requires data.version")
+            request = {
+                "operation": f"{action}_rule_pack",
+                "pack_id": pack_id,
+                "version": version,
+                "expected_revision": revision,
+            }
+            scope = f"content-pack-{action}-rules:{campaign_id}:{principal_id}"
+            replay = replay_response(scope, key, request)
+            if replay is not None:
+                return replay
+            require_campaign_revision(campaign_id, revision)
+            if action in {"activate", "deactivate"}:
+                activation = rule_packs.set_activation(
+                    campaign_id,
+                    pack_id=pack_id,
+                    version=version,
+                    enabled=action == "activate",
+                    expected_campaign_revision=revision,
+                    idempotency_key=key,
+                    idempotency_write=IdempotencyWrite(
+                        scope=scope,
+                        payload=request,
+                        response=lambda value: {"activation": asdict(value["activation"])},
+                    ),
+                )
+                return {"activation": asdict(activation)}
+            if action == "remove":
+                rule_packs.remove_version(pack_id, version)
+                response = {"removed": True, "pack_id": pack_id, "version": version}
+                return remember_response(scope, key, request, response, campaign_id=campaign_id)
+            raise ValueError(f"unsupported rules Pack action: {action}")
 
         module_id = str(data.get("module_id") or "").strip()
         if not module_id:
@@ -2992,6 +3730,18 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
         limit: int = 8,
         budget_chars: int = 12_000,
         related_refs: list[str] | None = None,
+        purpose: Literal[
+            "actor_turn",
+            "audience_render",
+            "faction_turn",
+            "source_interpretation",
+            "bounded_ruling",
+        ]
+        | None = None,
+        subject_ref: str | None = None,
+        interlocutor_actor_ids: list[str] | None = None,
+        evaluation_target_refs: list[str] | None = None,
+        stimulus: dict[str, Any] | None = None,
         principal_id: str = LOCAL_SYSTEM_PRINCIPAL_ID,
     ) -> dict[str, Any]:
         """Retrieve one audience-safe, branch-scoped investigation context bundle."""
@@ -3003,7 +3753,7 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
             audience = "player"
         if actor_id is not None:
             actor_access(campaign_id, actor_id, principal_id)
-        return continuity.context(
+        result = continuity.context(
             campaign_id,
             query=str(query or ""),
             actor_id=actor_id,
@@ -3014,6 +3764,807 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
             budget_chars=int(budget_chars),
             related_refs=list(related_refs or []),
         )
+        if purpose is None:
+            return result
+        if purpose not in BOUNDED_EVALUATION_PURPOSES:
+            raise ValueError(f"unsupported bounded evaluation purpose: {purpose}")
+        if purpose in {"actor_turn", "faction_turn", "source_interpretation", "bounded_ruling"}:
+            require_dm(campaign_id, principal_id)
+        if purpose in {"actor_turn", "audience_render", "faction_turn"} and authoritative_phase(
+            campaign_id
+        ) not in {PROFILE_PLAY, PROFILE_COMBAT}:
+            raise ValueError(f"{purpose} context is available only during Play or Combat")
+        normalized_interlocutors = [str(item) for item in interlocutor_actor_ids or []]
+        for interlocutor_id in normalized_interlocutors:
+            item = characters.get(interlocutor_id)
+            if item.campaign_id != campaign_id:
+                raise ValueError("bounded context interlocutors must belong to the campaign")
+        subject: dict[str, Any]
+        resolved_subject_ref = str(subject_ref or "").strip()
+        actor_revision = None
+        if purpose in {"actor_turn", "audience_render"}:
+            if not actor_id:
+                raise ValueError(f"actor_id is required for {purpose}")
+            actor = characters.get(actor_id)
+            if actor.campaign_id != campaign_id:
+                raise ValueError("bounded context actor must belong to the campaign")
+            if purpose == "actor_turn" and actor.character_type == "investigator":
+                raise ValueError("actor_turn cannot replace a human-owned investigator decision")
+            if purpose == "audience_render" and audience != "player":
+                raise ValueError("audience_render requires audience='player'")
+            resolved_subject_ref = f"actor:{actor.id}"
+            actor_revision = actor.revision
+            subject = {"kind": "actor", "id": actor.id, "name": actor.name}
+        elif purpose == "faction_turn":
+            if not resolved_subject_ref.startswith("faction:"):
+                raise ValueError("faction_turn requires subject_ref='faction:<id>'")
+            faction_facts = [
+                item
+                for item in memories.list(
+                    campaign_id,
+                    branch_id=resolved_branch,
+                    include_inactive=False,
+                )
+                if item.subject_ref == resolved_subject_ref
+            ]
+            if not faction_facts:
+                raise ValueError(f"{resolved_subject_ref} has no faction_state")
+            subject = {
+                "kind": "faction",
+                "id": resolved_subject_ref.removeprefix("faction:"),
+                "name": resolved_subject_ref.removeprefix("faction:"),
+            }
+        else:
+            resolved_subject_ref = resolved_subject_ref or f"campaign:{campaign_id}"
+            subject = {"kind": purpose, "id": resolved_subject_ref, "name": resolved_subject_ref}
+        target_refs = sorted(
+            {
+                resolved_subject_ref,
+                *(f"actor:{item}" for item in normalized_interlocutors),
+                *(str(item) for item in evaluation_target_refs or []),
+            }
+        )
+        context_request = {
+            "query": str(query or ""),
+            "actor_id": actor_id,
+            "scope_id": resolved_scope,
+            "audience": audience,
+            "branch_id": resolved_branch,
+            "limit": int(limit),
+            "budget_chars": int(budget_chars),
+            "related_refs": list(related_refs or []),
+        }
+        campaign = campaigns.get(campaign_id)
+        bundle_id = f"bounded:{uuid4().hex}"
+        issued_ns = time.monotonic_ns()
+        receipt_payload = {
+            "schema_version": 1,
+            "bundle_id": bundle_id,
+            "purpose": purpose,
+            "campaign_id": campaign_id,
+            "branch_id": resolved_branch,
+            "campaign_revision": campaign.revision,
+            "actor_revision": actor_revision,
+            "subject_ref": resolved_subject_ref,
+            "principal_fingerprint": principal_fingerprint(principal_id),
+            "allowed_basis_refs": [],
+            "allowed_claim_basis_refs": [],
+            "allowed_target_refs": target_refs,
+            "context_request": context_request,
+            "context_digest": bounded_context_digest(result),
+            "issued_monotonic_ns": issued_ns,
+            "expires_monotonic_ns": issued_ns + bounded_receipt_ttl_ns,
+        }
+        return {
+            "schema_version": 1,
+            "bundle_id": bundle_id,
+            "purpose": purpose,
+            "subject": subject,
+            "stimulus": deepcopy(stimulus),
+            "context": result,
+            "constraints": {
+                "allowed_basis_refs": [],
+                "allowed_target_refs": target_refs,
+                "may_roll_dice": False,
+                "may_call_tools": False,
+                "may_write_state": False,
+                "output_contract": BOUNDED_OUTPUT_CONTRACTS[purpose],
+            },
+            "delegation": {
+                "schema_version": 1,
+                "task": f"propose_{purpose}",
+                "execution": "awaited_fresh_context",
+                "inherit_agent_history": False,
+                "tools_exposed": False,
+                "persist_worker_session": False,
+                "authoritative_result": False,
+            },
+            "bundle_receipt": sign_receipt(receipt_payload, bounded_receipt_secret),
+        }
+
+    @mcp.tool()
+    def bounded_evaluation(
+        action: Literal["validate"],
+        campaign_id: str,
+        proposal: dict[str, Any],
+        bundle_receipt: dict[str, Any],
+        principal_id: str = LOCAL_SYSTEM_PRINCIPAL_ID,
+    ) -> dict[str, Any]:
+        """Validate one tool-free semantic proposal without changing authoritative state."""
+
+        if action != "validate":
+            raise ValueError("bounded_evaluation action must be validate")
+        membership = access.require_campaign(campaign_id, principal_id)
+        receipt = verify_receipt_signature(
+            bundle_receipt,
+            bounded_receipt_secret,
+            missing_error="bounded evaluation bundle_receipt is required",
+            invalid_error="bounded evaluation bundle_receipt signature is invalid",
+        )
+        purpose = str(receipt.get("purpose") or "")
+        if receipt.get("schema_version") != 1 or purpose not in BOUNDED_EVALUATION_PURPOSES:
+            raise ValueError("bounded evaluation receipt has the wrong purpose or schema")
+        if str(receipt.get("campaign_id") or "") != campaign_id:
+            raise ValueError("bounded evaluation receipt belongs to another campaign")
+        if receipt.get("principal_fingerprint") != principal_fingerprint(principal_id):
+            raise ValueError("bounded evaluation receipt belongs to another principal")
+        if membership.role not in {"owner", "dm"} and purpose != "audience_render":
+            raise PermissionError("only the Keeper may validate this bounded purpose")
+        if time.monotonic_ns() > int(receipt.get("expires_monotonic_ns") or 0):
+            raise ValueError("bounded evaluation receipt expired; read continuity_context again")
+        campaign = campaigns.get(campaign_id)
+        if campaign.revision != int(receipt.get("campaign_revision", -1)):
+            raise ValueError("bounded evaluation receipt is stale at the campaign revision")
+        if current_branch_id(campaign_id) != str(receipt.get("branch_id") or ""):
+            raise ValueError("bounded evaluation receipt is stale after branch change")
+        subject_ref_value = str(receipt.get("subject_ref") or "")
+        if subject_ref_value.startswith("actor:"):
+            actor = characters.get(subject_ref_value.removeprefix("actor:"))
+            expected_actor_revision = receipt.get("actor_revision")
+            if expected_actor_revision is not None and actor.revision != int(
+                expected_actor_revision
+            ):
+                raise ValueError("bounded evaluation receipt is stale at the actor revision")
+        context_request = dict(receipt.get("context_request") or {})
+        refreshed = continuity.context(
+            campaign_id,
+            query=str(context_request.get("query") or ""),
+            actor_id=context_request.get("actor_id"),
+            scope_id=str(context_request.get("scope_id") or "party"),
+            audience=str(context_request.get("audience") or "dm"),
+            branch_id=str(context_request.get("branch_id") or ""),
+            limit=int(context_request.get("limit", 8)),
+            budget_chars=int(context_request.get("budget_chars", 12_000)),
+            related_refs=list(context_request.get("related_refs") or []),
+        )
+        if bounded_context_digest(refreshed) != str(receipt.get("context_digest") or ""):
+            raise ValueError("bounded evaluation receipt is stale after continuity changed")
+        normalized = normalize_bounded_proposal(purpose, proposal)
+        if normalized["bundle_id"] != str(receipt.get("bundle_id") or ""):
+            raise ValueError("bounded proposal does not match its signed bundle")
+        validate_bounded_proposal_refs(
+            normalized,
+            subject_ref=subject_ref_value,
+            allowed_basis_refs={str(item) for item in receipt.get("allowed_basis_refs") or []},
+            allowed_claim_basis_refs={
+                str(item) for item in receipt.get("allowed_claim_basis_refs") or []
+            },
+            allowed_target_refs={str(item) for item in receipt.get("allowed_target_refs") or []},
+        )
+        response = {
+            "validated": True,
+            "authoritative_state_changed": False,
+            "purpose": purpose,
+            "proposal": normalized,
+            "validation_receipt": sign_receipt(
+                {
+                    "schema_version": 1,
+                    "bundle_id": normalized["bundle_id"],
+                    "purpose": purpose,
+                    "campaign_id": campaign_id,
+                    "principal_fingerprint": principal_fingerprint(principal_id),
+                    "proposal_digest": bounded_context_digest(normalized),
+                    "validated_at_ns": time.time_ns(),
+                },
+                bounded_receipt_secret,
+            ),
+        }
+        if purpose == "audience_render":
+            response["publication"] = {
+                "text": normalized["text"],
+                "cited_basis_refs": list(normalized.get("cited_basis_refs") or []),
+            }
+        return response
+
+    def npc_private_context(
+        campaign_id: str,
+        branch_id: str,
+        scope_id: str,
+        actor: Any,
+        participant_ids: list[str],
+        query: str,
+    ) -> tuple[dict[str, Any], str]:
+        context_request = {
+            "query": query,
+            "actor_id": actor.id,
+            "scope_id": scope_id,
+            "audience": "dm",
+            "branch_id": branch_id,
+            "limit": 12,
+            "budget_chars": 16_000,
+            "related_refs": [f"actor:{item}" for item in participant_ids],
+        }
+        context = continuity.context(campaign_id, **context_request)
+        bundle = {
+            "schema_version": 1,
+            "purpose": "npc_conversation",
+            "authority": {
+                "campaign_id": campaign_id,
+                "branch_id": branch_id,
+                "actor_revision": actor.revision,
+            },
+            "actor": {
+                "id": actor.id,
+                "name": actor.name,
+                "character_type": actor.character_type,
+                "summary": actor.summary,
+            },
+            "continuity": context,
+            "constraints": {
+                "allowed_basis_refs": [],
+                "allowed_target_actor_ids": participant_ids,
+                "may_call_tools": False,
+                "may_roll_dice": False,
+                "may_write_state": False,
+                "output_contract": "npc-conversation-proposal.v4",
+            },
+            "delegation": {
+                "schema_version": 1,
+                "task": "propose_npc_conversation_turn",
+                "execution": "persistent_actor_worker",
+                "inherit_agent_history": False,
+                "tools_exposed": False,
+                "persist_worker_session": True,
+                "authoritative_result": False,
+            },
+            "context_request": context_request,
+        }
+        return bundle, bounded_context_digest(context)
+
+    def npc_conversation_require_fresh(session: dict[str, Any]) -> None:
+        if session.get("status") == "stale":
+            raise ValueError("SESSION_STALE: abort and open a fresh NPC conversation")
+        if session.get("status") != "open":
+            raise ValueError(f"conversation is not open: {session.get('status')}")
+        campaign_id = str(session["campaign_id"])
+        reasons: list[str] = []
+        if current_branch_id(campaign_id) != str(session["branch_id"]):
+            reasons.append("branch")
+        if authoritative_phase(campaign_id) != PROFILE_PLAY:
+            reasons.append("phase")
+        campaign = campaigns.get(campaign_id)
+        if dict(campaign.state.get("combat") or {}).get("active"):
+            reasons.append("combat")
+        if dict(campaign.state.get("chase") or {}).get("active"):
+            reasons.append("chase")
+        authority = dict(session.get("authority") or {})
+        expected_revisions = dict(authority.get("actor_revisions") or {})
+        expected_digests = dict(authority.get("context_digests") or {})
+        for actor_id, runtime in dict(session.get("actor_runtimes") or {}).items():
+            try:
+                actor = characters.get(str(actor_id))
+            except LookupError:
+                reasons.append(f"actor:{actor_id}:missing")
+                continue
+            if actor.revision != int(expected_revisions.get(actor_id, -1)):
+                reasons.append(f"actor:{actor_id}:revision")
+                continue
+            request = dict(dict(runtime.get("context") or {}).get("context_request") or {})
+            refreshed = continuity.context(campaign_id, **request)
+            if bounded_context_digest(refreshed) != str(expected_digests.get(actor_id) or ""):
+                reasons.append(f"actor:{actor_id}:continuity")
+        if reasons:
+            session["status"] = "stale"
+            session["stale_reasons"] = sorted(set(reasons))
+            session["updated_at_ns"] = time.time_ns()
+            npc_conversations.save(session)
+            raise ValueError(
+                "SESSION_STALE: authoritative state changed: "
+                + ", ".join(session["stale_reasons"])
+            )
+
+    def npc_conversation_status(session: dict[str, Any]) -> dict[str, Any]:
+        result = npc_conversations.public_status(session)
+        result["activations"] = npc_conversations.list_activations(session)
+        result["pending_publications"] = [
+            {
+                key: deepcopy(value)
+                for key, value in item.items()
+                if key not in {"speaker_actor_id"}
+            }
+            for item in session.get("publications") or []
+            if item.get("status") == "pending_audience"
+        ]
+        result["pending_resolutions"] = [
+            deepcopy(item)
+            for item in session.get("pending_resolutions") or []
+            if item.get("status") == "pending"
+        ]
+        result["listener_knowledge_candidates"] = {
+            actor_id: deepcopy(values)
+            for actor_id, values in dict(
+                session.get("listener_knowledge_candidates") or {}
+            ).items()
+            if values
+        }
+        if session.get("status") == "stale":
+            result["stale_reasons"] = list(session.get("stale_reasons") or [])
+        return result
+
+    def selected_indexes(values: list[dict[str, Any]], indexes: Any, field: str):
+        if not isinstance(indexes, list) or len(indexes) != len(set(indexes)):
+            raise ValueError(f"{field} must be a unique integer list")
+        selected = []
+        for index in indexes:
+            if type(index) is not int or not 0 <= index < len(values):
+                raise ValueError(f"{field} contains an invalid index: {index}")
+            selected.append(deepcopy(values[index]))
+        return selected
+
+    def close_npc_conversation(
+        session: dict[str, Any],
+        accepted: dict[str, Any],
+        expected_revision: int,
+        idempotency_key: str,
+        principal_id: str,
+    ) -> dict[str, Any]:
+        npc_conversation_require_fresh(session)
+        session, replay = npc_conversations.begin_mutation(
+            str(session["conversation_id"]),
+            expected_revision=expected_revision,
+            idempotency_key=idempotency_key,
+            operation="close",
+            payload={"accepted_working_deltas": accepted},
+        )
+        if replay is not None:
+            return replay
+        if any(
+            item.get("status") in {"pending", "claimed"}
+            for item in session["activations"].values()
+        ):
+            raise ValueError("conversation has unfinished NPC activations")
+        if any(
+            item.get("status") == "pending_audience"
+            for item in session.get("publications") or []
+        ):
+            raise ValueError("conversation has unpublished NPC output")
+        if any(
+            item.get("status") == "pending"
+            for item in session.get("pending_resolutions") or []
+        ):
+            raise ValueError("conversation has unresolved mechanic requests")
+        if unknown := set(accepted) - set(session["participant_ids"]):
+            raise ValueError(f"accepted deltas include actors outside conversation: {unknown}")
+        facts: list[dict[str, Any]] = []
+        actor_knowledge: list[dict[str, Any]] = []
+        for actor_id, raw in accepted.items():
+            selection = dict(raw or {})
+            allowed = {
+                "fact_indexes",
+                "actor_knowledge_indexes",
+                "commitment_indexes",
+                "listener_knowledge_indexes",
+            }
+            if unknown := set(selection) - allowed:
+                raise ValueError(f"accepted delta selection has unknown fields: {unknown}")
+            runtime = dict(session["actor_runtimes"].get(actor_id) or {})
+            working = dict(runtime.get("working_deltas") or {})
+            facts.extend(
+                selected_indexes(
+                    list(working.get("facts") or []),
+                    selection.get("fact_indexes") or [],
+                    "fact_indexes",
+                )
+            )
+            actor_knowledge.extend(
+                selected_indexes(
+                    list(working.get("actor_knowledge") or []),
+                    selection.get("actor_knowledge_indexes") or [],
+                    "actor_knowledge_indexes",
+                )
+            )
+            actor_knowledge.extend(
+                selected_indexes(
+                    list(
+                        dict(session.get("listener_knowledge_candidates") or {}).get(
+                            actor_id, []
+                        )
+                    ),
+                    selection.get("listener_knowledge_indexes") or [],
+                    "listener_knowledge_indexes",
+                )
+            )
+            for commitment in selected_indexes(
+                list(working.get("commitments") or []),
+                selection.get("commitment_indexes") or [],
+                "commitment_indexes",
+            ):
+                facts.append(
+                    {
+                        "action": "upsert",
+                        "fact_key": (
+                            f"actor:{actor_id}:commitment:{commitment['commitment_key']}"
+                        ),
+                        "content": str(commitment["content"]),
+                        "kind": "actor_state",
+                        "subject": actor_id,
+                        "subject_ref": f"actor:{actor_id}",
+                        "predicate": "commitment",
+                        "metadata": dict(commitment.get("metadata") or {}),
+                        "importance": int(commitment.get("importance", 3)),
+                        "disclosure_scope": "dm",
+                    }
+                )
+        participants = set(session["participant_ids"])
+        current_facts = {
+            item.fact_key: item
+            for item in memories.list(
+                str(session["campaign_id"]),
+                branch_id=str(session["branch_id"]),
+                include_inactive=True,
+            )
+        }
+        for fact in facts:
+            if str(fact.get("subject_ref") or "").removeprefix("actor:") not in participants:
+                raise ValueError("accepted conversation fact belongs outside conversation")
+            if str(fact.get("kind") or "") != "actor_state" or str(
+                fact.get("predicate") or ""
+            ) not in {"relationship_to", "goal", "commitment"}:
+                raise ValueError("accepted conversation facts must be actor-state continuity")
+            fact["disclosure_scope"] = "dm"
+            current = current_facts.get(str(fact.get("fact_key") or ""))
+            if current is not None and str(fact.get("action") or "upsert") == "upsert":
+                fact.setdefault("expected_revision_id", current.revision_id)
+        for item in actor_knowledge:
+            if str(item.get("actor_id") or "") not in participants:
+                raise ValueError("accepted ActorKnowledge belongs outside conversation")
+            item["disclosure_scope"] = str(item.get("disclosure_scope") or "dm")
+        transcript = [
+            {
+                key: deepcopy(event[key])
+                for key in (
+                    "event_id",
+                    "sequence",
+                    "type",
+                    "speaker_actor_id",
+                    "content",
+                    "language",
+                    "delivery",
+                    "declared_target_actor_ids",
+                    "publication_id",
+                    "utterance_segments",
+                    "visible_cues",
+                    "visible_action",
+                    "resolved_resolution_ids",
+                    "audience_facts",
+                    "segment_audience_facts",
+                )
+                if key in event
+            }
+            for event in session["events"]
+        ]
+        names = {item["actor_id"]: item["name"] for item in session["participants"]}
+        event = {
+            "event_type": "npc_conversation",
+            "summary": (
+                f"Conversation among {', '.join(names.values())}; "
+                f"{len(transcript)} public events."
+            ),
+            "audience_scope": "dm",
+            "participants": [
+                {"actor_id": actor_id, "role": "witness"}
+                for actor_id in session["participant_ids"]
+            ],
+            "payload": {
+                "schema_version": 1,
+                "conversation_id": session["conversation_id"],
+                "scope_id": session["scope_id"],
+                "transcript": transcript,
+                "authority_at_open": deepcopy(session["authority"]),
+            },
+        }
+        request = {
+            "action": "close_npc_conversation",
+            "branch_id": session["branch_id"],
+            "event": event,
+            "facts": facts,
+            "actor_knowledge": actor_knowledge,
+        }
+        commit = continuity_commits.commit(
+            str(session["campaign_id"]),
+            event=event,
+            facts=facts,
+            actor_knowledge=actor_knowledge,
+            snapshot=None,
+            branch_id=str(session["branch_id"]),
+            idempotency_key=idempotency_key,
+            idempotency_write=IdempotencyWrite(
+                scope=(
+                    f"npc-conversation-close:{session['campaign_id']}:"
+                    f"{session['branch_id']}:{principal_id}"
+                ),
+                payload=request,
+                response=lambda result: result,
+            ),
+        )
+        session["status"] = "closed"
+        for runtime in session["actor_runtimes"].values():
+            runtime["status"] = "closed"
+            runtime["context"] = {}
+            runtime["working_deltas"] = {
+                "facts": [],
+                "actor_knowledge": [],
+                "commitments": [],
+            }
+        return npc_conversations.finish_mutation(session, commit)
+
+    @mcp.tool()
+    def npc_conversation(
+        action: Literal["open", "list", "get", "ingest", "publish", "close", "abort"],
+        campaign_id: str,
+        data: dict[str, Any] | None = None,
+        principal_id: str = LOCAL_SYSTEM_PRINCIPAL_ID,
+    ) -> dict[str, Any]:
+        """Run isolated, persistent per-NPC dialogue with explicit Agent audience rulings."""
+
+        require_dm(campaign_id, principal_id)
+        data = dict(data or {})
+        if action == "list":
+            branch_id = current_branch_id(campaign_id)
+            values = npc_conversations.active_public_statuses(
+                campaign_id=campaign_id,
+                branch_id=branch_id,
+                principal_id=principal_id,
+            )
+            return {"campaign_id": campaign_id, "branch_id": branch_id, "conversations": values}
+        if action == "open":
+            if authoritative_phase(campaign_id) != PROFILE_PLAY:
+                raise ValueError("NPC conversations may open only during play")
+            campaign = campaigns.get(campaign_id)
+            if dict(campaign.state.get("combat") or {}).get("active") or dict(
+                campaign.state.get("chase") or {}
+            ).get("active"):
+                raise ValueError("end active combat or chase before opening a conversation")
+            participant_ids = [
+                str(item).strip() for item in data.get("participant_actor_ids") or []
+            ]
+            if not participant_ids or len(participant_ids) > 20:
+                raise ValueError("participant_actor_ids must contain 1 to 20 actors")
+            if len(participant_ids) != len(set(participant_ids)) or any(
+                not item for item in participant_ids
+            ):
+                raise ValueError("participant_actor_ids must contain unique actor ids")
+            actors = [characters.get(item) for item in participant_ids]
+            if any(item.campaign_id != campaign_id for item in actors):
+                raise ValueError("all conversation participants must belong to campaign")
+            npc_actors = [
+                item
+                for item in actors
+                if item.character_type in {"npc", "creature", "monster"}
+            ]
+            if not npc_actors:
+                raise ValueError("conversation requires at least one NPC or creature")
+            branch_id = writable_branch_id(campaign_id, data.get("branch_id"))
+            scope_id = str(data.get("scope_id") or "party")
+            contexts: dict[str, dict[str, Any]] = {}
+            digests: dict[str, str] = {}
+            for actor in npc_actors:
+                context, digest = npc_private_context(
+                    campaign_id,
+                    branch_id,
+                    scope_id,
+                    actor,
+                    participant_ids,
+                    str(data.get("query") or ""),
+                )
+                contexts[actor.id] = context
+                digests[actor.id] = digest
+            return npc_conversations.open(
+                campaign_id=campaign_id,
+                branch_id=branch_id,
+                principal_id=principal_id,
+                scope_id=scope_id,
+                scene_id=str(data.get("scene_id") or ""),
+                authority={
+                    "campaign_revision": campaign.revision,
+                    "actor_revisions": {item.id: item.revision for item in actors},
+                    "context_digests": digests,
+                    "principal_fingerprint": principal_fingerprint(principal_id),
+                },
+                participants=[
+                    {
+                        "actor_id": item.id,
+                        "name": item.name,
+                        "kind": item.character_type,
+                        "npc_runtime": item.id in contexts,
+                    }
+                    for item in actors
+                ],
+                actor_contexts=contexts,
+                idempotency_key=str(data.get("idempotency_key") or ""),
+            )
+        conversation_id = str(data.get("conversation_id") or "")
+        session = npc_conversations.require_owner(
+            conversation_id,
+            campaign_id=campaign_id,
+            principal_id=principal_id,
+        )
+        if action == "get":
+            if session.get("status") == "open":
+                npc_conversation_require_fresh(session)
+            return npc_conversation_status(session)
+        if action == "ingest":
+            npc_conversation_require_fresh(session)
+            event = dict(data.get("event") or {})
+            allowed = {
+                "type",
+                "speaker_actor_id",
+                "content",
+                "language",
+                "delivery",
+                "declared_target_actor_ids",
+                "resolved_resolution_ids",
+            }
+            if unknown := set(event) - allowed:
+                raise ValueError(f"conversation event has unknown fields: {unknown}")
+            event_type = str(event.get("type") or "speech")
+            if event_type not in {"speech", "action", "scene_prompt", "resolution"}:
+                raise ValueError("unsupported conversation event type")
+            speaker = str(event.get("speaker_actor_id") or "")
+            if speaker and speaker not in session["participant_ids"]:
+                raise ValueError("conversation speaker must be a participant")
+            if event_type in {"speech", "action"} and not speaker:
+                raise ValueError("speech and action events require a speaker")
+            content = str(event.get("content") or "").strip()
+            if not content or len(content) > 6_000:
+                raise ValueError("conversation event content must contain 1 to 6000 characters")
+            targets = [str(item) for item in event.get("declared_target_actor_ids") or []]
+            if len(targets) != len(set(targets)) or any(
+                item not in session["participant_ids"] for item in targets
+            ):
+                raise ValueError("declared targets must be unique conversation participants")
+            resolved = [str(item) for item in event.get("resolved_resolution_ids") or []]
+            if event_type == "resolution" and not resolved:
+                raise ValueError("resolution events require resolved_resolution_ids")
+            if event_type != "resolution" and resolved:
+                raise ValueError("only resolution events may resolve requests")
+            audience = normalize_audience_facts(
+                data.get("audience_facts"),
+                participant_ids=set(session["participant_ids"]),
+                response_actor_ids=set(session["actor_runtimes"]),
+            )
+            return npc_conversations.append_event(
+                session,
+                event={
+                    "type": event_type,
+                    "speaker_actor_id": speaker,
+                    "content": content,
+                    "language": str(event.get("language") or ""),
+                    "delivery": str(event.get("delivery") or ""),
+                    "declared_target_actor_ids": targets,
+                    "resolved_resolution_ids": resolved,
+                },
+                audience_facts=audience,
+                expected_revision=int(data["expected_conversation_revision"]),
+                idempotency_key=str(data.get("idempotency_key") or ""),
+            )
+        if action == "publish":
+            npc_conversation_require_fresh(session)
+            audience = normalize_audience_facts(
+                data.get("audience_facts"),
+                participant_ids=set(session["participant_ids"]),
+                response_actor_ids=set(session["actor_runtimes"]),
+            )
+            segment_audience = [
+                normalize_audience_facts(
+                    item,
+                    participant_ids=set(session["participant_ids"]),
+                    response_actor_ids=set(session["actor_runtimes"]),
+                )
+                for item in data.get("segment_audience_facts") or []
+            ]
+            return npc_conversations.publish(
+                session,
+                publication_id=str(data.get("publication_id") or ""),
+                audience_facts=audience,
+                segment_audience_facts=segment_audience,
+                expected_revision=int(data["expected_conversation_revision"]),
+                idempotency_key=str(data.get("idempotency_key") or ""),
+            )
+        if action == "close":
+            return close_npc_conversation(
+                session,
+                dict(data.get("accepted_working_deltas") or {}),
+                int(data["expected_conversation_revision"]),
+                str(data.get("idempotency_key") or ""),
+                principal_id,
+            )
+        if action == "abort":
+            if session.get("status") == "closed":
+                raise ValueError("a committed conversation cannot be aborted")
+            session, replay = npc_conversations.begin_mutation(
+                conversation_id,
+                expected_revision=int(data["expected_conversation_revision"]),
+                idempotency_key=str(data.get("idempotency_key") or ""),
+                operation="abort",
+                payload={"reason": str(data.get("reason") or "")},
+            )
+            if replay is not None:
+                return replay
+            session["status"] = "aborted"
+            session["abort_reason"] = str(data.get("reason") or "")
+            for runtime in session["actor_runtimes"].values():
+                runtime["context"] = {}
+                runtime["working_deltas"] = {
+                    "facts": [],
+                    "actor_knowledge": [],
+                    "commitments": [],
+                }
+            return npc_conversations.finish_mutation(
+                session,
+                {
+                    "conversation_id": conversation_id,
+                    "status": "aborted",
+                    "recoverable": False,
+                },
+            )
+        raise ValueError(f"unsupported npc_conversation action: {action}")
+
+    @mcp.tool()
+    def npc_conversation_worker(
+        action: Literal["claim_activation", "submit_proposal", "cancel_activation"],
+        campaign_id: str,
+        conversation_id: str,
+        data: dict[str, Any],
+        principal_id: str = LOCAL_SYSTEM_PRINCIPAL_ID,
+    ) -> dict[str, Any]:
+        """Host-local transport for one isolated NPC worker activation."""
+
+        if principal_id != LOCAL_SYSTEM_PRINCIPAL_ID:
+            raise PermissionError("NPC conversation worker transport is local-only")
+        require_dm(campaign_id, principal_id)
+        session = npc_conversations.require_owner(
+            conversation_id,
+            campaign_id=campaign_id,
+            principal_id=principal_id,
+        )
+        npc_conversation_require_fresh(session)
+        common = {
+            "activation_ref": str(data.get("activation_ref") or ""),
+            "expected_revision": int(data["expected_conversation_revision"]),
+            "idempotency_key": str(data.get("idempotency_key") or ""),
+        }
+        if action == "claim_activation":
+            return npc_conversations.checkout(
+                session,
+                cursor=int(data.get("cursor", 0)),
+                include_bootstrap=bool(data.get("include_bootstrap", True)),
+                **common,
+            )
+        if action == "submit_proposal":
+            return npc_conversations.submit(
+                session,
+                lease_id=str(data.get("lease_id") or ""),
+                proposal=dict(data.get("proposal") or {}),
+                **common,
+            )
+        if action == "cancel_activation":
+            return npc_conversations.cancel_activation(
+                session,
+                lease_id=str(data.get("lease_id") or ""),
+                **common,
+            )
+        raise ValueError(f"unsupported NPC worker action: {action}")
 
     @mcp.tool()
     def actor_knowledge_query(
@@ -4628,6 +6179,7 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
         campaign = require_campaign_revision(campaign_id, int(expected_revision))
         if authoritative_phase(campaign_id) != PROFILE_PLAY:
             raise ValueError("chase_start is available only during play")
+        require_no_active_npc_conversation(campaign_id, "starting a chase")
         if dict(campaign.state.get("combat") or {}).get("active"):
             raise ValueError("active combat must end before a chase starts")
         if dict(campaign.state.get("chase") or {}).get("active"):
@@ -4678,7 +6230,17 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
                     "actor_id": actor_id,
                     "name": actor.name,
                     "role": role,
-                    "base_mov": int(sheet["mov"]),
+                    "participant_kind": str(raw.get("participant_kind") or "person"),
+                    "vehicle": (
+                        deepcopy(dict(raw["vehicle"]))
+                        if isinstance(raw.get("vehicle"), dict)
+                        else None
+                    ),
+                    "base_mov": int(
+                        dict(raw.get("vehicle") or {}).get("mov", sheet["mov"])
+                        if str(raw.get("participant_kind") or "person") == "vehicle"
+                        else sheet["mov"]
+                    ),
                     "dex": int(sheet["characteristics"]["dex"]),
                     "position": int(raw.get("position", 0)),
                     "speed_skill_name": skill_name,
@@ -4717,6 +6279,8 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
                         "actor_id": item["actor_id"],
                         "name": item["name"],
                         "role": item["role"],
+                        "participant_kind": item["participant_kind"],
+                        "vehicle": item["vehicle"],
                         "effective_mov": int(outcome["new_mov"]),
                         "dex": item["dex"],
                         "position": item["position"],
@@ -5036,6 +6600,7 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
         campaign = require_campaign_revision(campaign_id, int(expected_revision))
         if authoritative_phase(campaign_id) != PROFILE_PLAY:
             raise ValueError("combat_start is available only during play")
+        require_no_active_npc_conversation(campaign_id, "starting combat")
         if dict(campaign.state.get("chase") or {}).get("active"):
             raise ValueError("active chase must end before combat starts")
         if investigation_ledger(dict(campaign.state))["pending"]:

@@ -49,8 +49,10 @@ PHASE_TOOLS = {
         actor_knowledge_change actor_knowledge_query campaign_change character_change
         branch_change branch_query character_query coc_dice_roll coc_resolve
         campaign_event continuity_context memory_change memory_query state_revision
+        bounded_evaluation
         development_query development_settle
-        content_pack module_change module_draft module_query
+        content_pack inventory_change long_term_change module_change module_draft module_query
+        rule_query rulebook_draft wallet_change
         snapshot_change snapshot_query
         """
     ),
@@ -60,8 +62,10 @@ PHASE_TOOLS = {
         branch_change branch_query character_query coc_dice_roll coc_hp_change
         chase_action chase_end chase_query chase_start coc_resolve coc_sanity_check
         combat_start campaign_event continuity_context memory_change memory_query state_revision
+        bounded_evaluation npc_conversation npc_conversation_worker
         group_luck_check group_luck_query
         investigation_check investigation_query module_change module_query
+        inventory_change rule_query wallet_change
         snapshot_change snapshot_query
         """
     ),
@@ -70,7 +74,8 @@ PHASE_TOOLS = {
         actor_knowledge_query branch_change branch_query character_change character_query
         coc_dice_roll coc_hp_change coc_resolve coc_sanity_check combat_action
         combat_attack combat_end combat_query continuity_context module_query snapshot_change
-        snapshot_query state_revision
+        bounded_evaluation
+        rule_query snapshot_query state_revision
         """
     ),
 }
@@ -79,6 +84,7 @@ PHASE_DM_TOOLS = {
     PROFILE_LOBBY: _names(
         """
         actor_knowledge_change branch_change campaign_event character_change content_pack
+        long_term_change rulebook_draft
         memory_change memory_query
         module_change module_draft snapshot_change snapshot_query state_revision
         """
@@ -88,6 +94,7 @@ PHASE_DM_TOOLS = {
         actor_knowledge_change branch_change campaign_change campaign_event memory_change
         memory_query module_change
         chase_end chase_start combat_start group_luck_check group_luck_query
+        npc_conversation npc_conversation_worker
         snapshot_change snapshot_query state_revision
         """
     ),
@@ -97,7 +104,7 @@ PHASE_DM_TOOLS = {
 }
 
 NO_CAMPAIGN_TOOLS = frozenset({"campaign_change"})
-LOCAL_ONLY_TOOLS = frozenset()
+LOCAL_ONLY_TOOLS = frozenset({"npc_conversation_worker"})
 
 
 @dataclass(frozen=True)

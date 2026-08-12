@@ -68,6 +68,10 @@ class McpConfig:
         return self.home / "artifacts" / "modules"
 
     @property
+    def rules_dir(self) -> Path:
+        return self.home / "artifacts" / "rules"
+
+    @property
     def content_packages_dir(self) -> Path:
         return self.home / "artifacts" / "content-packages"
 
@@ -79,12 +83,23 @@ class McpConfig:
     def normalized_modules_dir(self) -> Path:
         return self.home / "artifacts" / "normalized-modules"
 
+    @property
+    def normalized_rules_dir(self) -> Path:
+        return self.home / "artifacts" / "normalized-rules"
+
+    @property
+    def npc_conversations_dir(self) -> Path:
+        return self.home / "runtime" / "npc-conversations"
+
     def prepare(self) -> None:
         for directory in (
             self.database_path.parent,
             self.modules_dir,
+            self.rules_dir,
             self.content_packages_dir,
             self.module_assets_dir,
             self.normalized_modules_dir,
+            self.normalized_rules_dir,
+            self.npc_conversations_dir,
         ):
             directory.mkdir(parents=True, exist_ok=True)

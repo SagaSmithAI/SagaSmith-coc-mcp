@@ -34,6 +34,7 @@ class SagaSmithStorage:
                 "exists": self.config.database_path.exists(),
             },
             "modules_dir": str(self.config.modules_dir),
+            "rules_dir": str(self.config.rules_dir),
             "content_packages_dir": str(self.config.content_packages_dir),
         }
 
@@ -72,6 +73,45 @@ class SagaSmithStorage:
         elif target.read_bytes() != encoded:
             raise RuntimeError("managed module artifact checksum mismatch")
         return {"artifact": artifact, "path": str(target), "checksum": checksum}
+
+    def stage_rule(self, source_path: str | Path) -> dict[str, Any]:
+        """Copy one allowlisted rule source into content-addressed MCP storage."""
+
+        source = Path(source_path).expanduser().resolve()
+        if not source.is_file():
+            raise LookupError(str(source))
+        if source.suffix.casefold() not in {".pdf", ".md", ".markdown", ".txt"}:
+            raise ValueError("rule source must be PDF, Markdown, or text")
+        if not self.config.module_import_roots or not any(
+            source.is_relative_to(root.resolve()) for root in self.config.module_import_roots
+        ):
+            raise PermissionError("rule source is outside configured import roots")
+        if source.stat().st_size > 100 * 1024 * 1024:
+            raise ValueError("rule source exceeds the 100 MiB safety limit")
+        checksum = file_sha256(source)
+        safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", source.name).strip("-.")
+        artifact = f"{checksum[:12]}-{safe_name or 'rules' + source.suffix.casefold()}"
+        target = (self.config.rules_dir / artifact).resolve()
+        if target.parent != self.config.rules_dir.resolve():
+            raise ValueError("invalid rule artifact")
+        if not target.exists():
+            shutil.copy2(source, target)
+        elif file_sha256(target) != checksum:
+            raise RuntimeError("managed rule artifact checksum mismatch")
+        return {"artifact": artifact, "path": str(target), "checksum": checksum}
+
+    def artifact_rule_path(self, name: str) -> Path:
+        target = (self.config.rules_dir / name).resolve()
+        if target.parent != self.config.rules_dir.resolve() or target.suffix.casefold() not in {
+            ".pdf",
+            ".md",
+            ".markdown",
+            ".txt",
+        }:
+            raise ValueError("invalid managed rule artifact")
+        if not target.is_file():
+            raise LookupError(name)
+        return target
 
     def stage_module(self, source_path: str | Path) -> dict[str, Any]:
         """Copy an allowlisted source into content-addressed MCP storage."""
@@ -259,9 +299,11 @@ class SagaSmithStorage:
         target = Path(source_path).expanduser().resolve()
         roots = (
             self.config.modules_dir.resolve(),
+            self.config.rules_dir.resolve(),
             self.config.module_assets_dir.resolve(),
             self.config.content_packages_dir.resolve(),
             self.config.normalized_modules_dir.resolve(),
+            self.config.normalized_rules_dir.resolve(),
         )
         if not any(target.is_relative_to(root) for root in roots):
             raise PermissionError("module asset is outside MCP-managed storage")
