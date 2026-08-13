@@ -19,10 +19,17 @@ dependencies = [
 
 [project.optional-dependencies]
 dense = ["sentence-transformers>=5.0.0,<6.0.0", "chromadb>=0.6.0,<1.0.0"]
-dev = ["pytest>=9.0.0,<10.0.0", "ruff>=0.1.0"]
+gateway = ["aiohttp>=3.11.0,<4.0.0"]
+dev = [
+    "aiohttp>=3.11.0,<4.0.0",
+    "pytest>=9.0.0,<10.0.0",
+    "pytest-asyncio>=1.0.0,<2.0.0",
+    "ruff>=0.1.0",
+]
 
 [project.scripts]
 sagasmith-coc-mcp = "sagasmith_coc_mcp.server:main"
+sagasmith-coc-gateway = "sagasmith_coc_mcp.gateway:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/sagasmith_coc_mcp"]
@@ -30,6 +37,7 @@ packages = ["src/sagasmith_coc_mcp"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+asyncio_mode = "auto"
 
 [tool.ruff]
 line-length = 100

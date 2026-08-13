@@ -97,6 +97,24 @@ pip install -e .
 sagasmith-coc-mcp
 ```
 
+The unified local stack runs the authority over streamable HTTP and serves the
+Workbench through a sticky-session gateway:
+
+```powershell
+$env:SAGASMITH_COC_MCP_TRANSPORT = "streamable-http"
+$env:SAGASMITH_COC_MCP_HTTP_PORT = "8769"
+sagasmith-coc-mcp
+
+# another terminal
+$env:SAGASMITH_COC_MCP_URL = "http://127.0.0.1:8769/mcp"
+$env:SAGASMITH_COC_GATEWAY_PORT = "8768"
+sagasmith-coc-gateway
+```
+
+The browser never submits a principal. The gateway binds identity server-side,
+keeps an MCP session sticky per browser/campaign, and refreshes the native list
+after `tools/list_changed`.
+
 State defaults to `.sagasmith-coc-mcp/`. The main configuration variables are:
 
 - `SAGASMITH_COC_MCP_HOME`

@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import importlib
 import json
+import os
 import re
 import time
 from copy import deepcopy
@@ -340,6 +341,9 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
         phase_lookup=authoritative_phase,
         scope_validator=validate_scope,
         bound_principal_id=config.bound_principal_id,
+        host=config.http_host,
+        port=config.http_port,
+        streamable_http_path=config.http_path,
     )
 
     def visible_character(character: Any, principal_id: str) -> dict[str, Any]:
@@ -7442,7 +7446,12 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
 
 
 def main() -> None:
-    create_server().run(transport="stdio")
+    transport = os.environ.get("SAGASMITH_COC_MCP_TRANSPORT", "stdio").strip().casefold()
+    if transport not in {"stdio", "streamable-http"}:
+        raise ValueError(
+            "SAGASMITH_COC_MCP_TRANSPORT must be 'stdio' or 'streamable-http'"
+        )
+    create_server(McpConfig.from_environment()).run(transport=transport)
 
 
 if __name__ == "__main__":

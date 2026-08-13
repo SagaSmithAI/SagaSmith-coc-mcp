@@ -94,6 +94,22 @@ pip install -e .
 sagasmith-coc-mcp
 ```
 
+统一本地栈使用 streamable HTTP 权威服务与粘性会话 Workbench gateway：
+
+```powershell
+$env:SAGASMITH_COC_MCP_TRANSPORT = "streamable-http"
+$env:SAGASMITH_COC_MCP_HTTP_PORT = "8769"
+sagasmith-coc-mcp
+
+# 另一个终端
+$env:SAGASMITH_COC_MCP_URL = "http://127.0.0.1:8769/mcp"
+$env:SAGASMITH_COC_GATEWAY_PORT = "8768"
+sagasmith-coc-gateway
+```
+
+浏览器不能提交 principal。Gateway 在服务端绑定身份，为每个浏览器/战役保留独立
+MCP session，并在 `tools/list_changed` 后刷新真实原生工具列表。
+
 状态默认位于 `.sagasmith-coc-mcp/`。主要配置项：
 
 - `SAGASMITH_COC_MCP_HOME`

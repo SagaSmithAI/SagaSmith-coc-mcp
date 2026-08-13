@@ -19,6 +19,9 @@ class McpConfig:
     modulegen_skills_dir: Path
     bound_principal_id: str | None = None
     module_import_roots: tuple[Path, ...] = ()
+    http_host: str = "127.0.0.1"
+    http_port: int = 8769
+    http_path: str = "/mcp"
 
     @classmethod
     def from_environment(cls) -> "McpConfig":
@@ -57,6 +60,9 @@ class McpConfig:
                 else None
             ),
             module_import_roots=tuple(path.resolve() for path in module_roots),
+            http_host=os.environ.get("SAGASMITH_COC_MCP_HTTP_HOST", "127.0.0.1"),
+            http_port=int(os.environ.get("SAGASMITH_COC_MCP_HTTP_PORT", "8769")),
+            http_path=os.environ.get("SAGASMITH_COC_MCP_HTTP_PATH", "/mcp"),
         )
 
     @property
