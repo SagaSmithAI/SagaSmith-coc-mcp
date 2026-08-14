@@ -12,7 +12,7 @@ from mcp.client.stdio import StdioServerParameters, stdio_client
 from pypdf import PdfWriter
 from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 from sagasmith_coc.random_stream import initial_random_stream
-from sagasmith_core import Database, ModuleService
+from sagasmith_core import CharacterService, Database, ModuleService
 from sagasmith_core.database import sqlite_database_url
 from sagasmith_core.models import CampaignSnapshot
 
@@ -414,9 +414,7 @@ def test_coc_mcp_persists_campaign_modules_and_actor_knowledge(tmp_path) -> None
                 "principal_id": "player:alice",
             },
         )
-        assert [scene["title"] for scene in player_scenes["scenes"]] == [
-            "Handout: Public Notice"
-        ]
+        assert [scene["title"] for scene in player_scenes["scenes"]] == ["Handout: Public Notice"]
         check = await call(
             server,
             "coc_resolve",
@@ -1035,7 +1033,13 @@ def test_module_draft_content_asset_and_actor_edits_enter_final_pack(tmp_path, m
             "idempotency_key": "recovered-pack-import",
         }
         original_bind = ModuleService.bind_actor
+        original_import_actor = CharacterService.import_content_actor
         interrupted = False
+        imported_asset_maps: list[dict] = []
+
+        def capture_package_assets(self, actor, **kwargs):
+            imported_asset_maps.append(dict(kwargs.get("assets_by_key") or {}))
+            return original_import_actor(self, actor, **kwargs)
 
         def interrupt_after_binding(self, *args, **kwargs):
             nonlocal interrupted
@@ -1045,11 +1049,27 @@ def test_module_draft_content_asset_and_actor_edits_enter_final_pack(tmp_path, m
                 raise RuntimeError("simulated interruption after actor binding")
             return result
 
+        monkeypatch.setattr(CharacterService, "import_content_actor", capture_package_assets)
         monkeypatch.setattr(ModuleService, "bind_actor", interrupt_after_binding)
         with pytest.raises(Exception, match="simulated interruption"):
             await call(server, "content_pack", import_args)
+        assert await call(
+            server,
+            "content_pack",
+            {"action": "list", "campaign_id": target["id"]},
+        ) == {"packs": [], "finalized_drafts": [], "rule_packs": []}
+        assert await call(
+            server,
+            "character_query",
+            {"action": "list", "campaign_id": target["id"]},
+        ) == {"characters": []}
         monkeypatch.setattr(ModuleService, "bind_actor", original_bind)
         imported = await call(server, "content_pack", import_args)
+        assert imported_asset_maps
+        assert all(
+            any(asset["kind"] == "handout" for asset in assets.values())
+            for assets in imported_asset_maps
+        )
         assert await call(server, "content_pack", import_args) == imported
         target_modules = await call(
             server,
@@ -1075,9 +1095,7 @@ def test_module_draft_content_asset_and_actor_edits_enter_final_pack(tmp_path, m
                 },
             },
         )
-        assert instantiated["template_id"] == imported["actor_map"][
-            "coc7e.actor.harriet-vane"
-        ]
+        assert instantiated["template_id"] == imported["actor_map"]["coc7e.actor.harriet-vane"]
         assert instantiated["campaign_id"] == target["id"]
         assert instantiated["sheet"]["skills"]["Spot Hidden"] == 65
         target_characters = await call(
@@ -2556,8 +2574,7 @@ def test_stdio_client_can_discover_load_and_call(tmp_path) -> None:
                 )
                 assert not listed_skills.isError
                 skill_ids = {
-                    item["id"]
-                    for item in json.loads(listed_skills.content[0].text)["skills"]
+                    item["id"] for item in json.loads(listed_skills.content[0].text)["skills"]
                 }
                 assert {
                     "coc.full",
@@ -2650,9 +2667,7 @@ def test_stdio_client_can_discover_load_and_call(tmp_path) -> None:
                     {"campaign_id": campaign_id, "actor_id": investigator["id"]},
                 )
                 assert not pending_development.isError
-                pending_development_value = json.loads(
-                    pending_development.content[0].text
-                )
+                pending_development_value = json.loads(pending_development.content[0].text)
                 settled_development = await session.call_tool(
                     "development_settle",
                     {
@@ -2667,9 +2682,7 @@ def test_stdio_client_can_discover_load_and_call(tmp_path) -> None:
                     },
                 )
                 assert not settled_development.isError
-                settled_development_value = json.loads(
-                    settled_development.content[0].text
-                )
+                settled_development_value = json.loads(settled_development.content[0].text)
                 investigator["revision"] = settled_development_value["character_revision"]
                 cultist_result = await session.call_tool(
                     "character_change",
@@ -2766,9 +2779,9 @@ def test_stdio_client_can_discover_load_and_call(tmp_path) -> None:
                     },
                 )
                 assert not group_luck_result.isError
-                play_value["revision"] = json.loads(
-                    group_luck_result.content[0].text
-                )["campaign_revision"]
+                play_value["revision"] = json.loads(group_luck_result.content[0].text)[
+                    "campaign_revision"
+                ]
                 opened_check_result = await session.call_tool(
                     "investigation_check",
                     {
@@ -2793,8 +2806,9 @@ def test_stdio_client_can_discover_load_and_call(tmp_path) -> None:
                     {"campaign_id": campaign_id, "actor_id": investigator["id"]},
                 )
                 assert not queried_check.isError
-                assert json.loads(queried_check.content[0].text)["pending"]["id"] == (
-                    opened_check["pending"]["id"]
+                assert (
+                    json.loads(queried_check.content[0].text)["pending"]["id"]
+                    == (opened_check["pending"]["id"])
                 )
                 settled_check_result = await session.call_tool(
                     "investigation_check",

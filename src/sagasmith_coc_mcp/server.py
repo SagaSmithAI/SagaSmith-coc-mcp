@@ -779,9 +779,7 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
                 + ", ".join(active)
             )
 
-    def readable_branch_id(
-        campaign_id: str, branch_id: str | None, principal_id: str
-    ) -> str:
+    def readable_branch_id(campaign_id: str, branch_id: str | None, principal_id: str) -> str:
         """Players may read only the checked-out timeline."""
 
         current = current_branch_id(campaign_id)
@@ -1176,9 +1174,7 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
                 campaign_id=campaign_id,
                 name=(str(data["name"]) if data.get("name") is not None else None),
                 player_name=(
-                    str(data["player_name"])
-                    if data.get("player_name") is not None
-                    else None
+                    str(data["player_name"]) if data.get("player_name") is not None else None
                 ),
                 sheet=validate_investigator_sheet(dict(template.sheet)),
             )
@@ -2901,8 +2897,7 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
         )
         return {"job": import_job_view(updated), **public_finalized}
 
-    @mcp.tool()
-    def content_pack(
+    def _content_pack(
         action: Literal["list", "get", "import", "export", "activate", "deactivate", "remove"],
         campaign_id: str,
         data: dict[str, Any] | None = None,
@@ -2995,8 +2990,9 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
             if package["kind"] not in {"module", "core_rules"} or package["system_id"] != "coc7e":
                 raise ValueError("content package must be a coc7e module or core_rules Pack")
             managed = storage.write_content_archive(package, blobs)
+            assets_by_key = {str(item["asset_key"]): item for item in package["assets"]}
             if package["kind"] == "core_rules":
-                assets = {str(item["asset_key"]): item for item in package["assets"]}
+                assets = assets_by_key
                 source_map: dict[str, str] = {}
                 existing_sources = {
                     str(item["source_key"]): item for item in rules.sources(system_id="coc7e")
@@ -3102,6 +3098,7 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
                 character = characters.import_content_actor(
                     actor,
                     campaign_id=None if preset else campaign_id,
+                    assets_by_key=assets_by_key,
                     principal_id=principal_id,
                     idempotency_key=f"{key}:actor:{actor['id']}",
                 )
@@ -3312,6 +3309,30 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
         raise ValueError(f"unsupported content_pack action: {action}")
 
     @mcp.tool()
+    def content_pack(
+        action: Literal["list", "get", "import", "export", "activate", "deactivate", "remove"],
+        campaign_id: str,
+        data: dict[str, Any] | None = None,
+        expected_revision: int | None = None,
+        idempotency_key: str | None = None,
+        principal_id: str = "system:local",
+    ) -> dict[str, Any]:
+        """Inspect and atomically manage finalized CoC Module and rules Pack archives."""
+
+        arguments = {
+            "action": action,
+            "campaign_id": campaign_id,
+            "data": data,
+            "expected_revision": expected_revision,
+            "idempotency_key": idempotency_key,
+            "principal_id": principal_id,
+        }
+        if action == "import":
+            with storage.database.transaction():
+                return _content_pack(**arguments)
+        return _content_pack(**arguments)
+
+    @mcp.tool()
     def module_query(
         action: Literal["list", "index", "current", "progress", "search"],
         campaign_id: str,
@@ -3329,9 +3350,7 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
                 "scenes": values
                 if keeper
                 else [
-                    item
-                    for item in values
-                    if item["visibility"] in PLAYER_MODULE_VISIBILITY_SCOPES
+                    item for item in values if item["visibility"] in PLAYER_MODULE_VISIBILITY_SCOPES
                 ]
             }
         if action == "current":
@@ -3367,8 +3386,7 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
             else [
                 item
                 for item in values
-                if item.get("metadata", {}).get("visibility")
-                in PLAYER_MODULE_VISIBILITY_SCOPES
+                if item.get("metadata", {}).get("visibility") in PLAYER_MODULE_VISIBILITY_SCOPES
             ]
         }
 
@@ -3576,13 +3594,9 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
                     fact_key=str(data.get("fact_key") or ""),
                     content=content,
                     kind=(str(data["kind"]) if data.get("kind") is not None else None),
-                    subject=(
-                        str(data["subject"]) if data.get("subject") is not None else None
-                    ),
+                    subject=(str(data["subject"]) if data.get("subject") is not None else None),
                     subject_ref=(
-                        str(data["subject_ref"])
-                        if data.get("subject_ref") is not None
-                        else None
+                        str(data["subject_ref"]) if data.get("subject_ref") is not None else None
                     ),
                     predicate=(
                         str(data["predicate"]) if data.get("predicate") is not None else None
@@ -3663,9 +3677,7 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
         participants = data.get("participants") or []
         known_by_actor_ids = [str(item) for item in data.get("known_by_actor_ids") or []]
         if audience_scope == "actor" and not participants and not known_by_actor_ids:
-            raise ValueError(
-                "actor-scoped events require participants or known_by_actor_ids"
-            )
+            raise ValueError("actor-scoped events require participants or known_by_actor_ids")
         if known_by_actor_ids and (
             not str(data.get("knowledge_key") or "").strip()
             or not str(data.get("knowledge_proposition") or "").strip()
@@ -3682,9 +3694,7 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
             "known_by_actor_ids": known_by_actor_ids,
             "knowledge_key": data.get("knowledge_key"),
             "knowledge_proposition": data.get("knowledge_proposition"),
-            "knowledge_disclosure_scope": str(
-                data.get("knowledge_disclosure_scope") or "owner"
-            ),
+            "knowledge_disclosure_scope": str(data.get("knowledge_disclosure_scope") or "owner"),
             "branch_id": branch_id,
         }
         scope = f"campaign-event:{campaign_id}:{branch_id}:{principal_id}"
@@ -4080,19 +4090,14 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
             session["updated_at_ns"] = time.time_ns()
             npc_conversations.save(session)
             raise ValueError(
-                "SESSION_STALE: authoritative state changed: "
-                + ", ".join(session["stale_reasons"])
+                "SESSION_STALE: authoritative state changed: " + ", ".join(session["stale_reasons"])
             )
 
     def npc_conversation_status(session: dict[str, Any]) -> dict[str, Any]:
         result = npc_conversations.public_status(session)
         result["activations"] = npc_conversations.list_activations(session)
         result["pending_publications"] = [
-            {
-                key: deepcopy(value)
-                for key, value in item.items()
-                if key not in {"speaker_actor_id"}
-            }
+            {key: deepcopy(value) for key, value in item.items() if key not in {"speaker_actor_id"}}
             for item in session.get("publications") or []
             if item.get("status") == "pending_audience"
         ]
@@ -4103,9 +4108,7 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
         ]
         result["listener_knowledge_candidates"] = {
             actor_id: deepcopy(values)
-            for actor_id, values in dict(
-                session.get("listener_knowledge_candidates") or {}
-            ).items()
+            for actor_id, values in dict(session.get("listener_knowledge_candidates") or {}).items()
             if values
         }
         if session.get("status") == "stale":
@@ -4140,18 +4143,15 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
         if replay is not None:
             return replay
         if any(
-            item.get("status") in {"pending", "claimed"}
-            for item in session["activations"].values()
+            item.get("status") in {"pending", "claimed"} for item in session["activations"].values()
         ):
             raise ValueError("conversation has unfinished NPC activations")
         if any(
-            item.get("status") == "pending_audience"
-            for item in session.get("publications") or []
+            item.get("status") == "pending_audience" for item in session.get("publications") or []
         ):
             raise ValueError("conversation has unpublished NPC output")
         if any(
-            item.get("status") == "pending"
-            for item in session.get("pending_resolutions") or []
+            item.get("status") == "pending" for item in session.get("pending_resolutions") or []
         ):
             raise ValueError("conversation has unresolved mechanic requests")
         if unknown := set(accepted) - set(session["participant_ids"]):
@@ -4187,9 +4187,7 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
             actor_knowledge.extend(
                 selected_indexes(
                     list(
-                        dict(session.get("listener_knowledge_candidates") or {}).get(
-                            actor_id, []
-                        )
+                        dict(session.get("listener_knowledge_candidates") or {}).get(actor_id, [])
                     ),
                     selection.get("listener_knowledge_indexes") or [],
                     "listener_knowledge_indexes",
@@ -4203,9 +4201,7 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
                 facts.append(
                     {
                         "action": "upsert",
-                        "fact_key": (
-                            f"actor:{actor_id}:commitment:{commitment['commitment_key']}"
-                        ),
+                        "fact_key": (f"actor:{actor_id}:commitment:{commitment['commitment_key']}"),
                         "content": str(commitment["content"]),
                         "kind": "actor_state",
                         "subject": actor_id,
@@ -4268,13 +4264,11 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
         event = {
             "event_type": "npc_conversation",
             "summary": (
-                f"Conversation among {', '.join(names.values())}; "
-                f"{len(transcript)} public events."
+                f"Conversation among {', '.join(names.values())}; {len(transcript)} public events."
             ),
             "audience_scope": "dm",
             "participants": [
-                {"actor_id": actor_id, "role": "witness"}
-                for actor_id in session["participant_ids"]
+                {"actor_id": actor_id, "role": "witness"} for actor_id in session["participant_ids"]
             ],
             "payload": {
                 "schema_version": 1,
@@ -4359,9 +4353,7 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
             if any(item.campaign_id != campaign_id for item in actors):
                 raise ValueError("all conversation participants must belong to campaign")
             npc_actors = [
-                item
-                for item in actors
-                if item.character_type in {"npc", "creature", "monster"}
+                item for item in actors if item.character_type in {"npc", "creature", "monster"}
             ]
             if not npc_actors:
                 raise ValueError("conversation requires at least one NPC or creature")
@@ -4794,8 +4786,7 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
                 payload=payload,
                 response=lambda value: {
                     "branch": asdict(value["branch"]),
-                    "campaign_revision": int(expected_revision)
-                    + int(branch_id != branch_guard),
+                    "campaign_revision": int(expected_revision) + int(branch_id != branch_guard),
                     "snapshot": (
                         asdict(value["snapshot"]) if value["snapshot"] is not None else None
                     ),
@@ -5641,15 +5632,11 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
             if "push" not in investigation_actions(campaign, pending):
                 raise ValueError("the pending check cannot be pushed")
             justification = " ".join(str(data.get("justification") or "").split()).strip()
-            consequence = " ".join(
-                str(data.get("failure_consequence") or "").split()
-            ).strip()
+            consequence = " ".join(str(data.get("failure_consequence") or "").split()).strip()
             if not justification or len(justification) > 500:
                 raise ValueError("data.justification must contain 1 to 500 characters")
             if not consequence or len(consequence) > 500:
-                raise ValueError(
-                    "data.failure_consequence must contain 1 to 500 characters"
-                )
+                raise ValueError("data.failure_consequence must contain 1 to 500 characters")
             bonus_dice = int(data.get("bonus_dice", pending["bonus_dice"]))
             penalty_dice = int(data.get("penalty_dice", pending["penalty_dice"]))
             stream = CampaignRandomStream.from_campaign_state(
@@ -5666,9 +5653,9 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
                         data.get("traits", pending["traits"]),
                         default_difficulty=str(data.get("difficulty") or "regular"),
                     )
-                    requirement = str(
-                        data.get("requirement") or pending["requirement"]
-                    ).strip().casefold()
+                    requirement = (
+                        str(data.get("requirement") or pending["requirement"]).strip().casefold()
+                    )
                     outcome = resolve_combined_check(
                         int(roll["total"]),
                         traits,
@@ -7448,9 +7435,7 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
 def main() -> None:
     transport = os.environ.get("SAGASMITH_COC_MCP_TRANSPORT", "stdio").strip().casefold()
     if transport not in {"stdio", "streamable-http"}:
-        raise ValueError(
-            "SAGASMITH_COC_MCP_TRANSPORT must be 'stdio' or 'streamable-http'"
-        )
+        raise ValueError("SAGASMITH_COC_MCP_TRANSPORT must be 'stdio' or 'streamable-http'")
     create_server(McpConfig.from_environment()).run(transport=transport)
 
 
