@@ -14,14 +14,16 @@ import os
 import secrets
 import threading
 import time
+import zlib
+from base64 import b64decode, b64encode
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-NPC_CONVERSATION_SCHEMA_VERSION = 2
+NPC_CONVERSATION_SCHEMA_VERSION = 3
 NPC_CONVERSATION_PROPOSAL_SCHEMA_VERSION = 4
-NPC_CONVERSATION_CONTRACT = "npc-conversation.v2"
+NPC_CONVERSATION_CONTRACT = "npc-conversation.v3"
 
 NPC_RESOLUTION_KINDS = frozenset(
     {
@@ -35,6 +37,10 @@ NPC_RESOLUTION_KINDS = frozenset(
     }
 )
 ACTIVE_CONVERSATION_STATUSES = frozenset({"open", "stale"})
+MAX_CONVERSATION_EVENTS = 200
+MAX_ACTIVE_JOURNAL_BYTES = 4 * 1024 * 1024
+TERMINAL_RECEIPT_RETENTION_NS = 30 * 24 * 60 * 60 * 1_000_000_000
+TERMINAL_RESULT_CODEC = "zlib-json-v1"
 
 
 def _object(value: Any, field: str) -> dict[str, Any]:
@@ -434,6 +440,7 @@ class ConversationStore:
         self.lease_ttl_s = max(10, int(lease_ttl_s))
         self._lock = threading.RLock()
         self._secret = self._load_secret()
+        self.cleanup_terminal_receipts()
 
     def _load_secret(self) -> bytes:
         path = self.root / ".capability-key"
@@ -457,6 +464,13 @@ class ConversationStore:
         path = self._path(str(session["conversation_id"]))
         temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
         encoded = json.dumps(session, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        if (
+            session.get("status") in ACTIVE_CONVERSATION_STATUSES
+            and len(encoded.encode("utf-8")) > MAX_ACTIVE_JOURNAL_BYTES
+        ):
+            raise ValueError(
+                "conversation journal exceeds 4194304 bytes; close or abort the conversation"
+            )
         with temporary.open("w", encoding="utf-8", newline="\n") as handle:
             handle.write(encoded)
             handle.flush()
@@ -479,6 +493,102 @@ class ConversationStore:
                 continue
             if self._is_current_session(value):
                 yield value
+
+    def cleanup_terminal_receipts(self, *, now_ns: int | None = None) -> int:
+        cutoff = int(now_ns if now_ns is not None else time.time_ns())
+        removed = 0
+        with self._lock:
+            for path in self.root.glob("*.json"):
+                try:
+                    value = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if (
+                    isinstance(value, dict)
+                    and str(value.get("contract") or "").startswith("npc-conversation.v")
+                    and not self._is_current_session(value)
+                ):
+                    path.unlink()
+                    removed += 1
+                    continue
+                if (
+                    self._is_current_session(value)
+                    and value.get("status") in {"closed", "aborted"}
+                    and cutoff - int(value.get("updated_at_ns") or 0)
+                    > TERMINAL_RECEIPT_RETENTION_NS
+                ):
+                    path.unlink()
+                    removed += 1
+        return removed
+
+    @staticmethod
+    def _encode_terminal_result(result: dict[str, Any]) -> str:
+        raw = json.dumps(
+            result,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return b64encode(zlib.compress(raw)).decode("ascii")
+
+    @staticmethod
+    def _decode_idempotency_result(entry: dict[str, Any]) -> dict[str, Any]:
+        if entry.get("result_codec") == TERMINAL_RESULT_CODEC:
+            raw = zlib.decompress(b64decode(str(entry["compressed_result"])))
+            value = json.loads(raw.decode("utf-8"))
+            if not isinstance(value, dict):
+                raise RuntimeError("terminal conversation result is invalid")
+            return value
+        return deepcopy(entry["result"])
+
+    @staticmethod
+    def _compact_terminal_session(
+        session: dict[str, Any],
+        *,
+        terminal_key: str,
+        fingerprint: str,
+        result: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            key: deepcopy(session[key])
+            for key in (
+                "schema_version",
+                "contract",
+                "conversation_id",
+                "campaign_id",
+                "branch_id",
+                "principal_id",
+                "scope_id",
+                "scene_id",
+                "status",
+                "conversation_revision",
+                "created_at_ns",
+                "updated_at_ns",
+                "authority",
+                "participants",
+                "participant_ids",
+                "open_idempotency_key",
+                "open_fingerprint",
+            )
+        } | {
+            "actor_runtimes": {},
+            "events": [],
+            "activations": {},
+            "publications": [],
+            "pending_resolutions": [],
+            "memory_candidates": [],
+            "audience_decision_ids": [],
+            "terminal_receipt": {
+                "event_id": str(dict(result.get("event") or {}).get("id") or ""),
+            },
+            "idempotency": {
+                terminal_key: {
+                    "fingerprint": fingerprint,
+                    "result_codec": TERMINAL_RESULT_CODEC,
+                    "compressed_result": ConversationStore._encode_terminal_result(result),
+                }
+            },
+        }
 
     def get(self, conversation_id: str) -> dict[str, Any]:
         with self._lock:
@@ -553,7 +663,7 @@ class ConversationStore:
             if prior is not None:
                 if prior.get("fingerprint") != fingerprint:
                     raise ValueError("idempotency_key was already used with another payload")
-                return session, deepcopy(prior["result"])
+                return session, self._decode_idempotency_result(prior)
             if int(session.get("conversation_revision") or 0) != int(expected_revision):
                 raise ValueError(
                     "CONVERSATION_REVISION_CONFLICT: expected "
@@ -584,8 +694,131 @@ class ConversationStore:
                 "fingerprint": str(pending["fingerprint"]),
                 "result": deepcopy(result),
             }
+            if session.get("status") in {"closed", "aborted"}:
+                session = self._compact_terminal_session(
+                    session,
+                    terminal_key=str(pending["key"]),
+                    fingerprint=str(pending["fingerprint"]),
+                    result=result,
+                )
             self._write(session)
             return result
+
+    @staticmethod
+    def _candidate_status(session: dict[str, Any], candidate: dict[str, Any]) -> str:
+        if candidate.get("status") == "invalidated":
+            return "invalidated"
+        publication_id = str(candidate.get("source_publication_id") or "")
+        if publication_id:
+            publication = next(
+                (
+                    item
+                    for item in session.get("publications") or []
+                    if str(item.get("publication_id") or "") == publication_id
+                ),
+                None,
+            )
+            if publication is None or publication.get("status") != "published":
+                return "pending_publication"
+        activation_id = str(candidate.get("source_activation_id") or "")
+        if activation_id and any(
+            str(item.get("activation_id") or "") == activation_id
+            and item.get("status") == "pending"
+            for item in session.get("pending_resolutions") or []
+        ):
+            return "pending_resolution"
+        return "available"
+
+    @classmethod
+    def memory_candidates(
+        cls,
+        session: dict[str, Any],
+        *,
+        actor_id: str | None = None,
+        include_invalidated: bool = False,
+    ) -> list[dict[str, Any]]:
+        result = []
+        for raw in session.get("memory_candidates") or []:
+            if actor_id is not None and str(raw.get("actor_id") or "") != actor_id:
+                continue
+            status = cls._candidate_status(session, raw)
+            if status == "invalidated" and not include_invalidated:
+                continue
+            result.append(
+                {
+                    **deepcopy(raw),
+                    "status": status,
+                }
+            )
+        return result
+
+    @staticmethod
+    def _append_memory_candidate(
+        session: dict[str, Any],
+        *,
+        actor_id: str,
+        kind: str,
+        value: dict[str, Any],
+        source_activation_id: str = "",
+        source_publication_id: str = "",
+        source_event_id: str = "",
+    ) -> dict[str, Any]:
+        candidate = {
+            "candidate_id": str(uuid4()),
+            "actor_id": actor_id,
+            "kind": kind,
+            "value": deepcopy(value),
+            "source_activation_id": source_activation_id,
+            "source_publication_id": source_publication_id,
+            "source_event_id": source_event_id,
+            "status": "proposed",
+        }
+        session.setdefault("memory_candidates", []).append(candidate)
+        return candidate
+
+    @classmethod
+    def _append_heard_statement_candidates(
+        cls,
+        session: dict[str, Any],
+        *,
+        event: dict[str, Any],
+        segments: list[dict[str, Any]],
+        segment_audience_facts: list[dict[str, Any]],
+        source_publication_id: str = "",
+    ) -> None:
+        speaker_id = str(event.get("speaker_actor_id") or "")
+        for index, (segment, facts) in enumerate(
+            zip(segments, segment_audience_facts, strict=True)
+        ):
+            for actor_id in facts["understood_actor_ids"]:
+                if actor_id == speaker_id:
+                    continue
+                cls._append_memory_candidate(
+                    session,
+                    actor_id=actor_id,
+                    kind="actor_knowledge",
+                    value={
+                        "action": "add",
+                        "actor_id": actor_id,
+                        "knowledge_key": (
+                            f"conversation:{session['conversation_id']}:event:"
+                            f"{event['event_id']}:segment:{index}"
+                        ),
+                        "proposition": f"{speaker_id} said: {segment['text']}",
+                        "subject_ref": f"actor:{speaker_id}",
+                        "epistemic_status": "known",
+                        "confidence": 3,
+                        "cause": event["event_id"],
+                        "disclosure_scope": "owner",
+                        "metadata": {
+                            "claim_kind": "heard_statement",
+                            "audience_decision_id": facts["decision_id"],
+                            "statement_truth_not_implied": True,
+                        },
+                    },
+                    source_publication_id=source_publication_id,
+                    source_event_id=str(event["event_id"]),
+                )
 
     def open(
         self,
@@ -644,12 +877,7 @@ class ConversationStore:
                     "inbox_cursor": 0,
                     "working_state_revision": 0,
                     "context": deepcopy(context),
-                    "working_deltas": {
-                        "facts": [],
-                        "actor_knowledge": [],
-                        "commitments": [],
-                    },
-                }
+                    }
             session = {
                 "schema_version": NPC_CONVERSATION_SCHEMA_VERSION,
                 "contract": NPC_CONVERSATION_CONTRACT,
@@ -671,7 +899,7 @@ class ConversationStore:
                 "activations": {},
                 "publications": [],
                 "pending_resolutions": [],
-                "listener_knowledge_candidates": {actor_id: [] for actor_id in participant_ids},
+                "memory_candidates": [],
                 "audience_decision_ids": [],
                 "idempotency": {},
                 "open_idempotency_key": idempotency_key,
@@ -751,6 +979,8 @@ class ConversationStore:
             return replay
         if session["status"] != "open":
             raise ValueError(f"conversation is not open: {session['status']}")
+        if len(session["events"]) >= MAX_CONVERSATION_EVENTS:
+            raise ValueError("conversation has reached its 200-event limit; close or abort it")
         decision_id = str(audience_facts["decision_id"])
         if decision_id in session["audience_decision_ids"]:
             raise ValueError("audience_facts.decision_id must be unique in the conversation")
@@ -776,6 +1006,24 @@ class ConversationStore:
             resolution["resolution_event_id"] = saved["event_id"]
         session["events"].append(saved)
         session["audience_decision_ids"].append(decision_id)
+        if saved["type"] == "speech":
+            self._append_heard_statement_candidates(
+                session,
+                event=saved,
+                segments=[{"text": str(saved.get("content") or "")}],
+                segment_audience_facts=[audience_facts],
+            )
+        resolved_activation_ids = {
+            str(resolutions_by_id[resolution_id].get("activation_id") or "")
+            for resolution_id in resolved_ids
+        }
+        for candidate in session.get("memory_candidates") or []:
+            if (
+                str(candidate.get("source_activation_id") or "")
+                in resolved_activation_ids
+                and not candidate.get("source_event_id")
+            ):
+                candidate["source_event_id"] = saved["event_id"]
         activations = []
         for actor_id in audience_facts["response_actor_ids"]:
             runtime = session["actor_runtimes"].get(actor_id)
@@ -941,7 +1189,7 @@ class ConversationStore:
             }
         )
         capsule = {
-            "schema_version": 2,
+            "schema_version": NPC_CONVERSATION_SCHEMA_VERSION,
             "contract": NPC_CONVERSATION_CONTRACT,
             "conversation_id": session["conversation_id"],
             "activation_id": activation["activation_id"],
@@ -958,7 +1206,10 @@ class ConversationStore:
                 "conversation_revision": int(session["conversation_revision"]) + 1,
             },
             "bootstrap": deepcopy(context) if include_bootstrap else None,
-            "working_state": deepcopy(runtime["working_deltas"]),
+            "memory_candidates": self.memory_candidates(
+                session,
+                actor_id=str(activation["actor_id"]),
+            ),
             "inbox": inbox,
             "constraints": {
                 "allowed_basis_refs": allowed_basis_refs,
@@ -1056,9 +1307,23 @@ class ConversationStore:
             for item in proposal["resolution_requests"]
         ]
         session["pending_resolutions"].extend(created_resolutions)
-        for field, values in proposal["working_deltas"].items():
-            runtime["working_deltas"][field].extend(deepcopy(values))
-        if any(proposal["working_deltas"].values()):
+        proposed_candidates = []
+        for kind, values in proposal["working_deltas"].items():
+            candidate_kind = "commitment" if kind == "commitments" else kind.removesuffix("s")
+            for value in values:
+                proposed_candidates.append(
+                    self._append_memory_candidate(
+                        session,
+                        actor_id=str(activation["actor_id"]),
+                        kind=candidate_kind,
+                        value=value,
+                        source_activation_id=str(activation["activation_id"]),
+                        source_publication_id=(
+                            str(publication["publication_id"]) if publication else ""
+                        ),
+                    )
+                )
+        if proposed_candidates:
             runtime["working_state_revision"] += 1
         runtime["inbox_cursor"] = len(session["events"])
         activation["status"] = "completed"
@@ -1069,6 +1334,9 @@ class ConversationStore:
                 "status": "publication_ready" if publication else "resolution_required",
                 "publication": publication,
                 "resolution_requests": deepcopy(created_resolutions),
+                "memory_candidate_ids": [
+                    str(item["candidate_id"]) for item in proposed_candidates
+                ],
             },
         )
 
@@ -1129,6 +1397,8 @@ class ConversationStore:
             raise LookupError(publication_id)
         if publication.get("status") != "pending_audience":
             raise ValueError("publication is not awaiting audience facts")
+        if len(session["events"]) >= MAX_CONVERSATION_EVENTS:
+            raise ValueError("conversation has reached its 200-event limit; close or abort it")
         segments = list(publication.get("utterance_segments") or [])
         segment_facts = list(segment_audience_facts or [])
         if segment_facts and len(segment_facts) != len(segments):
@@ -1174,32 +1444,16 @@ class ConversationStore:
         session["audience_decision_ids"].extend(sorted(decision_ids))
         publication["status"] = "published"
         publication["audience_decision_id"] = str(audience_facts["decision_id"])
-        speaker_id = str(publication["speaker_actor_id"])
-        for index, (segment, facts) in enumerate(zip(segments, segment_facts, strict=True)):
-            for actor_id in facts["understood_actor_ids"]:
-                if actor_id == speaker_id:
-                    continue
-                session["listener_knowledge_candidates"][actor_id].append(
-                    {
-                        "action": "add",
-                        "actor_id": actor_id,
-                        "knowledge_key": (
-                            f"conversation:{session['conversation_id']}:publication:"
-                            f"{publication_id}:segment:{index}"
-                        ),
-                        "proposition": f"{speaker_id} said: {segment['text']}",
-                        "subject_ref": f"actor:{speaker_id}",
-                        "epistemic_status": "known",
-                        "confidence": 3,
-                        "cause": event["event_id"],
-                        "disclosure_scope": "owner",
-                        "metadata": {
-                            "claim_kind": "heard_statement",
-                            "audience_decision_id": facts["decision_id"],
-                            "statement_truth_not_implied": True,
-                        },
-                    }
-                )
+        self._append_heard_statement_candidates(
+            session,
+            event=event,
+            segments=segments,
+            segment_audience_facts=segment_facts,
+            source_publication_id=publication_id,
+        )
+        for candidate in session.get("memory_candidates") or []:
+            if str(candidate.get("source_publication_id") or "") == publication_id:
+                candidate["source_event_id"] = event["event_id"]
         activations = []
         response_ids = {
             *audience_facts["response_actor_ids"],
@@ -1294,4 +1548,3 @@ class ConversationStore:
                 "audience_decision_id": overall["decision_id"],
             }
         return result
-

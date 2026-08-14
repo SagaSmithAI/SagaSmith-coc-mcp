@@ -448,6 +448,30 @@ def test_bounded_render_and_isolated_npc_conversation_settle_public_state(
             },
         )
         assert recovered["status"] == "open"
+        await call(
+            server,
+            "actor_knowledge_change",
+            {
+                "action": "add",
+                "campaign_id": campaign_id,
+                "actor_id": npc["id"],
+                "data": {
+                    "knowledge_key": "new-tide-report",
+                    "proposition": "The tide report arrived during the conversation.",
+                },
+                "idempotency_key": "new-tide-report",
+            },
+        )
+        refreshed = await call(
+            server,
+            "npc_conversation",
+            {
+                "action": "get",
+                "campaign_id": campaign_id,
+                "data": {"conversation_id": opened["conversation_id"]},
+            },
+        )
+        assert refreshed["refreshed_actor_ids"] == [npc["id"]]
         with pytest.raises(Exception, match="active NPC conversation"):
             await call(
                 server,
@@ -470,6 +494,58 @@ def test_bounded_render_and_isolated_npc_conversation_settle_public_state(
                     "source": "Conversation interruption regression.",
                     "expected_revision": 2,
                     "idempotency_key": "blocked-combat",
+                },
+            )
+        branch = await call(
+            server,
+            "branch_query",
+            {"action": "current", "campaign_id": campaign_id, "data": {}},
+        )
+        branch_id = branch["branch"]["id"]
+        with pytest.raises(Exception, match="active NPC conversation"):
+            await call(
+                server,
+                "branch_change",
+                {
+                    "action": "create",
+                    "campaign_id": campaign_id,
+                    "data": {"name": "blocked", "checkout": True},
+                    "expected_revision": 2,
+                    "expected_branch_id": branch_id,
+                    "idempotency_key": "blocked-branch",
+                },
+            )
+        with pytest.raises(Exception, match="active NPC conversation"):
+            await call(
+                server,
+                "snapshot_change",
+                {
+                    "action": "restore",
+                    "campaign_id": campaign_id,
+                    "data": {"slot": 1},
+                    "expected_revision": 2,
+                    "expected_branch_id": branch_id,
+                    "idempotency_key": "blocked-restore",
+                },
+            )
+        with pytest.raises(Exception, match="active NPC conversation"):
+            await call(
+                server,
+                "state_revision",
+                {
+                    "action": "undo",
+                    "campaign_id": campaign_id,
+                    "data": {},
+                },
+            )
+        with pytest.raises(Exception, match="active NPC conversation"):
+            await call(
+                server,
+                "module_change",
+                {
+                    "action": "set_progress",
+                    "campaign_id": campaign_id,
+                    "data": {"scene_id": "blocked-scene"},
                 },
             )
         ingested = await call(
@@ -496,7 +572,7 @@ def test_bounded_render_and_isolated_npc_conversation_settle_public_state(
                         "basis_refs": [],
                         "reason": "Both participants are face to face and share English.",
                     },
-                    "expected_conversation_revision": opened["conversation_revision"],
+                    "expected_conversation_revision": refreshed["conversation_revision"],
                     "idempotency_key": "ingest",
                 },
             },
@@ -597,6 +673,19 @@ def test_bounded_render_and_isolated_npc_conversation_settle_public_state(
                 },
             },
         )
+        status = await call(
+            server,
+            "npc_conversation",
+            {
+                "action": "get",
+                "campaign_id": campaign_id,
+                "data": {"conversation_id": opened["conversation_id"]},
+            },
+        )
+        accepted_candidate_ids = [
+            item["candidate_id"] for item in status["memory_candidates"]
+        ]
+        assert len(accepted_candidate_ids) == 2
         closed = await call(
             server,
             "npc_conversation",
@@ -605,7 +694,7 @@ def test_bounded_render_and_isolated_npc_conversation_settle_public_state(
                 "campaign_id": campaign_id,
                 "data": {
                     "conversation_id": opened["conversation_id"],
-                    "accepted_working_deltas": {},
+                    "accepted_candidate_ids": accepted_candidate_ids,
                     "expected_conversation_revision": published[
                         "conversation_revision"
                     ],
@@ -613,7 +702,7 @@ def test_bounded_render_and_isolated_npc_conversation_settle_public_state(
                 },
             },
         )
-        assert closed["conversation_revision"] == 5
+        assert closed["conversation_revision"] == published["conversation_revision"] + 1
         events = await call(
             server,
             "campaign_event",
@@ -628,5 +717,20 @@ def test_bounded_render_and_isolated_npc_conversation_settle_public_state(
         assert conversation_event["payload"]["conversation_id"] == opened[
             "conversation_id"
         ]
+        assert conversation_event["retrieval_text"].endswith("Just before dusk.")
+        investigator_knowledge = await call(
+            server,
+            "actor_knowledge_query",
+            {
+                "action": "list",
+                "campaign_id": campaign_id,
+                "actor_id": investigator["id"],
+                "data": {},
+            },
+        )
+        assert any(
+            item["proposition"] == f"{npc['id']} said: Just before dusk."
+            for item in investigator_knowledge["knowledge"]
+        )
 
     asyncio.run(scenario())
