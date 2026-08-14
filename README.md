@@ -24,7 +24,7 @@ Keeper 恢复接口由 `branch_query/change`、`snapshot_query/change` 和
 
 Snapshot 在公共协议中仍是可独立恢复的完整状态文档；底层 schema v8 仅把每个文档独立压缩为 `zlib-1` 记录，并校验压缩字节、文档 checksum 与节点身份。`snapshot_query/change`、branch checkout、undo/redo 和重启恢复都不依赖祖先链回放。
 
-服务启动时会执行 Core Alembic 迁移。首次运行包含 Snapshot schema v8 的版本前，必须在服务停止且 SQLite WAL 已收敛后备份 `data/ttrpgbase.db`；外部数据库使用其原生一致性备份。迁移只接受完整且 checksum 有效的 schema-v7 Snapshot，并删除旧 JSON `payload` 列。v3–v6 数据需先用匹配的历史运行时物化到 v7。该协议切换不可 downgrade；回滚必须同时恢复升级前数据库备份以及匹配的 Core、CoC 和 MCP 版本。
+服务启动时会执行 Core Alembic 迁移，并要求数据库符合当前 Snapshot schema v8。部署前必须在服务停止且 SQLite WAL 已收敛后备份 `data/ttrpgbase.db`；外部数据库使用其原生一致性备份。当前格式不可 downgrade；回滚必须将数据库、Core、CoC 和 MCP 恢复为一套匹配版本。
 
 Play 与 Combat 阶段提供两项来源明确的角色状态结算：
 

@@ -128,14 +128,12 @@ State defaults to `.sagasmith-coc-mcp/`. The main configuration variables are:
 - `SAGASMITH_MODULEGEN_SKILLS_DIR`
 - `SAGASMITH_COC_MCP_BOUND_PRINCIPAL_ID`
 
-The server applies Core Alembic migrations at startup. Before the first launch
-with Snapshot schema v8, stop the server and take a consistent backup of
-`data/ttrpgbase.db` after its SQLite WAL has settled, or use the external
-database's native backup mechanism. The cutover accepts complete,
-checksum-valid schema-v7 snapshots and removes the old JSON `payload` column.
-Schema v3-v6 snapshots must first be materialized by their matching historical
-runtime. There is no downgrade or dual-protocol mode; rollback restores the
-pre-upgrade database together with matching Core, CoC, and MCP versions.
+The server applies Core Alembic migrations at startup and requires the current
+Snapshot schema v8. Before deployment, stop the server and take a consistent
+backup of `data/ttrpgbase.db` after its SQLite WAL has settled, or use the
+external database's native backup mechanism. There is no downgrade or
+dual-protocol mode; rollback restores the database together with matching Core,
+CoC, and MCP versions as one unit.
 
 ## Development
 
