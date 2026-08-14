@@ -12,7 +12,9 @@ from mcp.client.stdio import StdioServerParameters, stdio_client
 from pypdf import PdfWriter
 from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 from sagasmith_coc.random_stream import initial_random_stream
-from sagasmith_core import ModuleService
+from sagasmith_core import Database, ModuleService
+from sagasmith_core.database import sqlite_database_url
+from sagasmith_core.models import CampaignSnapshot
 
 from sagasmith_coc_mcp import server as server_module
 from sagasmith_coc_mcp.config import McpConfig
@@ -2207,6 +2209,27 @@ def test_branch_snapshot_and_revision_recovery_are_guarded_and_replayable(tmp_pa
             {"action": "verify", "campaign_id": campaign_id, "data": {"slot": 1}},
         )
         assert verified["valid"] is True
+        document = (
+            await call(
+                server,
+                "snapshot_query",
+                {"action": "get", "campaign_id": campaign_id, "data": {"slot": 1}},
+            )
+        )["snapshot"]
+        assert document["storage_mode"] == "full"
+        assert document["valid"] is True
+        assert document["payload"]["campaign"]["name"] == "Forked case"
+        stored_database = Database(sqlite_database_url(config.database_path))
+        try:
+            with stored_database.transaction() as session:
+                stored = session.get(CampaignSnapshot, baseline["id"])
+                assert stored is not None
+                assert stored.schema_version == 8
+                assert stored.payload_codec == "zlib-1"
+                assert stored.uncompressed_size > 0
+                assert stored.compressed_payload
+        finally:
+            stored_database.dispose()
 
         play = await call(
             server,

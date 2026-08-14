@@ -22,6 +22,10 @@ Keeper 恢复接口由 `branch_query/change`、`snapshot_query/change` 和
 `idempotency_key`；checkout、restore、undo、redo 改变权威阶段后会触发
 `tools/list_changed`。Host 刷新列表后可重新加载并直接调用该阶段的合法原生工具。
 
+Snapshot 在公共协议中仍是可独立恢复的完整状态文档；底层 schema v8 仅把每个文档独立压缩为 `zlib-1` 记录，并校验压缩字节、文档 checksum 与节点身份。`snapshot_query/change`、branch checkout、undo/redo 和重启恢复都不依赖祖先链回放。
+
+服务启动时会执行 Core Alembic 迁移。首次运行包含 Snapshot schema v8 的版本前，必须在服务停止且 SQLite WAL 已收敛后备份 `data/ttrpgbase.db`；外部数据库使用其原生一致性备份。迁移只接受完整且 checksum 有效的 schema-v7 Snapshot，并删除旧 JSON `payload` 列。v3–v6 数据需先用匹配的历史运行时物化到 v7。该协议切换不可 downgrade；回滚必须同时恢复升级前数据库备份以及匹配的 Core、CoC 和 MCP 版本。
+
 Play 与 Combat 阶段提供两项来源明确的角色状态结算：
 
 - `coc_sanity_check` 原子完成 SAN 检定、损失骰、必要的 INT 检定、临时/不定期/永久疯狂、狂乱发作与持续时间，并在同一 revision group 中提交战役随机流和调查员 sheet。

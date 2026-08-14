@@ -23,6 +23,11 @@ guards plus an `idempotency_key`. When checkout, restore, undo, or redo changes 
 authoritative phase, the server emits `tools/list_changed`; after refreshing, the host can
 load and directly call the next legal native tool for that phase.
 
+Snapshots remain independently restorable full state documents at the public
+boundary. Core schema v8 stores each document as one bounded, checksummed
+`zlib-1` record. Snapshot query/restore, branch checkout, undo/redo, and restart
+recovery do not replay an ancestor chain.
+
 Play and Combat expose two source-explicit actor-state settlements:
 
 - `coc_sanity_check` atomically rolls the SAN check, loss, required INT check, temporary/indefinite/permanent insanity, bout, and duration, then commits the campaign random stream and investigator sheet in one revision group.
@@ -122,6 +127,15 @@ State defaults to `.sagasmith-coc-mcp/`. The main configuration variables are:
 - `SAGASMITH_COC_SKILLS_DIR`
 - `SAGASMITH_MODULEGEN_SKILLS_DIR`
 - `SAGASMITH_COC_MCP_BOUND_PRINCIPAL_ID`
+
+The server applies Core Alembic migrations at startup. Before the first launch
+with Snapshot schema v8, stop the server and take a consistent backup of
+`data/ttrpgbase.db` after its SQLite WAL has settled, or use the external
+database's native backup mechanism. The cutover accepts complete,
+checksum-valid schema-v7 snapshots and removes the old JSON `payload` column.
+Schema v3-v6 snapshots must first be materialized by their matching historical
+runtime. There is no downgrade or dual-protocol mode; rollback restores the
+pre-upgrade database together with matching Core, CoC, and MCP versions.
 
 ## Development
 
