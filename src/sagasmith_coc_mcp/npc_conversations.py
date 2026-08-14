@@ -876,6 +876,11 @@ class ConversationStore:
                     "status": "idle",
                     "inbox_cursor": 0,
                     "working_state_revision": 0,
+                    "working_state": {
+                        "facts": [],
+                        "actor_knowledge": [],
+                        "commitments": [],
+                    },
                     "context": deepcopy(context),
                     }
             session = {
@@ -1206,10 +1211,7 @@ class ConversationStore:
                 "conversation_revision": int(session["conversation_revision"]) + 1,
             },
             "bootstrap": deepcopy(context) if include_bootstrap else None,
-            "memory_candidates": self.memory_candidates(
-                session,
-                actor_id=str(activation["actor_id"]),
-            ),
+            "working_state": deepcopy(runtime["working_state"]),
             "inbox": inbox,
             "constraints": {
                 "allowed_basis_refs": allowed_basis_refs,
@@ -1324,6 +1326,8 @@ class ConversationStore:
                     )
                 )
         if proposed_candidates:
+            for kind, values in proposal["working_deltas"].items():
+                runtime["working_state"][kind].extend(deepcopy(values))
             runtime["working_state_revision"] += 1
         runtime["inbox_cursor"] = len(session["events"])
         activation["status"] = "completed"

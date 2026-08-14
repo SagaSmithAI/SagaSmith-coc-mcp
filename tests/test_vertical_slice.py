@@ -24,6 +24,18 @@ from sagasmith_coc_mcp.tool_profiles import CORE_TOOLS
 
 
 async def call(server, name: str, arguments: dict):
+    if name == "character_change" and arguments.get("action") in {"create", "instantiate"}:
+        data = arguments["data"]
+        data.setdefault(
+            "idempotency_key",
+            f"test-{arguments['action']}-{data.get('name') or data.get('template_id')}",
+        )
+        if "expected_campaign_revision" not in data:
+            _, campaign = await server.call_tool(
+                "campaign_query",
+                {"action": "get", "campaign_id": arguments["campaign_id"]},
+            )
+            data["expected_campaign_revision"] = campaign["revision"]
     _, result = await server.call_tool(name, arguments)
     if hasattr(result, "model_dump"):
         result = result.model_dump()
@@ -2242,7 +2254,7 @@ def test_branch_snapshot_and_revision_recovery_are_guarded_and_replayable(tmp_pa
             with stored_database.transaction() as session:
                 stored = session.get(CampaignSnapshot, baseline["id"])
                 assert stored is not None
-                assert stored.schema_version == 8
+                assert stored.schema_version == 9
                 assert stored.payload_codec == "zlib-1"
                 assert stored.uncompressed_size > 0
                 assert stored.compressed_payload
@@ -2543,7 +2555,8 @@ def test_stdio_client_can_discover_load_and_call(tmp_path) -> None:
                     },
                 )
                 assert not created.isError
-                campaign_id = json.loads(created.content[0].text)["id"]
+                created_campaign = json.loads(created.content[0].text)
+                campaign_id = created_campaign["id"]
                 rebound = await session.call_tool(
                     "exposure",
                     {"action": "open", "campaign_id": campaign_id},
@@ -2644,6 +2657,8 @@ def test_stdio_client_can_discover_load_and_call(tmp_path) -> None:
                         "campaign_id": campaign_id,
                         "data": {
                             "name": "Stdio Investigator",
+                            "expected_campaign_revision": created_campaign["revision"],
+                            "idempotency_key": "stdio-investigator",
                             "sheet": {
                                 "characteristics": {"dex": 60},
                                 "skills": {"Spot Hidden": 0},
@@ -2693,6 +2708,10 @@ def test_stdio_client_can_discover_load_and_call(tmp_path) -> None:
                             "name": "Stdio Cultist",
                             "character_type": "npc",
                             "sheet": {"characteristics": {"dex": 40}},
+                            "expected_campaign_revision": settled_development_value[
+                                "campaign_revision"
+                            ],
+                            "idempotency_key": "stdio-cultist",
                         },
                     },
                 )
@@ -2929,7 +2948,12 @@ def test_stdio_client_can_discover_load_and_call(tmp_path) -> None:
                 )
                 assert not restored.isError
                 phase = await session.call_tool("game_phase", {"campaign_id": campaign_id})
-                assert json.loads(phase.content[0].text)["phase"] == "lobby"
+                phase_payload = json.loads(phase.content[0].text)
+                assert phase_payload["phase"] == "lobby"
+                binding = phase_payload["host_context_binding"]
+                assert binding["domain"] == "sagasmith-coc"
+                assert len(binding["authorization_fingerprint"]) == 64
+                assert len(binding["context_epoch"]) == 64
                 reloaded = await session.call_tool(
                     "exposure",
                     {"action": "set", "add_tool_ids": ["module_draft"]},

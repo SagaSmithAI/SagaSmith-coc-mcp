@@ -29,6 +29,7 @@ class Exposure:
     expires_at: datetime
     revision: int = 0
     loaded_tools: set[str] = field(default_factory=set)
+    authorization_fingerprint: str = ""
 
 
 class ExposureRegistry:
@@ -71,6 +72,7 @@ class ExposureRegistry:
         principal_id: str,
         campaign_id: str | None,
         phase: str,
+        authorization_fingerprint: str = "",
     ) -> Exposure:
         self._prune()
         prior_id = self._active_by_session.get(session_key)
@@ -86,6 +88,7 @@ class ExposureRegistry:
             created_at=now,
             updated_at=now,
             expires_at=now + self._ttl,
+            authorization_fingerprint=authorization_fingerprint,
         )
         self._by_id[exposure.id] = exposure
         self._active_by_session[session_key] = exposure.id
@@ -126,6 +129,18 @@ class ExposureRegistry:
             exposure.revision += 1
             self.touch(exposure)
         return changed
+
+    def refresh_authorization(self, exposure: Exposure, fingerprint: str) -> bool:
+        if not exposure.authorization_fingerprint:
+            exposure.authorization_fingerprint = fingerprint
+            self.touch(exposure)
+            return False
+        if exposure.authorization_fingerprint == fingerprint:
+            return False
+        exposure.authorization_fingerprint = fingerprint
+        exposure.revision += 1
+        self.touch(exposure)
+        return True
 
     def set_tools(
         self,
@@ -178,6 +193,7 @@ class ExposureRegistry:
             "phase": exposure.phase,
             "loaded_tools": sorted(exposure.loaded_tools),
             "visible_tools": sorted(self.visible_tools(exposure)),
+            "authorization_fingerprint": exposure.authorization_fingerprint,
             "created_at": exposure.created_at.isoformat(),
             "updated_at": exposure.updated_at.isoformat(),
             "expires_at": exposure.expires_at.isoformat(),

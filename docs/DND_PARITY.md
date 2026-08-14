@@ -1,66 +1,65 @@
 # SagaSmith CoC 对标 D&D 的功能、契约与证据矩阵
 
-> 状态说明（2026-08-15）：本文记录的是 2026-08-13 的已完成基线，不能作为
-> 当前 Agent/NPC conversation v3 与补充权限审计的完成证明。当前缺口和唯一后续
-> 实施顺序见 `SagaSmith-dnd-mcp/docs/HANDOVER_DND_COC_CONVERGENCE.md`。完成该
-> handover 的真实 Host 回归前，下文“完成”均应读作历史基线，而非当前验收结论。
+> 当前状态（2026-08-15）：权限上下文、角色生命周期和 NPC conversation
+> 已收敛到单一当前协议。本文取代 2026-08-13 的旧完成结论。
 
-本文件以 2026-08-13 的协议为历史基线。对标指概念能力、权威边界、
-公共 facade、真实宿主行为和回归证据达到同等级；不复制 D&D 独有的
-职业、法术位或空间规则，也不把来源/叙事判断错误地下沉到引擎。
+对标指概念能力、权威边界、公共 facade、真实宿主行为和回归证据达到同等级；
+不复制 D&D 独有的职业、法术位或空间规则，也不把来源或叙事判断下沉到 Core。
 
-## 完成结论
+## 当前结论
 
-CoC 的共享全链路已完成：规则和 Module Content Pack 创作、战役运行时、
-角色与长期状态、调查、SAN、Combat、Chase、隔离 NPC 对话、动态 MCP
-工具、Skills、Keeper UI、重启恢复和两个并行私有战役均有公共证据。
+CoC 当前公开 50 个原生工具。`npc_conversation_transport` 是经过 Host token
+鉴权且永不出现在 `tools/list` 的私有 transport，不是第 51 个公开工具，也没有
+`npc_conversation_worker` 兼容入口。Agent 根据 server capability 私下调用 transport，
+Director 只收到 server 验证后的 publication，看不到 capsule 或 raw proposal。
 
-| 能力域 | 当前 CoC 公共协议 | 状态与证据 |
+| 能力域 | 当前 CoC 协议 | 当前证据 |
 | --- | --- | --- |
-| 原生动态工具 | `exposure`、会话原生列表、`tools/list_changed`、调用时二次校验 | 完成；51 个当前工具，Lobby → Play → Combat → Play 的真实 stdio Host 会刷新并直接调用下一阶段原生工具 |
-| 权威状态 | campaign/character revision、幂等、随机流、分支、快照、undo/redo | 完成；公共 facade、重启和真实双战役均验证 |
-| 访问与受众 | campaign/actor grant、ActorKnowledge、事件、memory、`continuity_context` | 完成；Keeper、玩家、角色私有知识和 group/public 投影均在调用边界复核 |
-| Module Pack | `module_draft(start/get/evidence/edit/finalize)`、`content_pack` | 完成；PDF 页证据、Agent 修订、不可变终结、跨战役导入、激活和私有 Pack 回测均验证 |
-| 规则 Pack | `rulebook_draft(start/evidence/finalize)`、`rule_query(sources/search/expand/effective)` | 完成；Quick-Start 私有规则 Pack 已生成、导入、锁定、搜索和展开 |
-| 规则/技能检索 | 分层 `skill_query`、规则来源和有效 lock | 完成；Skill 与规则 Pack 保持独立权威和来源收据 |
-| 有界评估 | `bounded_evaluation(validate)` | 完成；签名 context receipt、严格 proposal、无工具 worker 与零权威写入均验证 |
-| 角色状态 | template instantiate、inventory、wallet、技能成长、Luck、治疗、年龄、tome/spell study | 完成；写入均有角色/战役 revision、幂等和随机流收据 |
-| CoC 判定 | d100、难度、奖励/惩罚骰、Push、Luck、组合/对抗、团体 Luck | 完成；调查待决选择和后果由公共 facade 原子结算 |
-| SAN 与 HP | SAN loss/bout、伤害、护甲、重伤、昏迷、濒死、治疗 | 完成；即时机械转换由引擎拥有，跨场景时机由来源和 Keeper 明确提供 |
-| Combat | start/query/action/attack/end，Grid/Agent 两种空间模式 | 完成；顺序、响应、dodge/fight-back/dive、围攻、弹药、故障、伤害和恢复均有回归 |
-| Chase | start/query/action/end，人物和车辆参与卡 | 完成；MOV、Build、来源卡、路线、障碍、行动点、Combat 互斥和重启均有回归 |
-| NPC 对话 | `npc_conversation` 与 host-local `npc_conversation_worker` | 完成；每 NPC 隔离持久 worker、Agent 受众事实、server-derived publication、close/abort 和阶段互斥均验证 |
-| Skills | 51 工具契约、Keeper、campaign manager、工作流与恢复引用 | 完成；仓库 validator 强制工具集合和关键流程 |
-| ModuleGen | Module 与 `core_rules` Content Pack authoring | 完成；当前 unified schema、Agent review/finalize 和规则 Pack 路径已接入 |
-| Keeper UI | Content/Rules、调查、Combat/Chase、NPC Dialogue、调查员长期状态 | 完成；API 工具集合测试、Astro 检查、静态构建和浏览器实测通过 |
+| 原生动态工具 | `exposure`、session-aware `tools/list`、`tools/list_changed`、调用时二次鉴权 | 公共 facade 与真实 stdio 覆盖 Lobby → Play → Combat → Play；phase、role 或授权变化后原生列表和下一次调用同步刷新 |
+| Host 上下文 | domain、campaign、principal fingerprint、authorization fingerprint、role、audience、branch 共同形成 `context_epoch` | campaign revoke 和 actor-private 降级都会改变 epoch，向目标 session 发出 barrier；下一次私有读取失败 |
+| 角色生命周期 | `character_change(create/instantiate/update)` | create/instantiate 原子写 actor、template lineage、初始 grant、幂等 receipt 和 lifecycle revision；update 具有角色 revision、幂等、undo/redo |
+| 快照与分支 | snapshot schema 9、branch checkout、state revision | actor 与 actor grants 一同 capture/restore；公共测试覆盖 restart、snapshot/branch、create/update undo/redo 和同 ID 恢复 |
+| 访问与受众 | campaign/actor grant、ActorKnowledge、事件、memory、`continuity_context` | Keeper、玩家、角色私有知识和 group/public 投影在调用边界复核；revoke 不只改变未来 ACL，也使旧宿主上下文失效 |
+| Module / 规则 Pack | `module_draft`、`rulebook_draft`、`content_pack`、`module_query`、`rule_query` | 当前 public facade 覆盖 draft review/finalize、导入、激活、检索和来源收据；旧归档不享有兼容导入路径 |
+| CoC 判定 | d100、难度、奖励/惩罚骰、Push、Luck、组合/对抗、团体 Luck | 调查待决选择、随机收据、revision refresh 和原子结算由公共 facade 覆盖 |
+| SAN、HP 与长期状态 | SAN loss/bout、伤害、护甲、重伤、濒死、治疗、成长、Luck、年龄、tome/spell study | 即时机械转换由系统引擎拥有；跨场景时机仍由来源和 Keeper 明确提供 |
+| Combat / Chase | Grid 与 Agent 两种 Combat 空间模式；人物与车辆 Chase 卡 | 公共回归覆盖响应、攻击、伤害、Combat/Chase 互斥、Grid/Agent、重启；私有两路线分别覆盖 Agent Combat 与 Chase → Grid Combat |
+| NPC conversation | 公开 `npc_conversation` + 私有鉴权且不列出的 `npc_conversation_transport`；conversation v3、proposal v4 | 真实 Agent + 实际 CoC stdio MCP 回归验证 capability、隐藏 transport、私有 capsule、publication；公共 facade 覆盖 close/abort、阶段互斥和 stale authority |
+| Skills | 50 个公开工具、conversation v3/proposal v4、Host 私有 transport | `SagaSmith-coc-skills` validator 强制当前工具集合和关键流程；不含公开 worker 契约 |
 
-## 私有来源与真实宿主证据
+## 私有来源与真实 Host 证据
 
-私有 PDF、Pack 和逐调用日志仅保存在本地 `.runs/coc-private-v1`，不进入 Git。
+私有 PDF、Pack、临时数据库副本和逐调用日志只保存在本地 `.runs`，不进入 Git。
+2026-08-15 的当前运行报告是
+`.runs/coc-private-current-20260815-run5/reports/parallel-campaign-backtest.json`。
 
 | 证据 | 结果 |
 | --- | --- |
-| Quick-Start 规则 Pack | `coc7e.rules.quick-start.private` 1.0.0；两战役分别导入、激活、检索和展开 |
-| The Lightless Beacon | 真实 stdio campaign 到达 `ending:survived-rescue`；81 次公共调用；Agent 空间 Combat；隔离 NPC 对话；重启后结局与公开 transcript 均存在 |
-| Alone Against the Flames | 真实 stdio campaign 到达 `ending:escape`；80 次公共调用；Chase、Grid Combat、snapshot、branch、undo/redo；重启后结局存在 |
-| 并行方式 | 两个同时运行的真实 stdio MCP session，各自拥有独立权威 campaign home，共享只读私有 Pack 来源，避免把本地 SQLite 当作多进程数据库 |
-| 机器可读排除 | 当前两条合法结局路线没有来源要求的车辆追逐、tome/spell、therapy/aging；这些机械由公共 facade 测试覆盖，没有为回测虚构模组事实 |
+| The Lightless Beacon | 当前 CoC stdio runtime 从保留数据库的临时副本恢复私有 Pack，71 次调用到达 `ending:survived-rescue`；DM/player 投影、隐藏鉴权 transport、bounded evaluation、Agent 空间 Combat、Play 恢复和重启后结局/公开 transcript 均通过 |
+| Alone Against the Flames | 当前 CoC stdio runtime 从独立临时副本恢复私有 Pack，64 次调用到达 `ending:escape`；DM/player、Chase、Grid Combat、undo/redo、Play 恢复和重启均通过 |
+| 当前 Agent transport | `SagaSmith-agent/tests/agent/test_npc_conversation.py` 启动实际 CoC stdio MCP，通过 capability 构造私有 transport；`tools/list` 不列出 transport，Director 不接收 capsule/raw proposal |
+| 数据安全 | 原 `.runs/coc-private-v1` SQLite 与 Pack 均未改写；两条路线使用彼此隔离的数据库副本和共享只读 Pack 来源 |
+| 旧归档边界 | 旧 `.sagasmith-pack` 的 legacy scene metadata 被当前单一 schema 预检拒绝；没有为让旧回测导入而增加 alias、双读、fallback 或弱化验证。当前路线复用临时数据库中已经导入并激活的不可变 Pack |
+| 机器可读排除 | 报告记录两条合法结局路线没有来源要求的车辆追逐、tome/spell、therapy/aging；相应机械由公共 facade 测试覆盖，没有虚构模组事实 |
 
-## 权威边界（不是缺失能力）
+私有路线证明当前 CoC runtime 与私有 transport 能在真实模块状态上继续运行；
+当前 Agent 测试另行证明实际 Host 的 capability/transport 隔离。二者与 public facade
+回归共同构成证据，任何内部 service 测试都不单独算完成。
 
-- `module_query` 是当前统一模块导航 facade；不复制 D&D 的旧命名或兼容别名。
+## 权威边界
+
+- `module_query` 是唯一模块导航 facade；不复制旧命名或兼容别名。
 - Inventory 和 wallet 是角色本地原子状态。跨角色转移需要玩家意图和接收方授权，
-  由 Agent 将已确认结果结算为相应角色写入，不伪造单一所有权事务。
-- 车辆身份、MOV、Build 和 Chase 资源是权威状态；碰撞后果、复杂协助和追逐中
-  未结构化空间事实由来源与 Keeper 明示，再通过现有伤害/行动 facade 结算。
-- 战斗机动的来源目标和叙事效果、掩体几何、射击序列选择以及自然/周治疗发生时机
-  属于 Agent/来源决定；命中、随机、伤害、护甲、弹药、状态和 revision 仍由引擎拥有。
-- `content_solution` 不作为第二套解析/工作流协议存在。缺失或冲突内容按
-  `Pack data → Skill procedure → system mechanic → core primitive` 处理，并可用
-  `rule_query`、draft evidence 和 `bounded_evaluation` 留下可复核依据。
+  由 Agent 把已确认结果结算为角色写入。
+- 车辆身份、MOV、Build 和 Chase 资源是权威状态；复杂协助、碰撞后果和未结构化
+  空间事实由来源与 Keeper 明示，再通过机械 facade 结算。
+- Agent 空间模式不制造坐标；来源目标、掩体几何、射击序列选择和跨场景治疗时机
+  属于 Agent/来源决定。命中、随机、伤害、护甲、弹药、状态和 revision 仍由引擎拥有。
+- 缺失或冲突内容按 `Pack data → Skill procedure → system mechanic → core primitive`
+  处理。旧 Pack 若不满足当前 schema，应创建新 draft/version，而不是给 runtime 增加兼容读取。
 
 ## 完成标准
 
-完成状态必须同时有公共 facade 测试和至少一种真实 Host/回测证据；内部 service
-调用不算完成。私有模组只覆盖来源实际要求的路径，未出现的来源事实必须记录为
-机器可读 exclusion，而不能为了提高覆盖率而编造。
+完成状态必须同时具备公共 facade、真实 native tool refresh 和至少一种真实 Host 或
+回测证据。私有模组只覆盖来源实际要求的路径；未出现的来源事实必须记录为机器可读
+exclusion，不能为了覆盖率编造。

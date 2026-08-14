@@ -10,6 +10,18 @@ from sagasmith_coc_mcp.server import create_server
 
 
 async def call(server, name: str, arguments: dict):
+    if name == "character_change" and arguments.get("action") in {"create", "instantiate"}:
+        data = arguments["data"]
+        data.setdefault(
+            "idempotency_key",
+            f"test-{arguments['action']}-{data.get('name') or data.get('template_id')}",
+        )
+        if "expected_campaign_revision" not in data:
+            _, campaign = await server.call_tool(
+                "campaign_query",
+                {"action": "get", "campaign_id": arguments["campaign_id"]},
+            )
+            data["expected_campaign_revision"] = campaign["revision"]
     _, result = await server.call_tool(name, arguments)
     if hasattr(result, "model_dump"):
         result = result.model_dump()
@@ -22,6 +34,7 @@ def config(tmp_path: Path) -> McpConfig:
         database_url=None,
         coc_skills_dir=tmp_path / "missing-coc-skills",
         modulegen_skills_dir=tmp_path / "missing-modulegen-skills",
+        npc_host_token="test-host-token",
         module_import_roots=(tmp_path,),
     )
 
@@ -153,6 +166,8 @@ def test_inventory_wallet_and_source_study_are_atomic_and_idempotent(tmp_path: P
                 "data": {
                     "name": "Morgan",
                     "sheet": {"monetary": {}, "inventory": [], "luck": 40},
+                    "expected_campaign_revision": campaign["revision"],
+                    "idempotency_key": "create-morgan-state",
                 },
             },
         )
@@ -280,6 +295,8 @@ def test_vehicle_chase_preserves_source_bound_cards_through_public_facade(
                     "campaign_id": campaign_id,
                     "data": {
                         "name": name,
+                        "expected_campaign_revision": campaign["revision"],
+                        "idempotency_key": f"create-{name.lower().replace(' ', '-')}",
                         "sheet": {
                             "characteristics": {"con": 60, "dex": 60},
                             "skills": {"Drive Auto": 60},
@@ -368,7 +385,12 @@ def test_bounded_render_and_isolated_npc_conversation_settle_public_state(
             {
                 "action": "create",
                 "campaign_id": campaign_id,
-                "data": {"name": "Morgan", "character_type": "investigator"},
+                    "data": {
+                        "name": "Morgan",
+                        "character_type": "investigator",
+                        "expected_campaign_revision": campaign["revision"],
+                        "idempotency_key": "create-morgan",
+                    },
             },
         )
         npc = await call(
@@ -377,11 +399,13 @@ def test_bounded_render_and_isolated_npc_conversation_settle_public_state(
             {
                 "action": "create",
                 "campaign_id": campaign_id,
-                "data": {
-                    "name": "Harbormaster",
-                    "character_type": "npc",
-                    "summary": "Knows when the lighthouse boat departed.",
-                },
+                    "data": {
+                        "name": "Harbormaster",
+                        "character_type": "npc",
+                        "summary": "Knows when the lighthouse boat departed.",
+                        "expected_campaign_revision": campaign["revision"],
+                        "idempotency_key": "create-harbormaster",
+                    },
             },
         )
         await call(
@@ -580,26 +604,27 @@ def test_bounded_render_and_isolated_npc_conversation_settle_public_state(
         activation = ingested["activations"][0]
         claimed = await call(
             server,
-            "npc_conversation_worker",
+            "npc_conversation_transport",
             {
                 "action": "claim_activation",
                 "campaign_id": campaign_id,
                 "conversation_id": opened["conversation_id"],
-                "data": {
+                "payload": {
                     "activation_ref": activation["activation_ref"],
                     "expected_conversation_revision": ingested["conversation_revision"],
                     "idempotency_key": "claim",
                 },
+                "host_token": "test-host-token",
             },
         )
         submitted = await call(
             server,
-            "npc_conversation_worker",
+            "npc_conversation_transport",
             {
                 "action": "submit_proposal",
                 "campaign_id": campaign_id,
                 "conversation_id": opened["conversation_id"],
-                "data": {
+                "payload": {
                     "activation_ref": activation["activation_ref"],
                     "lease_id": claimed["lease_id"],
                     "expected_conversation_revision": claimed["conversation_revision"],
@@ -644,6 +669,7 @@ def test_bounded_render_and_isolated_npc_conversation_settle_public_state(
                         "decision_summary": "Answers the investigator.",
                     },
                 },
+                "host_token": "test-host-token",
             },
         )
         assert "private_intent" not in repr(submitted)

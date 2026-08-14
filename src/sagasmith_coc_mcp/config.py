@@ -18,6 +18,7 @@ class McpConfig:
     coc_skills_dir: Path
     modulegen_skills_dir: Path
     bound_principal_id: str | None = None
+    npc_host_token: str | None = None
     module_import_roots: tuple[Path, ...] = ()
     http_host: str = "127.0.0.1"
     http_port: int = 8769
@@ -56,6 +57,12 @@ class McpConfig:
             bound_principal_id=(
                 value.strip()
                 if (value := os.environ.get("SAGASMITH_COC_MCP_BOUND_PRINCIPAL_ID"))
+                and value.strip()
+                else None
+            ),
+            npc_host_token=(
+                value.strip()
+                if (value := os.environ.get("SAGASMITH_NPC_HOST_TOKEN"))
                 and value.strip()
                 else None
             ),

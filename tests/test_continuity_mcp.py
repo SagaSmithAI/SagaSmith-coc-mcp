@@ -10,6 +10,18 @@ from sagasmith_coc_mcp.server import create_server
 
 
 async def call(server, name: str, arguments: dict):
+    if name == "character_change" and arguments.get("action") in {"create", "instantiate"}:
+        data = arguments["data"]
+        data.setdefault(
+            "idempotency_key",
+            f"test-{arguments['action']}-{data.get('name') or data.get('template_id')}",
+        )
+        if "expected_campaign_revision" not in data:
+            _, campaign = await server.call_tool(
+                "campaign_query",
+                {"action": "get", "campaign_id": arguments["campaign_id"]},
+            )
+            data["expected_campaign_revision"] = campaign["revision"]
     _, result = await server.call_tool(name, arguments)
     return result
 
@@ -40,7 +52,12 @@ async def create_campaign_with_two_players(server) -> tuple[dict, dict, dict]:
             {
                 "action": "create",
                 "campaign_id": campaign["id"],
-                "data": {"name": name, "sheet": {"pow": 60}},
+                "data": {
+                    "name": name,
+                    "sheet": {"pow": 60},
+                    "expected_campaign_revision": campaign["revision"],
+                    "idempotency_key": f"create-{name.lower()}",
+                },
             },
         )
         actors.append(actor)

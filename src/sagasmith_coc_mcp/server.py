@@ -8,6 +8,7 @@ import importlib
 import json
 import os
 import re
+import secrets
 import time
 from copy import deepcopy
 from dataclasses import asdict
@@ -18,6 +19,8 @@ from uuid import uuid4
 from weakref import WeakValueDictionary
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.lowlevel.server import NotificationOptions
+from mcp.types import TextContent
 from sagasmith_coc.content_packages import (
     build_module_content_package,
     build_rule_content_package,
@@ -82,6 +85,7 @@ from sagasmith_coc.system import validate_investigator_sheet
 from sagasmith_core import (
     AccessService,
     ActorKnowledgeService,
+    ActorLifecycleService,
     BranchService,
     CampaignService,
     CharacterService,
@@ -92,6 +96,7 @@ from sagasmith_core import (
     IdempotencyService,
     IdempotencyWrite,
     ImportJobService,
+    InitialActorGrant,
     MemoryService,
     ModuleService,
     RevisionService,
@@ -131,12 +136,14 @@ from .skills import SkillCatalog
 from .storage import SagaSmithStorage
 from .tool_profiles import (
     CORE_TOOLS,
+    HOST_PRIVATE_TOOLS,
     PROFILE_COMBAT,
     PROFILE_LOBBY,
     PROFILE_PLAY,
     PROFILES,
     policy_for_tool,
     tool_catalog,
+    tools_for_phase,
     validate_profile_coverage,
 )
 
@@ -159,17 +166,40 @@ class SessionExposureFastMCP(FastMCP):
         *args: Any,
         exposure_registry: ExposureRegistry,
         phase_lookup: Any,
+        allowed_tools_lookup: Any,
         scope_validator: Any,
+        context_binding_factory: Any,
+        authorization_fingerprint_lookup: Any,
         bound_principal_id: str | None = None,
         **kwargs: Any,
     ) -> None:
         self.exposure_registry = exposure_registry
         self._phase_lookup = phase_lookup
+        self._allowed_tools_lookup = allowed_tools_lookup
         self._scope_validator = scope_validator
+        self._context_binding_factory = context_binding_factory
+        self._authorization_fingerprint_lookup = authorization_fingerprint_lookup
         self._bound_principal_id = bound_principal_id.strip() if bound_principal_id else None
         self._sessions: WeakValueDictionary[str, Any] = WeakValueDictionary()
         self._exposure_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
         super().__init__(*args, **kwargs)
+        original_initialization_options = self._mcp_server.create_initialization_options
+
+        def initialization_options(
+            notification_options: NotificationOptions | None = None,
+            experimental_capabilities: dict[str, dict[str, Any]] | None = None,
+        ):
+            return original_initialization_options(
+                notification_options
+                or NotificationOptions(
+                    tools_changed=True,
+                    prompts_changed=False,
+                    resources_changed=False,
+                ),
+                experimental_capabilities,
+            )
+
+        self._mcp_server.create_initialization_options = initialization_options  # type: ignore[method-assign]
 
     def _request_session(self) -> tuple[str, Any] | None:
         try:
@@ -210,27 +240,45 @@ class SessionExposureFastMCP(FastMCP):
             result["principal_id"] = self._bound_principal_id
         return result
 
-    async def _refresh(self, session_key: str) -> bool:
-        exposure = self.exposure_registry.active(session_key)
-        if exposure is None or exposure.campaign_id is None:
-            return False
-        changed = self.exposure_registry.refresh_phase(
-            exposure, self._phase_lookup(exposure.campaign_id)
+    async def _refresh(self, session_key: str, campaign_id: str | None = None) -> bool:
+        changed_session_keys: set[str] = set()
+        exposure_items = (
+            [(session_key, self.exposure_registry.active(session_key))]
+            if campaign_id is None
+            else list(self.exposure_registry.active_items(campaign_id))
         )
-        if changed:
-            session = self._sessions.get(session_key)
+        for key, exposure in exposure_items:
+            if exposure is None or exposure.campaign_id is None:
+                continue
+            phase = self._phase_lookup(exposure.campaign_id)
+            if self.exposure_registry.refresh_phase(
+                exposure,
+                phase,
+                allowed_tools=self._allowed_tools_lookup(exposure, phase),
+            ):
+                changed_session_keys.add(key)
+            fingerprint = self._authorization_fingerprint_lookup(
+                exposure.campaign_id, exposure.principal_id
+            )
+            if self.exposure_registry.refresh_authorization(exposure, fingerprint):
+                changed_session_keys.add(key)
+        for key in changed_session_keys:
+            session = self._sessions.get(key)
             if session is not None:
                 await session.send_tool_list_changed()
-        return changed
+        return bool(changed_session_keys)
 
     async def list_tools(self):  # type: ignore[override]
+        public_tools = [
+            tool for tool in await super().list_tools() if tool.name not in HOST_PRIVATE_TOOLS
+        ]
         request = self._request_session()
         if request is None:
-            return await super().list_tools()
+            return public_tools
         session_key, _ = request
         await self._refresh(session_key)
         visible = self.exposure_registry.visible_tools(self.exposure_registry.active(session_key))
-        return [tool for tool in await super().list_tools() if tool.name in visible]
+        return [tool for tool in public_tools if tool.name in visible]
 
     async def call_tool(self, name: str, arguments: dict[str, Any]):  # type: ignore[override]
         request = self._request_session()
@@ -238,10 +286,13 @@ class SessionExposureFastMCP(FastMCP):
             return await super().call_tool(name, arguments)
         session_key, _ = request
         await self._refresh(session_key)
+        arguments = self._bind_configured_principal(name, arguments)
+        if name in HOST_PRIVATE_TOOLS:
+            return await super().call_tool(name, arguments)
         exposure = self.exposure_registry.active(session_key)
         if name not in CORE_TOOLS and exposure is None:
             raise ExposureError("Open and load a session exposure before calling domain tools.")
-        bound = self._bind_configured_principal(name, arguments)
+        bound = arguments
         if exposure is not None and name != "exposure":
             self.exposure_registry.require_tool(exposure, name)
             bound = self._bind_principal(exposure, name, bound)
@@ -254,8 +305,58 @@ class SessionExposureFastMCP(FastMCP):
         campaign_id = str(bound.get("campaign_id") or "") or None
         campaign_id = campaign_id or (exposure.campaign_id if exposure else None)
         if campaign_id:
-            await self._refresh(session_key)
+            await self._refresh(session_key, campaign_id)
+            principal_id = str(bound.get("principal_id") or "").strip()
+            principal_id = (
+                principal_id
+                or (exposure.principal_id if exposure is not None else "")
+                or self._bound_principal_id
+                or LOCAL_SYSTEM_PRINCIPAL_ID
+            )
+            binding = self._context_binding_factory(campaign_id, principal_id, bound)
+            result = self._attach_host_context_binding(result, binding)
         return result
+
+    @staticmethod
+    def _attach_host_context_binding(result: Any, binding: dict[str, str] | None) -> Any:
+        if binding is None or not (isinstance(result, tuple) and len(result) == 2):
+            return result
+        content, structured = result
+
+        def attach(value: Any) -> Any:
+            if not isinstance(value, dict):
+                return value
+            updated = deepcopy(value)
+            payload = updated.get("result")
+            if isinstance(payload, dict):
+                payload["host_context_binding"] = deepcopy(binding)
+            else:
+                updated["host_context_binding"] = deepcopy(binding)
+            return updated
+
+        updated_content = []
+        for item in content:
+            if not isinstance(item, TextContent):
+                updated_content.append(item)
+                continue
+            try:
+                decoded = json.loads(item.text)
+            except json.JSONDecodeError:
+                updated_content.append(item)
+                continue
+            updated_content.append(
+                item.model_copy(
+                    update={
+                        "text": json.dumps(
+                            attach(decoded), ensure_ascii=False, separators=(",", ":")
+                        )
+                    }
+                )
+            )
+        # FastMCP validates structuredContent against each tool's declared
+        # return annotation after this override. Keep that value unchanged and
+        # carry the Host-only envelope in the JSON text representation.
+        return updated_content, structured
 
 
 def create_server(config: McpConfig | None = None) -> FastMCP:
@@ -266,6 +367,7 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
     campaigns = CampaignService(storage.database)
     branches = BranchService(storage.database)
     characters = CharacterService(storage.database)
+    actor_lifecycle = ActorLifecycleService(storage.database)
     access = AccessService(storage.database)
     memories = MemoryService(storage.database)
     knowledge = ActorKnowledgeService(storage.database)
@@ -292,6 +394,57 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
 
     def principal_fingerprint(principal_id: str) -> str:
         return hashlib.sha256(principal_id.encode("utf-8")).hexdigest()
+
+    def authoritative_host_context_binding(
+        campaign_id: str,
+        principal_id: str,
+        arguments: dict[str, Any] | None = None,
+    ) -> dict[str, str] | None:
+        membership = access.membership(campaign_id, principal_id)
+        branch = branches.current(campaign_id)
+        if membership is None or branch is None:
+            return None
+        values = dict(arguments or {})
+        data = values.get("data")
+        if isinstance(data, dict):
+            values = {**data, **values}
+        requested_audience = str(values.get("audience") or "").strip().casefold()
+        if membership.role not in {"owner", "dm"}:
+            audience = "player"
+        elif requested_audience in {"dm", "player"}:
+            audience = requested_audience
+        else:
+            audience = "dm"
+        value = {
+            "domain": "sagasmith-coc",
+            "campaign_id": campaign_id,
+            "principal_fingerprint": principal_fingerprint(principal_id),
+            "authorization_fingerprint": access.authorization_fingerprint(
+                campaign_id, principal_id
+            ),
+            "role": membership.role,
+            "audience": audience,
+            "branch_id": branch.id,
+            "memory_policy": "domain_authoritative",
+        }
+        epoch_fields = {
+            key: value[key]
+            for key in (
+                "domain",
+                "campaign_id",
+                "principal_fingerprint",
+                "authorization_fingerprint",
+                "role",
+                "audience",
+                "branch_id",
+            )
+        }
+        return {
+            **value,
+            "context_epoch": hashlib.sha256(
+                canonical_json(epoch_fields).encode("utf-8")
+            ).hexdigest(),
+        }
 
     def bounded_context_digest(value: dict[str, Any]) -> str:
         return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
@@ -336,6 +489,28 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
             if character.campaign_id != exposure.campaign_id:
                 raise ExposureError("actor target does not match the exposure campaign")
 
+    def allowed_tools_for_exposure(exposure: Exposure, phase: str) -> set[str]:
+        allowed = set(tools_for_phase(phase))
+        membership = (
+            access.membership(exposure.campaign_id, exposure.principal_id)
+            if exposure.campaign_id is not None
+            else None
+        )
+        for tool_id in tuple(allowed):
+            policy = policy_for_tool(tool_id)
+            if policy is None:
+                continue
+            if policy.local_only and exposure.principal_id != LOCAL_SYSTEM_PRINCIPAL_ID:
+                allowed.discard(tool_id)
+                continue
+            if policy.requires_campaign and membership is None:
+                allowed.discard(tool_id)
+                continue
+            roles = policy.roles(phase)
+            if roles and (membership is None or membership.role not in roles):
+                allowed.discard(tool_id)
+        return allowed
+
     mcp = SessionExposureFastMCP(
         "SagaSmith CoC",
         instructions=(
@@ -344,7 +519,10 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
         ),
         exposure_registry=exposures,
         phase_lookup=authoritative_phase,
+        allowed_tools_lookup=allowed_tools_for_exposure,
         scope_validator=validate_scope,
+        context_binding_factory=authoritative_host_context_binding,
+        authorization_fingerprint_lookup=access.authorization_fingerprint,
         bound_principal_id=config.bound_principal_id,
         host=config.http_host,
         port=config.http_port,
@@ -1022,6 +1200,9 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
                 "schema_version": NPC_CONVERSATION_SCHEMA_VERSION,
                 "contract": NPC_CONVERSATION_CONTRACT,
                 "proposal_contract": "npc-conversation-proposal.v4",
+                "public_tool": "npc_conversation",
+                "host_transport": "private_authenticated_unlisted",
+                "host_transport_tool": "npc_conversation_transport",
                 "stable_memory_candidate_ids": True,
                 "symmetric_heard_statement_candidates": True,
                 "actor_safe_transcript_recall": True,
@@ -1076,7 +1257,9 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
 
     @mcp.tool()
     def campaign_change(
-        action: Literal["create", "set_phase", "grant_campaign", "grant_actor"],
+        action: Literal[
+            "create", "set_phase", "grant_campaign", "revoke_campaign", "grant_actor"
+        ],
         data: dict[str, Any],
         campaign_id: str | None = None,
         principal_id: str = "system:local",
@@ -1126,6 +1309,8 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
         target = str(data.get("target_principal_id") or "")
         if not target:
             raise ValueError("data.target_principal_id is required")
+        if action == "revoke_campaign":
+            return asdict(access.revoke_campaign(campaign_id, target))
         access.ensure_principal(target, display_name=str(data.get("display_name") or ""))
         if action == "grant_campaign":
             return asdict(
@@ -1175,6 +1360,9 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
         principal_id: str = "system:local",
     ) -> dict[str, Any]:
         membership = access.require_campaign(campaign_id, principal_id)
+        key = str(data.get("idempotency_key") or "").strip()
+        if not key:
+            raise ValueError("data.idempotency_key is required")
         if action == "instantiate":
             require_dm(campaign_id, principal_id)
             template_id = str(data.get("template_id") or "").strip()
@@ -1183,23 +1371,29 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
             template = characters.get(template_id)
             if template.system_id != "coc7e" or template.character_type != "investigator":
                 raise ValueError("template must be a CoC investigator")
-            created = characters.instantiate(
-                template_id,
-                campaign_id=campaign_id,
-                name=(str(data["name"]) if data.get("name") is not None else None),
+            instance_name = (
+                str(data["name"]) if data.get("name") is not None else template.name
+            )
+            created = actor_lifecycle.create(
+                campaign_id,
+                system_id="coc7e",
+                template_id=template_id,
+                name=instance_name,
+                character_type=template.character_type,
                 player_name=(
                     str(data["player_name"]) if data.get("player_name") is not None else None
                 ),
+                summary=template.summary,
                 sheet=validate_investigator_sheet(dict(template.sheet)),
+                notes=deepcopy(template.notes),
+                principal_id=principal_id,
+                idempotency_key=key,
+                initial_grants=(InitialActorGrant(principal_id),),
+                expected_campaign_revision=int(data["expected_campaign_revision"]),
+                operation="character.instantiate",
+                actor=principal_id,
             )
-            access.grant_actor(
-                campaign_id,
-                principal_id,
-                created.id,
-                can_control=True,
-                can_view_private=True,
-            )
-            return asdict(created)
+            return asdict(created.character)
         if action == "create":
             character_type = str(data.get("character_type") or "investigator")
             if character_type not in {"investigator", "npc", "creature"}:
@@ -1209,24 +1403,23 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
             name = str(data.get("name") or "").strip()
             if not name:
                 raise ValueError("data.name is required")
-            created = characters.create(
+            created = actor_lifecycle.create(
+                campaign_id,
                 system_id="coc7e",
-                campaign_id=campaign_id,
                 name=name,
                 character_type=character_type,
                 player_name=data.get("player_name"),
                 summary=str(data.get("summary") or ""),
                 sheet=validate_investigator_sheet(dict(data.get("sheet") or {})),
                 notes=dict(data.get("notes") or {}),
+                principal_id=principal_id,
+                idempotency_key=key,
+                initial_grants=(InitialActorGrant(principal_id),),
+                expected_campaign_revision=int(data["expected_campaign_revision"]),
+                operation="character.create",
+                actor=principal_id,
             )
-            access.grant_actor(
-                campaign_id,
-                principal_id,
-                created.id,
-                can_control=True,
-                can_view_private=True,
-            )
-            return asdict(created)
+            return asdict(created.character)
         if character_id is None:
             raise ValueError("character_id is required")
         actor_access(campaign_id, character_id, principal_id, control=True)
@@ -1236,18 +1429,56 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
         }:
             raise PermissionError("combat character mutations require Keeper authority")
         current = characters.get(character_id)
-        sheet = validate_investigator_sheet(dict(data["sheet"])) if "sheet" in data else None
-        return asdict(
-            characters.update(
-                character_id,
-                name=data.get("name"),
-                player_name=data.get("player_name"),
-                summary=data.get("summary"),
-                sheet=sheet,
-                notes=dict(data["notes"]) if "notes" in data else None,
-                expected_revision=int(data.get("expected_revision", current.revision)),
-            )
+        if "expected_revision" not in data:
+            raise ValueError("data.expected_revision is required")
+        updated = {
+            **asdict(current),
+            "name": str(data.get("name", current.name)),
+            "player_name": data.get("player_name", current.player_name),
+            "summary": str(data.get("summary", current.summary)),
+            "sheet": (
+                validate_investigator_sheet(dict(data["sheet"]))
+                if "sheet" in data
+                else deepcopy(current.sheet)
+            ),
+            "notes": (
+                dict(data["notes"]) if "notes" in data else deepcopy(current.notes)
+            ),
+            "revision": current.revision + 1,
+        }
+        payload = {
+            "action": "update",
+            "campaign_id": campaign_id,
+            "character_id": character_id,
+            "data": deepcopy(data),
+        }
+        scope = f"character-update:{campaign_id}:{current_branch_id(campaign_id)}:{principal_id}"
+        replay = idempotency.lookup(scope, key, payload)
+        if replay is not None and replay.response is not None:
+            return dict(replay.response)
+        StateMutationService(storage.database).replace(
+            campaign_id,
+            character_updates=[
+                CharacterStateUpdate(
+                    character_id=character_id,
+                    name=updated["name"],
+                    player_name=updated["player_name"],
+                    summary=updated["summary"],
+                    sheet=updated["sheet"],
+                    notes=updated["notes"],
+                    expected_revision=int(data["expected_revision"]),
+                )
+            ],
+            operation="character.update",
+            actor=principal_id,
+            idempotency_key=key,
+            idempotency_write=IdempotencyWrite(
+                scope=scope,
+                payload=payload,
+                response=updated,
+            ),
         )
+        return updated
 
     @mcp.tool()
     def inventory_change(
@@ -4749,17 +4980,20 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
         raise ValueError(f"unsupported npc_conversation action: {action}")
 
     @mcp.tool()
-    def npc_conversation_worker(
-        action: Literal["claim_activation", "submit_proposal", "cancel_activation"],
+    def npc_conversation_transport(
         campaign_id: str,
         conversation_id: str,
-        data: dict[str, Any],
+        action: Literal["claim_activation", "submit_proposal", "cancel_activation"],
+        payload: dict[str, Any],
+        host_token: str,
         principal_id: str = LOCAL_SYSTEM_PRINCIPAL_ID,
     ) -> dict[str, Any]:
-        """Host-local transport for one isolated NPC worker activation."""
+        """Host-private activation transport; never appears in MCP tools/list."""
 
-        if principal_id != LOCAL_SYSTEM_PRINCIPAL_ID:
-            raise PermissionError("NPC conversation worker transport is local-only")
+        if not config.npc_host_token or not secrets.compare_digest(
+            host_token, config.npc_host_token
+        ):
+            raise PermissionError("NPC host transport authentication failed")
         require_dm(campaign_id, principal_id)
         session = npc_conversations.require_owner(
             conversation_id,
@@ -4767,6 +5001,7 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
             principal_id=principal_id,
         )
         npc_conversation_require_fresh(session)
+        data = dict(payload or {})
         common = {
             "activation_ref": str(data.get("activation_ref") or ""),
             "expected_revision": int(data["expected_conversation_revision"]),
@@ -4792,7 +5027,7 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
                 lease_id=str(data.get("lease_id") or ""),
                 **common,
             )
-        raise ValueError(f"unsupported NPC worker action: {action}")
+        raise ValueError(f"unsupported NPC host transport action: {action}")
 
     @mcp.tool()
     def actor_knowledge_query(
@@ -7581,6 +7816,11 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
                 principal_id=principal_id,
                 campaign_id=campaign_id,
                 phase=phase,
+                authorization_fingerprint=(
+                    access.authorization_fingerprint(campaign_id, principal_id)
+                    if campaign_id
+                    else ""
+                ),
             )
             return {
                 **exposures.status(opened),

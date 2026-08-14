@@ -38,6 +38,8 @@ CORE_TOOLS = frozenset(
     }
 )
 
+HOST_PRIVATE_TOOLS = frozenset({"npc_conversation_transport"})
+
 
 def _names(value: str) -> frozenset[str]:
     return frozenset(value.split())
@@ -62,7 +64,7 @@ PHASE_TOOLS = {
         branch_change branch_query character_query coc_dice_roll coc_hp_change
         chase_action chase_end chase_query chase_start coc_resolve coc_sanity_check
         combat_start campaign_event continuity_context memory_change memory_query state_revision
-        bounded_evaluation npc_conversation npc_conversation_worker
+        bounded_evaluation npc_conversation
         group_luck_check group_luck_query
         investigation_check investigation_query module_change module_query
         inventory_change rule_query wallet_change
@@ -94,7 +96,7 @@ PHASE_DM_TOOLS = {
         actor_knowledge_change branch_change campaign_change campaign_event memory_change
         memory_query module_change
         chase_end chase_start combat_start group_luck_check group_luck_query
-        npc_conversation npc_conversation_worker
+        npc_conversation
         snapshot_change snapshot_query state_revision
         """
     ),
@@ -104,7 +106,7 @@ PHASE_DM_TOOLS = {
 }
 
 NO_CAMPAIGN_TOOLS = frozenset({"campaign_change"})
-LOCAL_ONLY_TOOLS = frozenset({"npc_conversation_worker"})
+LOCAL_ONLY_TOOLS = frozenset()
 
 
 @dataclass(frozen=True)
@@ -152,7 +154,9 @@ def tools_for_phase(phase: str) -> frozenset[str]:
 
 def validate_profile_coverage(tool_names: Iterable[str]) -> None:
     missing = sorted(
-        name for name in tool_names if name not in CORE_TOOLS and name not in TOOL_POLICIES
+        name
+        for name in tool_names
+        if name not in HOST_PRIVATE_TOOLS and name not in CORE_TOOLS and name not in TOOL_POLICIES
     )
     if missing:
         raise RuntimeError(f"MCP tools missing a tool policy: {', '.join(missing)}")
