@@ -9,8 +9,8 @@
 ## 当前结论
 
 CoC 当前公开 50 个原生工具。`npc_conversation_transport` 是经过 Host token
-鉴权且永不出现在 `tools/list` 的私有 transport，不是第 51 个公开工具，也没有
-`npc_conversation_worker` 兼容入口。Agent 根据 server capability 私下调用 transport，
+鉴权且永不出现在 `tools/list` 的私有 transport，不是额外的公开工具，也没有
+旧公开 worker 兼容入口。Agent 根据 server capability 私下调用 transport，
 Director 只收到 server 验证后的 publication，看不到 capsule 或 raw proposal。
 
 | 能力域 | 当前 CoC 协议 | 当前证据 |
