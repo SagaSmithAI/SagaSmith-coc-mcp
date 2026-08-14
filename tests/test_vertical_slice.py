@@ -2216,7 +2216,7 @@ def test_branch_snapshot_and_revision_recovery_are_guarded_and_replayable(tmp_pa
                 {"action": "get", "campaign_id": campaign_id, "data": {"slot": 1}},
             )
         )["snapshot"]
-        assert document["storage_mode"] == "full"
+        assert "storage_mode" not in document
         assert document["valid"] is True
         assert document["payload"]["campaign"]["name"] == "Forked case"
         stored_database = Database(sqlite_database_url(config.database_path))
