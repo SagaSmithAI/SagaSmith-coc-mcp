@@ -70,9 +70,22 @@ from sagasmith_coc.engine.combat_state import (
 from sagasmith_coc.engine.combat_state import (
     start_combat as build_combat_state,
 )
-from sagasmith_coc.engine.development import resolve_luck_development, resolve_skill_development
+from sagasmith_coc.engine.development import (
+    development_query as query_development,
+)
+from sagasmith_coc.engine.development import (
+    resolve_luck_development,
+    settle_development,
+)
 from sagasmith_coc.engine.dice.rolls import roll_d100, roll_dice_expression
 from sagasmith_coc.engine.health import apply_damage, apply_healing
+from sagasmith_coc.engine.sheet import (
+    combat_weapon,
+    development_skill_eligible,
+    exact_sheet_value,
+    investigation_combined_traits,
+    investigation_trait,
+)
 from sagasmith_coc.module_profile import CocModuleProfile
 from sagasmith_coc.random_stream import (
     CampaignRandomStream,
@@ -644,42 +657,6 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
             "available_actions": list(dict.fromkeys(actions)),
         }
 
-    def exact_sheet_value(values: dict[str, Any], name: str, label: str) -> int:
-        folded = name.casefold()
-        matches = [int(value) for key, value in values.items() if str(key).casefold() == folded]
-        if len(matches) != 1:
-            raise ValueError(f"actor sheet must contain exactly one {label} {name!r}")
-        return matches[0]
-
-    def combat_weapon(sheet: dict[str, Any], weapon_name: str) -> dict[str, Any]:
-        folded = weapon_name.casefold()
-        matches = [
-            dict(item)
-            for item in list(sheet.get("weapons") or [])
-            if isinstance(item, dict) and str(item.get("name") or "").casefold() == folded
-        ]
-        if len(matches) != 1:
-            raise ValueError(f"actor sheet must contain exactly one weapon named {weapon_name!r}")
-        weapon = matches[0]
-        skill_field = weapon.get("skill")
-        skill_name = (
-            str(dict(skill_field).get("name") or "").strip()
-            if isinstance(skill_field, dict)
-            else str(skill_field or "").strip()
-        )
-        damage = str(weapon.get("damage") or "").strip()
-        if not skill_name or not damage:
-            raise ValueError("combat weapon requires skill and damage")
-        properties = dict(weapon.get("properties") or {})
-        return {
-            **weapon,
-            "name": weapon_name,
-            "skill_name": skill_name,
-            "damage": damage,
-            "ranged": bool(properties.get("rngd", False)),
-            "impaling": bool(properties.get("impl", False)),
-        }
-
     def require_lobby(campaign_id: str, operation: str) -> None:
         phase = authoritative_phase(campaign_id)
         if phase != PROFILE_LOBBY:
@@ -1008,63 +985,6 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
         if bool(outcome.get("push_eligible")) and not pending.get("decision"):
             actions.append("push")
         return actions
-
-    def investigation_trait(
-        sheet: dict[str, Any], trait_kind: str, trait_name: str
-    ) -> tuple[str, str, int]:
-        kind = str(trait_kind or "skill").strip().casefold()
-        name = str(trait_name or "").strip()
-        if kind == "luck":
-            if name and name.casefold() != "luck":
-                raise ValueError("a luck roll must use trait_name='Luck'")
-            return "luck", "Luck", int(sheet["luck"])
-        if not name:
-            raise ValueError("data.trait_name is required")
-        if kind == "skill":
-            return kind, name, exact_sheet_value(dict(sheet.get("skills") or {}), name, "skill")
-        if kind == "characteristic":
-            return (
-                kind,
-                name,
-                exact_sheet_value(
-                    dict(sheet.get("characteristics") or {}),
-                    name,
-                    "characteristic",
-                ),
-            )
-        raise ValueError("trait_kind must be skill, characteristic, or luck")
-
-    def investigation_combined_traits(
-        sheet: dict[str, Any],
-        raw_traits: Any,
-        *,
-        default_difficulty: str = "regular",
-    ) -> list[dict[str, Any]]:
-        if not isinstance(raw_traits, list):
-            raise ValueError("data.traits must be an array for a combined check")
-        values = []
-        for raw in raw_traits:
-            if not isinstance(raw, dict):
-                raise ValueError("every combined trait must be an object")
-            kind, name, threshold = investigation_trait(
-                sheet,
-                str(raw.get("trait_kind") or raw.get("kind") or "skill"),
-                str(raw.get("trait_name") or raw.get("name") or ""),
-            )
-            if kind == "luck":
-                raise ValueError("Luck cannot be one component of a combined check")
-            values.append(
-                {
-                    "kind": kind,
-                    "name": name,
-                    "threshold": threshold,
-                    "difficulty": str(raw.get("difficulty") or default_difficulty),
-                }
-            )
-        return values
-
-    def development_skill_eligible(skill_name: str) -> bool:
-        return str(skill_name).strip().casefold() != "cthulhu mythos"
 
     def require_investigation_play(campaign_id: str) -> Any:
         campaign = campaigns.get(campaign_id)
@@ -5483,34 +5403,12 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
         campaign = campaigns.get(campaign_id)
         actor = characters.get(actor_id)
         sheet = validate_investigator_sheet(dict(actor.sheet))
-        checked = [
-            str(item).strip()
-            for item in list(dict(sheet.get("development") or {}).get("checked_skills") or [])
-            if str(item).strip()
-        ]
-        skills = dict(sheet.get("skills") or {})
-        actual_skill_names = {str(name).casefold(): str(name) for name in skills}
-        pending = []
-        for skill_name in checked:
-            canonical_name = actual_skill_names[skill_name.casefold()]
-            pending.append(
-                {
-                    "skill_name": canonical_name,
-                    "current_value": exact_sheet_value(skills, skill_name, "skill"),
-                    "eligible": development_skill_eligible(canonical_name),
-                    "reason": (
-                        None
-                        if development_skill_eligible(canonical_name)
-                        else "Cthulhu Mythos does not use ordinary development checks"
-                    ),
-                }
-            )
         return {
             "campaign_id": campaign_id,
             "campaign_revision": campaign.revision,
             "actor_id": actor_id,
             "character_revision": actor.revision,
-            "pending": pending,
+            "pending": query_development(sheet),
         }
 
     @mcp.tool()
@@ -5559,75 +5457,18 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
                 f"expected {expected_character_revision}, found {actor.revision}"
             )
         sheet = validate_investigator_sheet(dict(actor.sheet))
-        development = dict(sheet.get("development") or {})
-        checked = [
-            str(item).strip()
-            for item in list(development.get("checked_skills") or [])
-            if str(item).strip()
-        ]
-        if not checked:
-            raise ValueError("actor has no checked skills awaiting development")
-        if len(set(name.casefold() for name in checked)) != len(checked):
-            raise ValueError("checked skill names must be unique")
-        skills = dict(sheet.get("skills") or {})
-        actual_skill_names = {str(name).casefold(): str(name) for name in skills}
         stream = CampaignRandomStream.from_campaign_state(
             campaign_id,
             campaign.state,
             operation="development_settle",
             idempotency_key=key,
         )
-        results: list[dict[str, Any]] = []
-        san_before = int(sheet["san"])
-        san_current = san_before
         with use_random_stream(stream):
-            for skill_name in checked:
-                canonical_name = actual_skill_names[skill_name.casefold()]
-                current = exact_sheet_value(skills, skill_name, "skill")
-                if not development_skill_eligible(canonical_name):
-                    results.append(
-                        {
-                            "skill_name": canonical_name,
-                            "current_value": current,
-                            "eligible": False,
-                            "reason": "Cthulhu Mythos does not use ordinary development checks",
-                        }
-                    )
-                    continue
-                result = resolve_skill_development(current)
-                skills[canonical_name] = int(result["new_value"])
-                san_gain = min(
-                    int(result["san_recovery"]),
-                    max(0, int(sheet["san_max"]) - san_current),
-                )
-                san_current += san_gain
-                results.append(
-                    {
-                        "skill_name": canonical_name,
-                        "eligible": True,
-                        **result,
-                        "san_applied": san_gain,
-                    }
-                )
-        receipt = {
-            "sequence": len(list(development.get("history") or [])) + 1,
-            "source": source_value,
-            "actor_id": actor_id,
-            "results": results,
-            "san_before": san_before,
-            "san_after": san_current,
-        }
-        development["checked_skills"] = []
-        development["history"] = [
-            *list(development.get("history") or [])[-99:],
-            receipt,
-        ]
-        next_sheet = {
-            **sheet,
-            "skills": skills,
-            "san": san_current,
-            "development": development,
-        }
+            next_sheet, receipt = settle_development(
+                sheet,
+                source=source_value,
+                actor_id=actor_id,
+            )
         next_state = {
             **dict(campaign.state),
             "random_stream": stream.persisted_state(),
