@@ -46,7 +46,6 @@ from sagasmith_coc.engine.checks.combat import resolve_melee_attack, resolve_ran
 from sagasmith_coc.engine.checks.sanity import resolve_sanity_check, resolve_sanity_loss
 from sagasmith_coc.engine.checks.skill import (
     group_luck_candidates,
-    resolve_combined_check,
     resolve_opposed_check,
     resolve_skill_check,
 )
@@ -75,12 +74,14 @@ from sagasmith_coc.engine.development import (
 )
 from sagasmith_coc.engine.dice.rolls import roll_d100, roll_dice_expression
 from sagasmith_coc.engine.health import apply_damage, apply_healing
+from sagasmith_coc.engine.investigation import (
+    resolve_investigation_check,
+    spend_luck_on_investigation,
+)
 from sagasmith_coc.engine.sheet import (
     combat_weapon,
     development_skill_eligible,
     exact_sheet_value,
-    investigation_combined_traits,
-    investigation_trait,
 )
 from sagasmith_coc.module_profile import CocModuleProfile
 from sagasmith_coc.random_stream import (
@@ -5738,9 +5739,6 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
                 raise ValueError("data.source must contain 1 to 500 characters")
             if not goal or len(goal) > 500:
                 raise ValueError("data.goal must contain 1 to 500 characters")
-            difficulty = str(data.get("difficulty") or "regular")
-            bonus_dice = int(data.get("bonus_dice", 0))
-            penalty_dice = int(data.get("penalty_dice", 0))
             check_id = hashlib.sha256(
                 f"{campaign_id}:{branch_id}:{actor_id}:{key}".encode()
             ).hexdigest()[:24]
@@ -5751,60 +5749,18 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
                 idempotency_key=key,
             )
             with use_random_stream(stream):
-                roll = roll_d100(bonus_dice=bonus_dice, penalty_dice=penalty_dice)
-                if data.get("traits") is not None:
-                    traits = investigation_combined_traits(
-                        sheet,
-                        data["traits"],
-                        default_difficulty=difficulty,
-                    )
-                    requirement = str(data.get("requirement") or "").strip().casefold()
-                    outcome = resolve_combined_check(
-                        int(roll["total"]),
-                        traits,
-                        requirement=requirement,
-                        bonus_dice=bonus_dice,
-                        penalty_dice=penalty_dice,
-                    )
-                    check_shape = {
-                        "check_kind": "combined",
-                        "traits": traits,
-                        "requirement": requirement,
-                    }
-                else:
-                    trait_kind, trait_name, threshold = investigation_trait(
-                        sheet,
-                        str(data.get("trait_kind") or "skill"),
-                        str(data.get("trait_name") or ""),
-                    )
-                    outcome = resolve_skill_check(
-                        int(roll["total"]),
-                        threshold,
-                        difficulty=difficulty,
-                        bonus_dice=bonus_dice,
-                        penalty_dice=penalty_dice,
-                        skill_name=trait_name,
-                        investigator_name=actor.name,
-                        roll_kind=trait_kind,
-                    )
-                    check_shape = {
-                        "check_kind": "single",
-                        "trait_kind": trait_kind,
-                        "trait_name": trait_name,
-                        "threshold": threshold,
-                        "difficulty": difficulty,
-                    }
+                resolution = resolve_investigation_check(
+                    sheet,
+                    data,
+                    investigator_name=actor.name,
+                )
             pending = {
                 "id": check_id,
                 "actor_id": actor_id,
                 "actor_revision": actor.revision,
                 "source": source,
                 "goal": goal,
-                **check_shape,
-                "bonus_dice": bonus_dice,
-                "penalty_dice": penalty_dice,
-                "roll": roll,
-                "outcome": outcome,
+                **resolution,
                 "decision": None,
             }
             pending_by_actor[actor_id] = pending
@@ -5854,41 +5810,14 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
             if "spend_luck" not in investigation_actions(campaign, pending):
                 raise ValueError("the pending check cannot spend Luck")
             spent = int(data.get("luck_spent", 0))
-            if spent <= 0 or spent > int(sheet["luck"]):
-                raise ValueError("luck_spent must be positive and no greater than current Luck")
-            if pending.get("check_kind") == "combined":
-                outcome = resolve_combined_check(
-                    int(dict(pending["roll"])["total"]),
-                    list(pending["traits"]),
-                    requirement=str(pending["requirement"]),
-                    bonus_dice=int(pending["bonus_dice"]),
-                    penalty_dice=int(pending["penalty_dice"]),
-                    luck_spent=spent,
-                )
-            else:
-                outcome = resolve_skill_check(
-                    int(dict(pending["roll"])["total"]),
-                    int(pending["threshold"]),
-                    difficulty=str(pending["difficulty"]),
-                    bonus_dice=int(pending["bonus_dice"]),
-                    penalty_dice=int(pending["penalty_dice"]),
-                    luck_spent=spent,
-                    skill_name=str(pending["trait_name"]),
-                    investigator_name=actor.name,
-                    roll_kind=str(pending["trait_kind"]),
-                )
-            next_sheet = dict(sheet)
-            next_sheet["luck"] = int(sheet["luck"]) - spent
-            next_sheet["luck_events"] = [
-                *list(sheet.get("luck_events") or [])[-499:],
-                {
-                    "check_id": pending["id"],
-                    "source": pending["source"],
-                    "spent": spent,
-                    "before": int(sheet["luck"]),
-                    "after": int(sheet["luck"]) - spent,
-                },
-            ]
+            luck_transition = spend_luck_on_investigation(
+                sheet,
+                pending,
+                spent,
+                investigator_name=actor.name,
+            )
+            next_sheet = dict(luck_transition["sheet"])
+            outcome = dict(luck_transition["outcome"])
             pending = {
                 **pending,
                 "actor_revision": actor.revision + 1,
@@ -5948,56 +5877,31 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
                 idempotency_key=key,
             )
             with use_random_stream(stream):
-                roll = roll_d100(bonus_dice=bonus_dice, penalty_dice=penalty_dice)
                 if pending.get("check_kind") == "combined":
-                    traits = investigation_combined_traits(
-                        sheet,
-                        data.get("traits", pending["traits"]),
-                        default_difficulty=str(data.get("difficulty") or "regular"),
-                    )
-                    requirement = (
-                        str(data.get("requirement") or pending["requirement"]).strip().casefold()
-                    )
-                    outcome = resolve_combined_check(
-                        int(roll["total"]),
-                        traits,
-                        requirement=requirement,
-                        bonus_dice=bonus_dice,
-                        penalty_dice=penalty_dice,
-                        pushed=True,
-                    )
-                    pushed_shape = {"traits": traits, "requirement": requirement}
-                else:
-                    trait_kind, trait_name, threshold = investigation_trait(
-                        sheet,
-                        str(data.get("trait_kind") or pending["trait_kind"]),
-                        str(data.get("trait_name") or pending["trait_name"]),
-                    )
-                    difficulty = str(data.get("difficulty") or pending["difficulty"])
-                    outcome = resolve_skill_check(
-                        int(roll["total"]),
-                        threshold,
-                        difficulty=difficulty,
-                        bonus_dice=bonus_dice,
-                        penalty_dice=penalty_dice,
-                        skill_name=trait_name,
-                        investigator_name=actor.name,
-                        pushed=True,
-                        roll_kind=trait_kind,
-                    )
-                    pushed_shape = {
-                        "trait_kind": trait_kind,
-                        "trait_name": trait_name,
-                        "threshold": threshold,
-                        "difficulty": difficulty,
+                    declaration = {
+                        "traits": data.get("traits", pending["traits"]),
+                        "requirement": data.get("requirement", pending["requirement"]),
+                        "difficulty": data.get("difficulty", "regular"),
+                        "bonus_dice": bonus_dice,
+                        "penalty_dice": penalty_dice,
                     }
+                else:
+                    declaration = {
+                        "trait_kind": data.get("trait_kind", pending["trait_kind"]),
+                        "trait_name": data.get("trait_name", pending["trait_name"]),
+                        "difficulty": data.get("difficulty", pending["difficulty"]),
+                        "bonus_dice": bonus_dice,
+                        "penalty_dice": penalty_dice,
+                    }
+                resolution = resolve_investigation_check(
+                    sheet,
+                    declaration,
+                    investigator_name=actor.name,
+                    pushed=True,
+                )
             pending = {
                 **pending,
-                **pushed_shape,
-                "bonus_dice": bonus_dice,
-                "penalty_dice": penalty_dice,
-                "roll": roll,
-                "outcome": outcome,
+                **resolution,
                 "decision": {
                     "kind": "push",
                     "justification": justification,
