@@ -47,7 +47,7 @@ from sagasmith_coc.engine.checks.chase import (
     resolve_chase_speed_check,
 )
 from sagasmith_coc.engine.checks.combat import resolve_melee_attack, resolve_ranged_attack
-from sagasmith_coc.engine.checks.sanity import resolve_sanity_loss, roll_bout_of_madness
+from sagasmith_coc.engine.checks.sanity import resolve_sanity_check, resolve_sanity_loss
 from sagasmith_coc.engine.checks.skill import (
     group_luck_candidates,
     resolve_combined_check,
@@ -6214,9 +6214,6 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
                 f"expected {expected_character_revision}, found {actor.revision}"
             )
         sheet = validate_investigator_sheet(dict(actor.sheet))
-        current_san = int(sheet["san"])
-        if current_san <= 0:
-            raise ValueError("an actor with zero SAN cannot make another SAN check")
         stream = CampaignRandomStream.from_campaign_state(
             campaign_id,
             campaign.state,
@@ -6224,60 +6221,24 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
             idempotency_key=key,
         )
         with use_random_stream(stream):
-            sanity_roll = roll_d100()
-            succeeded = int(sanity_roll["total"]) <= current_san
-            selected_formula = formulas["success" if succeeded else "failure"]
-            loss_roll = roll_dice_expression(selected_formula)
-            if int(loss_roll["total"]) < 0:
-                raise ValueError("SAN loss expressions must not produce a negative result")
-            int_roll = None
-            int_success = None
-            if int(loss_roll["total"]) >= 5:
-                int_roll = roll_d100()
-                int_success = int(int_roll["total"]) <= int(sheet["characteristics"]["int"])
-            outcome = resolve_sanity_loss(
-                current_san=current_san,
-                san_max=int(sheet["san_max"]),
-                loss_amount=int(loss_roll["total"]),
-                daily_loss_accumulated=int(sheet.get("san_daily_loss", 0)),
-                daily_limit=int(sheet.get("san_daily_limit", max(1, current_san // 5))),
-                cthulhu_mythos_value=int(sheet.get("cthulhu_mythos", 0)),
-                is_mythos_hardened=bool(sheet.get("mythos_hardened", False)),
-                pulp_rules=str(sheet.get("ruleset") or "classic") == "pulp",
-                investigator_name=actor.name,
+            settled = resolve_sanity_check(
+                sheet,
+                success_loss=formulas["success"],
+                failure_loss=formulas["failure"],
                 source=source_value,
-                int_check_success=int_success,
+                context=context,
+                investigator_name=actor.name,
+                event_id=key,
             )
-            bout = None
-            if outcome["bout_of_madness"]:
-                bout = {
-                    **roll_bout_of_madness(real_time=context == "real_time"),
-                    "duration": roll_dice_expression("1D10"),
-                    "duration_unit": "rounds" if context == "real_time" else "hours",
-                }
-        conditions = dict(sheet.get("conditions") or {})
-        conditions["temporary_insanity"] = bool(outcome["temp_insanity"])
-        conditions["indefinite_insanity"] = bool(outcome["indef_insanity"])
-        conditions["permanent_insanity"] = outcome["insanity_type"] == "permanent"
-        sheet["conditions"] = conditions
-        sheet["san"] = int(outcome["new_san"])
-        sheet["san_daily_loss"] = int(outcome["daily_loss_accumulated"])
-        event = {
-            "idempotency_key": key,
-            "source": source_value,
-            "context": context,
-            "sanity_roll": sanity_roll,
-            "succeeded": succeeded,
-            "loss_formula": selected_formula,
-            "loss_roll": loss_roll,
-            "int_roll": int_roll,
-            "outcome": outcome,
-            "bout": bout,
-        }
-        sheet["sanity_loss_events"] = [
-            *list(sheet.get("sanity_loss_events") or [])[-499:],
-            event,
-        ]
+        sheet = dict(settled["sheet"])
+        event = dict(settled["event"])
+        conditions = dict(settled["conditions"])
+        sanity_roll = dict(event["sanity_roll"])
+        succeeded = bool(event["succeeded"])
+        loss_roll = dict(event["loss_roll"])
+        int_roll = deepcopy(event["int_roll"])
+        outcome = dict(event["outcome"])
+        bout = deepcopy(event["bout"])
         next_state = {**dict(campaign.state), "random_stream": stream.persisted_state()}
         response = {
             "campaign_revision": campaign.revision + 1,
