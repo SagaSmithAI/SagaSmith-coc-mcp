@@ -32,15 +32,11 @@ from sagasmith_coc.engine.character_state import (
     settle_source_study,
 )
 from sagasmith_coc.engine.chase_state import (
-    advance_chase_turn,
-    set_effective_mov,
-    take_chase_action,
-)
-from sagasmith_coc.engine.chase_state import (
     end_chase as close_chase_state,
 )
 from sagasmith_coc.engine.chase_state import (
-    start_chase as build_chase_state,
+    resolve_chase_turn_action,
+    start_chase_with_speed_checks,
 )
 from sagasmith_coc.engine.checks.chase import (
     resolve_chase_action,
@@ -6523,50 +6519,20 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
             )
         if set(revision_map) != {item["actor_id"] for item in prepared}:
             raise ValueError("expected_character_revisions must exactly match participants")
-        base_slowest = min(int(item["base_mov"]) for item in prepared)
         stream = CampaignRandomStream.from_campaign_state(
             campaign_id,
             campaign.state,
             operation="chase_start",
             idempotency_key=key,
         )
-        speed_checks: dict[str, dict[str, Any]] = {}
-        state_participants: list[dict[str, Any]] = []
         with use_random_stream(stream):
-            for item in prepared:
-                roll = roll_d100()
-                outcome = resolve_chase_speed_check(
-                    int(roll["total"]),
-                    int(item["speed_skill"]),
-                    int(item["base_mov"]),
-                    base_slowest,
-                    participant_name=str(item["name"]),
-                )
-                speed_checks[str(item["actor_id"])] = {
-                    "skill_name": item["speed_skill_name"],
-                    "skill_value": item["speed_skill"],
-                    "roll": roll,
-                    "outcome": outcome,
-                }
-                state_participants.append(
-                    {
-                        "actor_id": item["actor_id"],
-                        "name": item["name"],
-                        "role": item["role"],
-                        "participant_kind": item["participant_kind"],
-                        "vehicle": item["vehicle"],
-                        "effective_mov": int(outcome["new_mov"]),
-                        "dex": item["dex"],
-                        "position": item["position"],
-                    }
-                )
-        chase = build_chase_state(
-            state_participants,
-            source=source_value,
-            route=list(route or []),
-        )
-        for actor_id, check in speed_checks.items():
-            check["outcome"]["actions"] = chase["participants"][actor_id]["action_points"]
+            started = start_chase_with_speed_checks(
+                prepared,
+                source=source_value,
+                route=list(route or []),
+            )
+        chase = dict(started["chase"])
+        speed_checks = dict(started["speed_checks"])
         next_state = {
             **dict(campaign.state),
             "game_phase": PROFILE_PLAY,
@@ -6644,18 +6610,20 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
                 "campaign revision conflict: "
                 f"expected {expected_revision}, found {campaign.revision}"
             )
-        if actor_id != str(chase.get("current_actor_id") or ""):
-            raise ValueError("only the current chase actor may act")
         source_value = " ".join(str(data.get("source") or "").split()).strip()
         result: dict[str, Any] | None = None
         stream = None
         if action == "end_turn":
-            next_chase = advance_chase_turn(chase)
-        elif action == "move":
-            next_chase = take_chase_action(
+            transition = resolve_chase_turn_action(
                 chase,
                 actor_id,
-                action_type="move",
+                action="end_turn",
+            )
+        elif action == "move":
+            transition = resolve_chase_turn_action(
+                chase,
+                actor_id,
+                action="move",
                 cost=int(data.get("cost", 1)),
                 position_change=int(data.get("position_change", 1)),
                 source=source_value,
@@ -6685,64 +6653,25 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
                 idempotency_key=key,
             )
             with use_random_stream(stream):
-                roll = roll_d100(
+                transition = resolve_chase_turn_action(
+                    chase,
+                    actor_id,
+                    action=action,
+                    source=source_value,
+                    cost=int(data.get("cost", 1)),
+                    action_type=str(data.get("action_type") or "check"),
+                    skill_name=skill_name,
+                    skill_value=skill_value,
+                    actor_name=actor.name,
+                    difficulty=str(data.get("difficulty") or "regular"),
                     bonus_dice=int(data.get("bonus_dice", 0)),
                     penalty_dice=int(data.get("penalty_dice", 0)),
+                    success_position_change=int(data.get("success_position_change", 0)),
+                    failure_position_change=int(data.get("failure_position_change", 0)),
                 )
-                if action == "speed_check":
-                    outcome = resolve_chase_speed_check(
-                        int(roll["total"]),
-                        skill_value,
-                        int(chase["participants"][actor_id]["effective_mov"]),
-                        int(chase["slowest_mov"]),
-                        difficulty=str(data.get("difficulty") or "regular"),
-                        participant_name=actor.name,
-                    )
-                    next_chase = take_chase_action(
-                        chase,
-                        actor_id,
-                        action_type="speed_check",
-                        cost=int(data.get("cost", 1)),
-                        source=source_value,
-                    )
-                    next_chase = set_effective_mov(
-                        next_chase,
-                        actor_id,
-                        int(outcome["new_mov"]),
-                        source=source_value,
-                    )
-                else:
-                    outcome = resolve_skill_check(
-                        int(roll["total"]),
-                        skill_value,
-                        difficulty=str(data.get("difficulty") or "regular"),
-                        bonus_dice=int(data.get("bonus_dice", 0)),
-                        penalty_dice=int(data.get("penalty_dice", 0)),
-                        skill_name=skill_name,
-                        investigator_name=actor.name,
-                    )
-                    position_change = int(
-                        data.get(
-                            "success_position_change"
-                            if outcome["success"]
-                            else "failure_position_change",
-                            0,
-                        )
-                    )
-                    next_chase = take_chase_action(
-                        chase,
-                        actor_id,
-                        action_type=str(data.get("action_type") or "check"),
-                        cost=int(data.get("cost", 1)),
-                        position_change=position_change,
-                        source=source_value,
-                    )
-                result = {
-                    "skill_name": skill_name,
-                    "skill_value": skill_value,
-                    "roll": roll,
-                    "outcome": outcome,
-                }
+        next_chase = dict(transition["chase"])
+        if transition["resolution"] is not None:
+            result = dict(transition["resolution"])
         next_state = {**dict(campaign.state), "chase": next_chase}
         if stream is not None:
             next_state["random_stream"] = stream.persisted_state()
