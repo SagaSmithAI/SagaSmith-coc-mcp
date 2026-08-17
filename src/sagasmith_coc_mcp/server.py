@@ -49,15 +49,16 @@ from sagasmith_coc.engine.checks.skill import (
     resolve_opposed_check,
     resolve_skill_check,
 )
+from sagasmith_coc.engine.combat_resolution import (
+    combat_attack_profile,
+    resolve_combat_attack,
+)
 from sagasmith_coc.engine.combat_state import (
     advance_turn as advance_combat_turn,
 )
 from sagasmith_coc.engine.combat_state import (
     combat_distance_feet,
     move_combatant,
-    outnumbering_bonus_dice,
-    record_attack,
-    record_defense,
 )
 from sagasmith_coc.engine.combat_state import (
     join_combat as join_combat_state,
@@ -79,7 +80,6 @@ from sagasmith_coc.engine.investigation import (
     spend_luck_on_investigation,
 )
 from sagasmith_coc.engine.sheet import (
-    combat_weapon,
     development_skill_eligible,
     exact_sheet_value,
 )
@@ -6931,14 +6931,8 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
                     f"expected {expected_target_revision}, found {target.revision}"
                 )
             attacker_sheet = validate_investigator_sheet(dict(attacker.sheet))
-            weapon = combat_weapon(attacker_sheet, weapon_name)
-            if weapon["ranged"] and int(weapon.get("ammo", 0)) < 1:
-                raise ValueError("ranged weapon has no ammunition")
-            attacker_threshold = exact_sheet_value(
-                dict(attacker_sheet.get("skills") or {}),
-                str(weapon["skill_name"]),
-                "combat skill",
-            )
+            attack_profile = combat_attack_profile(attacker_sheet, weapon_name)
+            weapon = dict(attack_profile["weapon"])
             if combat["positioning_mode"] == "agent":
                 spatial = dict(data.get("spatial_ruling") or {})
                 if (
@@ -6970,18 +6964,11 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
                 "target_revision": target.revision,
                 "attacker_name": attacker.name,
                 "target_name": target.name,
-                "weapon": weapon,
-                "attacker_threshold": attacker_threshold,
-                "damage_bonus": str(attacker_sheet.get("damage_bonus") or "0"),
+                **attack_profile,
                 "source": source_value,
                 "range_band": str(data.get("range_band") or "normal"),
                 "spatial_ruling": spatial,
                 "distance_feet": distance_feet,
-                "response_options": (
-                    ["none", "dive_for_cover"]
-                    if weapon["ranged"]
-                    else ["none", "dodge", "fight-back"]
-                ),
             }
             next_combat = {**combat, "pending_choice": pending}
             next_combat["events"] = [
@@ -7064,22 +7051,6 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
         attacker_sheet = validate_investigator_sheet(dict(attacker.sheet))
         target_sheet = validate_investigator_sheet(dict(target.sheet))
         weapon = dict(pending["weapon"])
-        target_weapon = None
-        target_threshold = None
-        if defense == "dodge":
-            target_threshold = int(target_sheet["dodge"])
-        elif defense == "fight-back":
-            target_weapon_name = str(data.get("target_weapon_name") or "").strip()
-            if not target_weapon_name:
-                raise ValueError("data.target_weapon_name is required to fight back")
-            target_weapon = combat_weapon(target_sheet, target_weapon_name)
-            if target_weapon["ranged"]:
-                raise ValueError("a ranged weapon cannot be used to fight back")
-            target_threshold = exact_sheet_value(
-                dict(target_sheet.get("skills") or {}),
-                str(target_weapon["skill_name"]),
-                "combat skill",
-            )
         stream = CampaignRandomStream.from_campaign_state(
             campaign_id,
             campaign.state,
@@ -7087,100 +7058,24 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
             idempotency_key=key,
         )
         with use_random_stream(stream):
-            defense_roll = None
-            dive_success = False
-            if defense in {"dodge", "fight-back", "dive_for_cover"}:
-                defense_roll = roll_d100()
-            if defense == "dive_for_cover":
-                dodge = resolve_skill_check(
-                    int(defense_roll["total"]),
-                    int(target_sheet["dodge"]),
-                    skill_name="Dodge",
-                    investigator_name=target.name,
-                )
-                dive_success = bool(dodge["success"])
-            bonus_dice = outnumbering_bonus_dice(
+            transition = resolve_combat_attack(
                 combat,
-                target_id,
-                ranged=bool(weapon["ranged"]),
+                attacker_sheet,
+                target_sheet,
+                pending,
+                defense=defense,
+                attacker_name=attacker.name,
+                target_name=target.name,
+                target_weapon_name=data.get("target_weapon_name"),
             )
-            penalty_dice = 1 if dive_success else 0
-            attack_roll = roll_d100(
-                bonus_dice=bonus_dice,
-                penalty_dice=penalty_dice,
-            )
-            if weapon["ranged"]:
-                resolution = resolve_ranged_attack(
-                    int(attack_roll["total"]),
-                    int(pending["attacker_threshold"]),
-                    str(weapon["damage"]),
-                    range_band=str(pending["range_band"]),
-                    damage_bonus=str(pending["damage_bonus"]),
-                    bonus_dice=bonus_dice,
-                    penalty_dice=penalty_dice,
-                    malfunction=(
-                        int(weapon["malfunction"])
-                        if weapon.get("malfunction") is not None
-                        else None
-                    ),
-                    attacker_name=attacker.name,
-                    weapon_name=str(weapon["name"]),
-                    impaling=bool(weapon["impaling"]),
-                )
-            else:
-                resolution = resolve_melee_attack(
-                    int(attack_roll["total"]),
-                    int(pending["attacker_threshold"]),
-                    damage_bonus=str(pending["damage_bonus"]),
-                    weapon_damage=str(weapon["damage"]),
-                    target_dodge=target_threshold if defense == "dodge" else None,
-                    target_fighting=(target_threshold if defense == "fight-back" else None),
-                    target_roll=(int(defense_roll["total"]) if defense_roll is not None else None),
-                    defense=defense,
-                    bonus_dice=bonus_dice,
-                    attacker_name=attacker.name,
-                    weapon_name=str(weapon["name"]),
-                    target_weapon_damage=(str(target_weapon["damage"]) if target_weapon else None),
-                    target_damage_bonus=str(target_sheet.get("damage_bonus") or "0"),
-                    impaling=bool(weapon["impaling"]),
-                    target_impaling=bool(target_weapon and target_weapon["impaling"]),
-                )
-
-            damaged_id = None
-            damage_value = 0
-            if resolution.get("damage") is not None:
-                damaged_id = target_id
-                damage_value = int(resolution["damage"]["total"])
-            elif resolution.get("counterattack") is not None:
-                damaged_id = attacker_id
-                damage_value = int(resolution["counterattack"]["total"])
-            health_transition = None
-            if damaged_id is not None:
-                damaged_sheet = target_sheet if damaged_id == target_id else attacker_sheet
-                preview = apply_damage(damaged_sheet, damage_value)
-                con_success = None
-                con_roll = None
-                if preview["requires_con_check"]:
-                    con_roll = roll_d100()
-                    con_success = int(con_roll["total"]) <= int(
-                        damaged_sheet["characteristics"]["con"]
-                    )
-                health_transition = apply_damage(
-                    damaged_sheet,
-                    damage_value,
-                    con_check_success=con_success,
-                )
-            else:
-                con_roll = None
-
-        next_combat = record_attack(combat, attacker_id)
-        if defense != "none":
-            next_combat = record_defense(
-                next_combat,
-                target_id,
-                dive_for_cover=defense == "dive_for_cover",
-            )
-        next_combat["pending_choice"] = None
+        next_combat = dict(transition["combat"])
+        resolution = dict(transition["resolution"])
+        attack_roll = dict(transition["attack_roll"])
+        defense_roll = transition["defense_roll"]
+        dive_success = bool(transition["dive_success"])
+        damaged_id = transition["damaged_actor_id"]
+        health_transition = transition["health_transition"]
+        con_roll = transition["con_roll"]
         event = {
             "type": "attack_resolved",
             "pending_id": pending["id"],
@@ -7206,20 +7101,12 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
             "combat": next_combat,
             "random_stream": stream.persisted_state(),
         }
-        updates_by_id: dict[str, dict[str, Any]] = {}
-        if weapon["ranged"]:
-            next_attacker_sheet = dict(attacker_sheet)
-            next_weapons = [dict(item) for item in next_attacker_sheet["weapons"]]
-            matching_indexes = [
-                index
-                for index, item in enumerate(next_weapons)
-                if str(item.get("name") or "").casefold() == str(weapon["name"]).casefold()
-            ]
-            next_weapons[matching_indexes[0]]["ammo"] = int(weapon["ammo"]) - 1
-            next_attacker_sheet["weapons"] = next_weapons
-            updates_by_id[attacker_id] = next_attacker_sheet
+        updates_by_id = {
+            str(actor_id): dict(sheet)
+            for actor_id, sheet in dict(transition["sheet_updates"]).items()
+        }
         if health_transition is not None and damaged_id is not None:
-            damaged_sheet = dict(health_transition["sheet"])
+            damaged_sheet = dict(updates_by_id[damaged_id])
             damaged_sheet["health_events"] = [
                 *list(damaged_sheet.get("health_events") or [])[-499:],
                 {
@@ -7235,8 +7122,6 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
                     },
                 },
             ]
-            if damaged_id in updates_by_id:
-                damaged_sheet["weapons"] = updates_by_id[damaged_id]["weapons"]
             updates_by_id[damaged_id] = damaged_sheet
         character_updates = [
             CharacterStateUpdate(
