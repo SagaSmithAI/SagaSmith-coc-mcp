@@ -1428,6 +1428,19 @@ def test_sanity_check_commits_rolls_actor_state_and_bout_atomically(tmp_path) ->
         assert settled["conditions"]["indefinite_insanity"] is False
         assert settled["resolution"]["bout"]["duration_unit"] == "rounds"
         assert settled["random_stream_receipt"]["draw_count"] == 6
+        presentation = await call(
+            server,
+            "resolution_presentation",
+            {
+                "campaign_id": campaign["id"],
+                "resolution_id": settled["resolution_id"],
+                "principal_id": "player:armitage",
+            },
+        )
+        assert presentation["operation"] == "coc_sanity_check"
+        assert presentation["audience"]["actor_refs"] == [investigator["id"]]
+        assert len(presentation["rolls"]) >= 3
+        assert presentation["outcome"]["san_loss"] == 5
         actor = await call(
             server,
             "character_query",
@@ -1773,6 +1786,21 @@ def test_combat_start_order_move_join_end_and_restart_are_authoritative(tmp_path
             "none",
             "dive_for_cover",
         ]
+        pending_presentation = await call(
+            server,
+            "resolution_presentation",
+            {
+                "campaign_id": campaign["id"],
+                "resolution_id": incoming["resolution_id"],
+                "principal_id": "player:investigator",
+            },
+        )
+        assert pending_presentation["status"] == "pending"
+        assert pending_presentation["event_sequence"] == 1
+        assert pending_presentation["pending_choice"]["available_actions"] == [
+            "none",
+            "dive_for_cover",
+        ]
         incoming_arguments = {
             "action": "resolve",
             "campaign_id": campaign["id"],
@@ -1787,6 +1815,19 @@ def test_combat_start_order_move_join_end_and_restart_are_authoritative(tmp_path
         incoming_resolved = await call(server, "combat_attack", incoming_arguments)
         assert await call(server, "combat_attack", incoming_arguments) == incoming_resolved
         assert incoming_resolved["resolution"]["defense"] == "dive_for_cover"
+        resolved_presentation = await call(
+            server,
+            "resolution_presentation",
+            {
+                "campaign_id": campaign["id"],
+                "resolution_id": incoming_resolved["resolution_id"],
+                "principal_id": "player:investigator",
+            },
+        )
+        assert resolved_presentation["thread_id"] == pending_presentation["thread_id"]
+        assert resolved_presentation["event_sequence"] == 2
+        assert resolved_presentation["status"] == "settled"
+        assert resolved_presentation["rolls"]
         assert (
             incoming_resolved["combat"]["participants"][investigator["id"]]["forfeit_next_action"]
             is True
@@ -2153,6 +2194,18 @@ def test_chase_is_atomic_actor_scoped_combat_exclusive_and_restartable(tmp_path)
         assert checked["resolution"]["skill_name"] == "Climb"
         assert checked["random_stream_receipt"]["draw_count"] == 2
         assert checked["chase"]["participants"][fleeing["id"]]["position"] == 3
+        presentation = await call(
+            server,
+            "resolution_presentation",
+            {
+                "campaign_id": campaign["id"],
+                "resolution_id": checked["resolution_id"],
+                "principal_id": "player:fleeing",
+            },
+        )
+        assert presentation["operation"] == "chase_action.check"
+        assert presentation["rolls"]
+        assert presentation["outcome"]["outcome"] in {"success", "failure"}
         ended_turn = await call(
             server,
             "chase_action",
@@ -2975,3 +3028,16 @@ def test_only_one_exposure_facade_is_registered(tmp_path) -> None:
 
     assert "exposure" in names
     assert not any(name.startswith("exposure_") for name in names)
+
+
+def test_tools_advertise_agent_domain_context_contract(tmp_path) -> None:
+    config = McpConfig(tmp_path / "home", None, tmp_path / "coc", tmp_path / "modulegen")
+    tools = {
+        tool.name: tool for tool in create_server(config)._tool_manager.list_tools()
+    }
+
+    assert all(
+        tool.meta.get("sagasmith_domain_context") == "sagasmith-coc"
+        for tool in tools.values()
+    )
+    assert tools["campaign_query"].meta.get("sagasmith_context_sync") is True

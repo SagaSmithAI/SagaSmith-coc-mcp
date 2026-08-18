@@ -140,6 +140,9 @@ def test_luck_choice_is_persisted_spent_and_followed_by_explicit_continuity(
             "spend_luck",
             "push",
         }
+        assert opened["resolution_id"] == opened["pending"]["id"]
+        assert opened["thread_id"] == opened["resolution_id"]
+        assert opened["event_sequence"] == 1
 
         restarted = create_server(config)
         pending = await call(
@@ -152,6 +155,26 @@ def test_luck_choice_is_persisted_spent_and_followed_by_explicit_continuity(
             },
         )
         assert pending["pending"]["id"] == opened["pending"]["id"]
+        presentation = await call(
+            restarted,
+            "resolution_presentation",
+            {
+                "campaign_id": campaign["id"],
+                "resolution_id": opened["resolution_id"],
+                "principal_id": "player:alice",
+            },
+        )
+        assert presentation["schema"] == "sagasmith.resolution-presentation/v1"
+        assert presentation["system_id"] == "coc7e"
+        assert presentation["status"] == "pending"
+        assert presentation["event_sequence"] == 1
+        assert presentation["rolls"][0]["total"] == 45
+        assert set(presentation["pending_choice"]["available_actions"]) == {
+            "settle",
+            "spend_luck",
+            "push",
+        }
+        assert "source" not in repr(presentation)
         with pytest.raises(Exception, match="pending investigation checks"):
             await call(
                 restarted,
@@ -182,6 +205,8 @@ def test_luck_choice_is_persisted_spent_and_followed_by_explicit_continuity(
         assert adjusted["pending"]["outcome"]["success"] is True
         assert adjusted["pending"]["outcome"]["modified_total"] == 40
         assert adjusted["pending"]["available_actions"] == ["settle"]
+        assert adjusted["resolution_id"] == opened["resolution_id"]
+        assert adjusted["event_sequence"] == 2
         character = await call(
             restarted,
             "character_query",
@@ -207,6 +232,20 @@ def test_luck_choice_is_persisted_spent_and_followed_by_explicit_continuity(
         settled = await call(restarted, "investigation_check", settle_arguments)
         assert await call(restarted, "investigation_check", settle_arguments) == settled
         assert settled["continuity_required"] is True
+        assert settled["resolution_id"] == opened["resolution_id"]
+        assert settled["event_sequence"] == 3
+        settled_presentation = await call(
+            restarted,
+            "resolution_presentation",
+            {
+                "campaign_id": campaign["id"],
+                "resolution_id": settled["resolution_id"],
+                "principal_id": "player:alice",
+            },
+        )
+        assert settled_presentation["status"] == "settled"
+        assert settled_presentation["event_sequence"] == 3
+        assert settled_presentation["pending_choice"] is None
         character = await call(
             restarted,
             "character_query",

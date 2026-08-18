@@ -617,6 +617,148 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
             raise ValueError("campaign has no active chase")
         return campaign, chase
 
+    def player_pending_choice(
+        campaign_id: str,
+        principal_id: str,
+        pending: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """Return only the choice fields needed by an authorized responder."""
+
+        if not pending:
+            return None
+        responder_ids = {
+            str(pending.get(key) or "")
+            for key in ("actor_id", "target_actor_id", "responder_actor_id")
+            if str(pending.get(key) or "")
+        }
+        if not any(
+            can_control_actor(campaign_id, actor_id, principal_id)
+            for actor_id in responder_ids
+        ):
+            return None
+        allowed = {
+            "id",
+            "kind",
+            "actor_id",
+            "attacker_id",
+            "target_actor_id",
+            "responder_actor_id",
+            "attacker_name",
+            "target_name",
+            "response_options",
+            "range_band",
+            "distance_feet",
+        }
+        return {key: deepcopy(value) for key, value in pending.items() if key in allowed}
+
+    def chase_audience_state(
+        campaign_id: str,
+        principal_id: str,
+        chase: dict[str, Any],
+    ) -> dict[str, Any]:
+        if is_dm(campaign_id, principal_id):
+            return deepcopy(chase)
+        participants = {
+            str(actor_id): {
+                key: deepcopy(value)
+                for key, value in dict(item).items()
+                if key
+                in {
+                    "actor_id",
+                    "name",
+                    "role",
+                    "participant_kind",
+                    "position",
+                    "action_points",
+                    "action_points_remaining",
+                    "status",
+                }
+            }
+            for actor_id, item in dict(chase.get("participants") or {}).items()
+        }
+        route = [
+            {
+                key: deepcopy(value)
+                for key, value in dict(item).items()
+                if key in {"id", "title", "index", "kind"}
+            }
+            for item in list(chase.get("route") or [])
+            if isinstance(item, dict)
+        ]
+        value = {
+            key: deepcopy(chase[key])
+            for key in (
+                "schema",
+                "active",
+                "round",
+                "turn_index",
+                "current_actor_id",
+                "order",
+                "outcome",
+            )
+            if key in chase
+        }
+        value["participants"] = participants
+        value["route"] = route
+        pending = player_pending_choice(
+            campaign_id,
+            principal_id,
+            dict(chase.get("pending_choice") or {}),
+        )
+        if pending is not None:
+            value["pending_choice"] = pending
+        value["audience_redacted"] = True
+        return value
+
+    def combat_audience_state(
+        campaign_id: str,
+        principal_id: str,
+        combat: dict[str, Any],
+    ) -> dict[str, Any]:
+        if is_dm(campaign_id, principal_id):
+            return deepcopy(combat)
+        participants = {
+            str(actor_id): {
+                key: deepcopy(value)
+                for key, value in dict(item).items()
+                if key
+                in {
+                    "actor_id",
+                    "name",
+                    "side",
+                    "position",
+                    "available_from_round",
+                }
+            }
+            for actor_id, item in dict(combat.get("participants") or {}).items()
+        }
+        value = {
+            key: deepcopy(combat[key])
+            for key in (
+                "schema",
+                "active",
+                "positioning_mode",
+                "grid_metric",
+                "grid_unit_feet",
+                "round",
+                "turn_index",
+                "current_actor_id",
+                "order",
+                "outcome",
+            )
+            if key in combat
+        }
+        value["participants"] = participants
+        pending = player_pending_choice(
+            campaign_id,
+            principal_id,
+            dict(combat.get("pending_choice") or {}),
+        )
+        if pending is not None:
+            value["pending_choice"] = pending
+        value["audience_redacted"] = True
+        return value
+
     def chase_view(campaign_id: str, principal_id: str) -> dict[str, Any]:
         campaign, chase = active_chase(campaign_id)
         current_actor_id = str(chase.get("current_actor_id") or "")
@@ -629,7 +771,7 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
             "campaign_id": campaign_id,
             "campaign_revision": campaign.revision,
             "phase": PROFILE_PLAY,
-            "chase": deepcopy(chase),
+            "chase": chase_audience_state(campaign_id, principal_id, chase),
             "available_actions": actions,
         }
 
@@ -650,8 +792,328 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
             "campaign_id": campaign_id,
             "campaign_revision": campaign.revision,
             "phase": PROFILE_COMBAT,
-            "combat": deepcopy(combat),
+            "combat": combat_audience_state(campaign_id, principal_id, combat),
             "available_actions": list(dict.fromkeys(actions)),
+        }
+
+    def campaign_audience_view(campaign_id: str, principal_id: str) -> dict[str, Any]:
+        """Project persisted campaign state without exposing Keeper-only ledgers."""
+
+        access.require_campaign(campaign_id, principal_id)
+        campaign = campaigns.get(campaign_id)
+        value = asdict(campaign)
+        value["effective_game_phase"] = authoritative_phase(campaign_id)
+        if is_dm(campaign_id, principal_id):
+            return value
+        state = dict(value.get("state") or {})
+        safe_state: dict[str, Any] = {
+            "game_phase": str(state.get("game_phase") or PROFILE_LOBBY),
+        }
+        combat = dict(state.get("combat") or {})
+        if combat.get("active"):
+            safe_state["combat"] = combat_audience_state(
+                campaign_id,
+                principal_id,
+                combat,
+            )
+        elif combat:
+            safe_state["combat"] = {"active": False}
+        chase = dict(state.get("chase") or {})
+        if chase.get("active"):
+            safe_state["chase"] = chase_audience_state(
+                campaign_id,
+                principal_id,
+                chase,
+            )
+        elif chase:
+            safe_state["chase"] = {"active": False}
+        value["state"] = safe_state
+        value["state_redacted"] = True
+        return value
+
+    def resolution_rolls(resolution_id: str, result: dict[str, Any]) -> list[dict[str, Any]]:
+        normalized: list[dict[str, Any]] = []
+        seen: set[int] = set()
+
+        def visit(value: Any) -> None:
+            if len(normalized) >= 32:
+                return
+            if isinstance(value, dict):
+                total = value.get("total")
+                dice: list[int] | None = None
+                expression = str(value.get("expression") or "")
+                kept: list[int] | None = None
+                if isinstance(value.get("all_tens"), list) and isinstance(
+                    value.get("unit_die"), int
+                ):
+                    dice = [*list(value["all_tens"]), int(value["unit_die"])]
+                    kept = [int(total)] if isinstance(total, int) else None
+                    expression = expression or "d100"
+                elif isinstance(value.get("rolls"), list):
+                    dice = list(value["rolls"])
+                    expression = expression or "dice"
+                if (
+                    dice
+                    and all(isinstance(item, int) and not isinstance(item, bool) for item in dice)
+                    and isinstance(total, int)
+                    and not isinstance(total, bool)
+                ):
+                    identity = id(value)
+                    if identity not in seen:
+                        seen.add(identity)
+                        normalized.append(
+                            {
+                                "roll_id": f"{resolution_id}:roll:{len(normalized) + 1}",
+                                "expression": expression,
+                                "dice": dice,
+                                "kept": kept or list(dice),
+                                "modifier": 0,
+                                "total": int(total),
+                            }
+                        )
+                for child in value.values():
+                    visit(child)
+            elif isinstance(value, list):
+                for child in value:
+                    visit(child)
+
+        visit(result)
+        return normalized
+
+    def resolution_outcome(result: dict[str, Any]) -> dict[str, Any]:
+        allowed = {
+            "success",
+            "success_level",
+            "critical",
+            "fumble",
+            "difficulty",
+            "outcome",
+            "damage",
+            "san_loss",
+            "major_wound",
+            "unconscious",
+            "dead",
+        }
+        return {
+            key: deepcopy(value)
+            for key, value in result.items()
+            if key in allowed and isinstance(value, (str, int, float, bool, type(None)))
+        }
+
+    def resolution_presentation_event(
+        campaign_id: str,
+        resolution_id: str,
+    ) -> dict[str, Any]:
+        state = dict(campaigns.get(campaign_id).state or {})
+        for item in list(state.get("resolution_presentation_log") or []):
+            if isinstance(item, dict) and str(item.get("id") or "") == resolution_id:
+                return deepcopy(item)
+        ledger = investigation_ledger(state)
+        candidates = [
+            *list(dict(ledger.get("pending") or {}).values()),
+            *list(ledger.get("history") or []),
+        ]
+        matching = [
+            item
+            for item in candidates
+            if isinstance(item, dict) and str(item.get("id") or "") == resolution_id
+        ]
+        if len(matching) == 1:
+            item = deepcopy(matching[0])
+            status_value = str(item.get("status") or "pending")
+            available_actions = (
+                investigation_actions(campaigns.get(campaign_id), item)
+                if status_value == "pending"
+                else []
+            )
+            return {
+                "id": resolution_id,
+                "thread_id": str(item.get("thread_id") or resolution_id),
+                "event_sequence": int(item.get("event_sequence") or 1),
+                "operation": str(item.get("operation") or "investigation_check"),
+                "status": status_value,
+                "audience": dict(
+                    item.get("audience")
+                    or {
+                        "scope": "actors",
+                        "actor_refs": [str(item.get("actor_id") or "")],
+                        "disclosure": "private",
+                    }
+                ),
+                "branch_id": item.get("branch_id"),
+                "campaign_revision": item.get("campaign_revision"),
+                "result": {
+                    "roll": deepcopy(item.get("roll")),
+                    **deepcopy(dict(item.get("outcome") or {})),
+                },
+                "pending_choice": (
+                    {
+                        "id": resolution_id,
+                        "kind": "investigation_check",
+                        "available_actions": available_actions,
+                    }
+                    if status_value == "pending"
+                    else None
+                ),
+                "random_stream_receipt": deepcopy(item.get("random_stream_receipt")),
+            }
+        combat = dict(state.get("combat") or {})
+        pending = dict(combat.get("pending_choice") or {})
+        if str(pending.get("id") or "") == resolution_id:
+            actor_refs = [
+                str(pending.get("attacker_id") or ""),
+                str(pending.get("target_actor_id") or ""),
+            ]
+            actor_refs = [value for value in actor_refs if value]
+            return {
+                "id": resolution_id,
+                "thread_id": resolution_id,
+                "event_sequence": 1,
+                "operation": "combat_attack",
+                "status": "pending",
+                "audience": {
+                    "scope": "actors",
+                    "actor_refs": actor_refs,
+                    "disclosure": "private",
+                },
+                "branch_id": pending.get("branch_id"),
+                "campaign_revision": pending.get("campaign_revision"),
+                "result": {},
+                "pending_choice": {
+                    "id": resolution_id,
+                    "kind": "combat_attack_response",
+                    "available_actions": list(pending.get("response_options") or []),
+                },
+                "random_stream_receipt": None,
+            }
+        combat_events = [
+            item
+            for item in list(combat.get("events") or [])
+            if isinstance(item, dict) and str(item.get("pending_id") or "") == resolution_id
+        ]
+        if combat_events:
+            item = deepcopy(combat_events[-1])
+            event_type = str(item.get("type") or "")
+            actor_refs = [str(value) for value in item.get("actor_refs") or [] if str(value)]
+            if event_type == "attack_opened":
+                status_value = "pending"
+                event_sequence = 1
+            elif event_type == "attack_aborted":
+                status_value = "aborted"
+                event_sequence = 2
+            else:
+                status_value = "settled"
+                event_sequence = 2
+            mechanics = dict(item.get("resolution") or {})
+            damage = mechanics.get("damage") or mechanics.get("counterattack")
+            safe_result = {
+                "attack_roll": deepcopy(item.get("attack_roll")),
+                "defense_roll": deepcopy(item.get("defense_roll")),
+                "con_roll": deepcopy(item.get("con_roll")),
+                "success": bool(
+                    mechanics.get("success")
+                    or mechanics.get("attacker_wins")
+                    or damage is not None
+                ),
+                "outcome": str(
+                    mechanics.get("outcome")
+                    or mechanics.get("winner")
+                    or event_type.removeprefix("attack_")
+                ),
+                "damage": (
+                    int(dict(damage).get("total") or 0)
+                    if isinstance(damage, dict)
+                    else None
+                ),
+            }
+            return {
+                "id": resolution_id,
+                "thread_id": resolution_id,
+                "event_sequence": event_sequence,
+                "operation": "combat_attack",
+                "status": status_value,
+                "audience": {
+                    "scope": "actors",
+                    "actor_refs": actor_refs,
+                    "disclosure": "private",
+                },
+                "branch_id": item.get("branch_id"),
+                "campaign_revision": item.get("campaign_revision"),
+                "result": safe_result,
+                "pending_choice": None,
+                "random_stream_receipt": deepcopy(item.get("random_stream_receipt")),
+            }
+        raise LookupError("resolution presentation not found")
+
+    def resolution_presentation_view(
+        campaign_id: str,
+        resolution_id: str,
+        principal_id: str,
+    ) -> dict[str, Any]:
+        membership = access.require_campaign(campaign_id, principal_id)
+        campaign = campaigns.get(campaign_id)
+        event = resolution_presentation_event(campaign_id, resolution_id)
+        audience = dict(event.get("audience") or {})
+        actor_refs = [str(item) for item in audience.get("actor_refs") or [] if str(item)]
+        scope = str(audience.get("scope") or ("actors" if actor_refs else "dm"))
+        if scope == "dm" and membership.role not in {"owner", "dm"}:
+            raise LookupError("resolution presentation not found")
+        if scope == "principal" and (
+            membership.role not in {"owner", "dm"}
+            and str(event.get("principal_id") or "") != principal_id
+        ):
+            raise LookupError("resolution presentation not found")
+        if scope == "actors" and membership.role not in {"owner", "dm"}:
+            authorized = False
+            for actor_ref in actor_refs:
+                try:
+                    actor_access(campaign_id, actor_ref, principal_id)
+                except (LookupError, PermissionError):
+                    continue
+                authorized = True
+                break
+            if not authorized:
+                raise LookupError("resolution presentation not found")
+        result = deepcopy(dict(event.get("result") or {}))
+        pending_choice = deepcopy(event.get("pending_choice"))
+        if isinstance(pending_choice, dict) and scope == "actors":
+            pending_choice["available_actions"] = list(
+                pending_choice.get("available_actions") or []
+            )
+        return {
+            "schema": "sagasmith.resolution-presentation/v1",
+            "resolution_id": resolution_id,
+            "thread_id": str(event.get("thread_id") or resolution_id),
+            "event_sequence": int(event.get("event_sequence") or 1),
+            "system_id": "coc7e",
+            "campaign_id": campaign_id,
+            "branch_id": event.get("branch_id"),
+            "operation": str(event.get("operation") or "resolution"),
+            "status": str(event.get("status") or "settled"),
+            "audience": {
+                "scope": scope,
+                "actor_refs": actor_refs if scope == "actors" else [],
+                "disclosure": str(
+                    audience.get("disclosure") or ("private" if scope == "actors" else "hidden")
+                ),
+            },
+            "actor_refs": actor_refs,
+            "rolls": resolution_rolls(resolution_id, result),
+            "outcome": resolution_outcome(result),
+            "pending_choice": pending_choice,
+            "campaign_revision": int(event.get("campaign_revision") or campaign.revision),
+            "random_stream_receipt": {
+                key: deepcopy(value)
+                for key, value in dict(event.get("random_stream_receipt") or {}).items()
+                if key
+                in {
+                    "operation",
+                    "position_before",
+                    "position_after",
+                    "draw_count",
+                    "receipt_digest",
+                }
+            },
         }
 
     def require_lobby(campaign_id: str, operation: str) -> None:
@@ -1076,11 +1538,40 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
             result = resolve()
         if stream.draw_count == 0:
             return {"resolution": result, "campaign_revision": campaign.revision}
+        resolution_id = "resolution-" + hashlib.sha256(
+            f"{campaign_id}:{branch_id}:{operation}:{idempotency_key}".encode("utf-8")
+        ).hexdigest()[:32]
+        membership = access.require_campaign(campaign_id, principal_id)
+        audience = (
+            {"scope": "dm", "actor_refs": [], "disclosure": "hidden"}
+            if membership.role in {"owner", "dm"}
+            else {"scope": "principal", "actor_refs": [], "disclosure": "private"}
+        )
+        receipt = stream.receipt()
         next_state = {**dict(campaign.state), "random_stream": stream.persisted_state()}
+        next_state["resolution_presentation_log"] = [
+            *list(next_state.get("resolution_presentation_log") or []),
+            {
+                "id": resolution_id,
+                "thread_id": resolution_id,
+                "event_sequence": 1,
+                "operation": operation,
+                "status": "settled",
+                "audience": audience,
+                "principal_id": principal_id if audience["scope"] == "principal" else None,
+                "branch_id": branch_id,
+                "campaign_revision": campaign.revision + 1,
+                "result": deepcopy(dict(result)),
+                "random_stream_receipt": receipt,
+            },
+        ][-200:]
         response = {
             "resolution": result,
+            "resolution_id": resolution_id,
+            "thread_id": resolution_id,
+            "event_sequence": 1,
             "campaign_revision": campaign.revision + 1,
-            "random_stream_receipt": stream.receipt(),
+            "random_stream_receipt": receipt,
         }
         StateMutationService(storage.database).replace(
             campaign_id,
@@ -1150,6 +1641,16 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
         return storage.status()
 
     @mcp.tool()
+    def resolution_presentation(
+        campaign_id: str,
+        resolution_id: str,
+        principal_id: str = LOCAL_SYSTEM_PRINCIPAL_ID,
+    ) -> dict[str, Any]:
+        """Return one audience-safe, authoritative resolution bubble projection."""
+
+        return resolution_presentation_view(campaign_id, resolution_id, principal_id)
+
+    @mcp.tool()
     def campaign_query(
         action: Literal["list", "get"],
         campaign_id: str | None = None,
@@ -1159,13 +1660,14 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
             allowed = access.accessible_campaign_ids(principal_id)
             return {
                 "campaigns": [
-                    asdict(item) for item in campaigns.list(system_id="coc7e") if item.id in allowed
+                    campaign_audience_view(item.id, principal_id)
+                    for item in campaigns.list(system_id="coc7e")
+                    if item.id in allowed
                 ]
             }
         if campaign_id is None:
             raise ValueError("campaign_id is required")
-        access.require_campaign(campaign_id, principal_id)
-        return asdict(campaigns.get(campaign_id))
+        return campaign_audience_view(campaign_id, principal_id)
 
     @mcp.tool()
     def game_phase(campaign_id: str, principal_id: str = "system:local") -> dict[str, str]:
@@ -5754,14 +6256,27 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
                     data,
                     investigator_name=actor.name,
                 )
+            stream_receipt = stream.receipt()
             pending = {
                 "id": check_id,
+                "thread_id": check_id,
+                "event_sequence": 1,
+                "operation": "investigation_check.open",
+                "status": "pending",
                 "actor_id": actor_id,
+                "audience": {
+                    "scope": "actors",
+                    "actor_refs": [actor_id],
+                    "disclosure": "private",
+                },
+                "branch_id": branch_id,
+                "campaign_revision": campaign.revision + 1,
                 "actor_revision": actor.revision,
                 "source": source,
                 "goal": goal,
                 **resolution,
                 "decision": None,
+                "random_stream_receipt": stream_receipt,
             }
             pending_by_actor[actor_id] = pending
             next_ledger = {**ledger, "pending": pending_by_actor}
@@ -5774,11 +6289,14 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
                 "campaign_id": campaign_id,
                 "campaign_revision": campaign.revision + 1,
                 "character_revision": actor.revision,
+                "resolution_id": check_id,
+                "thread_id": check_id,
+                "event_sequence": 1,
                 "pending": {
                     **deepcopy(pending),
                     "available_actions": investigation_actions(campaign, pending),
                 },
-                "random_stream_receipt": stream.receipt(),
+                "random_stream_receipt": stream_receipt,
             }
             StateMutationService(storage.database).replace(
                 campaign_id,
@@ -5820,6 +6338,9 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
             outcome = dict(luck_transition["outcome"])
             pending = {
                 **pending,
+                "event_sequence": int(pending.get("event_sequence") or 1) + 1,
+                "operation": "investigation_check.spend_luck",
+                "campaign_revision": campaign.revision + 1,
                 "actor_revision": actor.revision + 1,
                 "outcome": outcome,
                 "decision": {"kind": "spend_luck", "spent": spent},
@@ -5833,6 +6354,9 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
                 "campaign_id": campaign_id,
                 "campaign_revision": campaign.revision + 1,
                 "character_revision": actor.revision + 1,
+                "resolution_id": pending["id"],
+                "thread_id": str(pending.get("thread_id") or pending["id"]),
+                "event_sequence": int(pending["event_sequence"]),
                 "pending": {**deepcopy(pending), "available_actions": ["settle"]},
             }
             StateMutationService(storage.database).replace(
@@ -5899,14 +6423,19 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
                     investigator_name=actor.name,
                     pushed=True,
                 )
+            stream_receipt = stream.receipt()
             pending = {
                 **pending,
+                "event_sequence": int(pending.get("event_sequence") or 1) + 1,
+                "operation": "investigation_check.push",
+                "campaign_revision": campaign.revision + 1,
                 **resolution,
                 "decision": {
                     "kind": "push",
                     "justification": justification,
                     "failure_consequence": consequence,
                 },
+                "random_stream_receipt": stream_receipt,
             }
             pending_by_actor[actor_id] = pending
             next_state = {
@@ -5918,8 +6447,11 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
                 "campaign_id": campaign_id,
                 "campaign_revision": campaign.revision + 1,
                 "character_revision": actor.revision,
+                "resolution_id": pending["id"],
+                "thread_id": str(pending.get("thread_id") or pending["id"]),
+                "event_sequence": int(pending["event_sequence"]),
                 "pending": {**deepcopy(pending), "available_actions": ["settle"]},
-                "random_stream_receipt": stream.receipt(),
+                "random_stream_receipt": stream_receipt,
             }
             StateMutationService(storage.database).replace(
                 campaign_id,
@@ -5946,6 +6478,9 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
             receipt = {
                 **pending,
                 "status": "aborted",
+                "operation": "investigation_check.abort",
+                "event_sequence": int(pending.get("event_sequence") or 1) + 1,
+                "campaign_revision": campaign.revision + 1,
                 "abort_reason": reason,
                 "sequence": len(ledger["history"]) + 1,
             }
@@ -5963,6 +6498,9 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
                 "campaign_id": campaign_id,
                 "campaign_revision": campaign.revision + 1,
                 "character_revision": actor.revision,
+                "resolution_id": receipt["id"],
+                "thread_id": str(receipt.get("thread_id") or receipt["id"]),
+                "event_sequence": int(receipt["event_sequence"]),
                 "receipt": deepcopy(receipt),
             }
             StateMutationService(storage.database).replace(
@@ -5985,6 +6523,9 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
         receipt = {
             **pending,
             "status": "settled",
+            "operation": "investigation_check.settle",
+            "event_sequence": int(pending.get("event_sequence") or 1) + 1,
+            "campaign_revision": campaign.revision + 1,
             "sequence": len(ledger["history"]) + 1,
         }
         pending_by_actor.pop(actor_id)
@@ -6033,6 +6574,9 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
             "campaign_id": campaign_id,
             "campaign_revision": campaign.revision + 1,
             "character_revision": next_character_revision,
+            "resolution_id": receipt["id"],
+            "thread_id": str(receipt.get("thread_id") or receipt["id"]),
+            "event_sequence": int(receipt["event_sequence"]),
             "receipt": deepcopy(receipt),
             "continuity_required": True,
             "continuity_instruction": (
@@ -6139,7 +6683,38 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
         int_roll = deepcopy(event["int_roll"])
         outcome = dict(event["outcome"])
         bout = deepcopy(event["bout"])
+        receipt = stream.receipt()
+        resolution_id = "resolution-" + hashlib.sha256(
+            f"{campaign_id}:{branch_id}:coc_sanity_check:{key}:{actor_id}".encode("utf-8")
+        ).hexdigest()[:32]
         next_state = {**dict(campaign.state), "random_stream": stream.persisted_state()}
+        next_state["resolution_presentation_log"] = [
+            *list(next_state.get("resolution_presentation_log") or []),
+            {
+                "id": resolution_id,
+                "thread_id": resolution_id,
+                "event_sequence": 1,
+                "operation": "coc_sanity_check",
+                "status": "settled",
+                "audience": {
+                    "scope": "actors",
+                    "actor_refs": [actor_id],
+                    "disclosure": "private",
+                },
+                "branch_id": branch_id,
+                "campaign_revision": campaign.revision + 1,
+                "result": {
+                    "sanity_roll": deepcopy(sanity_roll),
+                    "loss_roll": deepcopy(loss_roll),
+                    "int_roll": deepcopy(int_roll),
+                    "bout": deepcopy(bout),
+                    "success": succeeded,
+                    "san_loss": int(loss_roll["total"]),
+                    "outcome": str(outcome.get("insanity_type") or "stable"),
+                },
+                "random_stream_receipt": receipt,
+            },
+        ][-200:]
         response = {
             "campaign_revision": campaign.revision + 1,
             "character_revision": actor.revision + 1,
@@ -6147,7 +6722,11 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
             "resolution": event,
             "san": int(outcome["new_san"]),
             "conditions": conditions,
-            "random_stream_receipt": stream.receipt(),
+            "random_stream_receipt": receipt,
+            "resolution_id": resolution_id,
+            "thread_id": resolution_id,
+            "event_sequence": 1,
+            "status": "settled",
         }
         StateMutationService(storage.database).replace(
             campaign_id,
@@ -6579,13 +7158,58 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
         next_state = {**dict(campaign.state), "chase": next_chase}
         if stream is not None:
             next_state["random_stream"] = stream.persisted_state()
+            resolution_id = "resolution-" + hashlib.sha256(
+                f"{campaign_id}:{branch_id}:chase_action.{action}:{key}:{actor_id}".encode(
+                    "utf-8"
+                )
+            ).hexdigest()[:32]
+            receipt = stream.receipt()
+            outcome = dict((result or {}).get("outcome") or {})
+            next_state["resolution_presentation_log"] = [
+                *list(next_state.get("resolution_presentation_log") or []),
+                {
+                    "id": resolution_id,
+                    "thread_id": resolution_id,
+                    "event_sequence": 1,
+                    "operation": f"chase_action.{action}",
+                    "status": "settled",
+                    "audience": {
+                        "scope": "actors",
+                        "actor_refs": [actor_id],
+                        "disclosure": "private",
+                    },
+                    "branch_id": branch_id,
+                    "campaign_revision": campaign.revision + 1,
+                    "result": {
+                        "roll": deepcopy((result or {}).get("roll")),
+                        "success": bool(outcome.get("success")),
+                        "success_level": outcome.get("success_level"),
+                        "outcome": str(
+                            outcome.get("outcome")
+                            or outcome.get("result")
+                            or ("success" if outcome.get("success") else "failure")
+                        ),
+                    },
+                    "random_stream_receipt": receipt,
+                },
+            ][-200:]
         response = {
             "campaign_id": campaign_id,
             "campaign_revision": campaign.revision + 1,
             "phase": PROFILE_PLAY,
             "chase": deepcopy(next_chase),
             "resolution": result,
-            **({"random_stream_receipt": stream.receipt()} if stream is not None else {}),
+            **({"random_stream_receipt": receipt} if stream is not None else {}),
+            **(
+                {
+                    "resolution_id": resolution_id,
+                    "thread_id": resolution_id,
+                    "event_sequence": 1,
+                    "status": "settled",
+                }
+                if stream is not None
+                else {}
+            ),
         }
         StateMutationService(storage.database).replace(
             campaign_id,
@@ -6957,6 +7581,9 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
             ).hexdigest()[:24]
             pending = {
                 "id": pending_id,
+                "thread_id": pending_id,
+                "event_sequence": 1,
+                "status": "pending",
                 "kind": "combat_attack_response",
                 "attacker_id": attacker_id,
                 "target_actor_id": target_id,
@@ -6969,11 +7596,19 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
                 "range_band": str(data.get("range_band") or "normal"),
                 "spatial_ruling": spatial,
                 "distance_feet": distance_feet,
+                "branch_id": branch_id,
+                "campaign_revision": campaign.revision + 1,
             }
             next_combat = {**combat, "pending_choice": pending}
             next_combat["events"] = [
                 *list(combat.get("events") or []),
-                {"type": "attack_opened", "pending_id": pending_id},
+                {
+                    "type": "attack_opened",
+                    "pending_id": pending_id,
+                    "actor_refs": [attacker_id, target_id],
+                    "branch_id": branch_id,
+                    "campaign_revision": campaign.revision + 1,
+                },
             ]
             next_state = {**dict(campaign.state), "combat": next_combat}
             response = {
@@ -6981,6 +7616,10 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
                 "campaign_revision": campaign.revision + 1,
                 "phase": PROFILE_COMBAT,
                 "pending_choice": deepcopy(pending),
+                "resolution_id": pending_id,
+                "thread_id": pending_id,
+                "event_sequence": 1,
+                "status": "pending",
             }
             StateMutationService(storage.database).replace(
                 campaign_id,
@@ -7011,7 +7650,14 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
             next_combat = {**combat, "pending_choice": None}
             next_combat["events"] = [
                 *list(combat.get("events") or []),
-                {"type": "attack_aborted", "pending_id": pending["id"], "reason": reason},
+                {
+                    "type": "attack_aborted",
+                    "pending_id": pending["id"],
+                    "actor_refs": [pending["attacker_id"], pending["target_actor_id"]],
+                    "branch_id": pending.get("branch_id") or branch_id,
+                    "campaign_revision": campaign.revision + 1,
+                    "reason": reason,
+                },
             ]
             next_state = {**dict(campaign.state), "combat": next_combat}
             response = {
@@ -7019,6 +7665,10 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
                 "campaign_revision": campaign.revision + 1,
                 "phase": PROFILE_COMBAT,
                 "aborted_pending_id": pending["id"],
+                "resolution_id": pending["id"],
+                "thread_id": str(pending.get("thread_id") or pending["id"]),
+                "event_sequence": 2,
+                "status": "aborted",
             }
             StateMutationService(storage.database).replace(
                 campaign_id,
@@ -7079,6 +7729,9 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
         event = {
             "type": "attack_resolved",
             "pending_id": pending["id"],
+            "actor_refs": [attacker_id, target_id],
+            "branch_id": pending.get("branch_id") or branch_id,
+            "campaign_revision": campaign.revision + 1,
             "source": pending["source"],
             "attacker_id": attacker_id,
             "target_actor_id": target_id,
@@ -7094,6 +7747,11 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
                 else None
             ),
             "con_roll": con_roll,
+            "random_stream_receipt": stream.receipt(),
+            "resolution_id": pending["id"],
+            "thread_id": str(pending.get("thread_id") or pending["id"]),
+            "event_sequence": 2,
+            "status": "settled",
         }
         next_combat["events"] = [*list(next_combat.get("events") or []), event]
         next_state = {
@@ -7143,6 +7801,10 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
             "combat": deepcopy(next_combat),
             "character_revisions": character_revisions,
             "random_stream_receipt": stream.receipt(),
+            "resolution_id": pending["id"],
+            "thread_id": str(pending.get("thread_id") or pending["id"]),
+            "event_sequence": 2,
+            "status": "settled",
         }
         StateMutationService(storage.database).replace(
             campaign_id,
@@ -7418,6 +8080,13 @@ def create_server(config: McpConfig | None = None) -> FastMCP:
 
     registered_tools = mcp._tool_manager.list_tools()
     validate_profile_coverage(tool.name for tool in registered_tools)
+    for registered_tool in registered_tools:
+        registered_tool.meta = {
+            **dict(registered_tool.meta or {}),
+            "sagasmith_domain_context": "sagasmith-coc",
+        }
+        if registered_tool.name == "campaign_query":
+            registered_tool.meta["sagasmith_context_sync"] = True
 
     return mcp
 

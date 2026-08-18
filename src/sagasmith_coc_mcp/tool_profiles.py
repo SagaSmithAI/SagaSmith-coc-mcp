@@ -34,6 +34,7 @@ CORE_TOOLS = frozenset(
         "storage_status",
         "campaign_query",
         "game_phase",
+        "resolution_presentation",
         "skill_query",
     }
 )
