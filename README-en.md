@@ -1,5 +1,10 @@
 # SagaSmith CoC MCP
 
+> [!IMPORTANT]
+> **本仓库已归档。** 它不再是发布输入、兼容回退或新 issue 的接收位置。当前权威 MCP 位于 [Sagasmith-coc/packages/mcp](https://github.com/SagaSmithAI/Sagasmith-coc/tree/main/packages/mcp)。
+>
+> **This repository is archived.** It is no longer a release input, compatibility fallback, or destination for new issues. The authoritative MCP now lives in [Sagasmith-coc/packages/mcp](https://github.com/SagaSmithAI/Sagasmith-coc/tree/main/packages/mcp).
+
 [中文](README.md) · [English](README-en.md) · [Website](https://sagasmithai.github.io) · [Platform overview](https://github.com/SagaSmithAI/.github/blob/main/profile/README.md) · [Hosted service](https://github.com/SagaSmithAI/SagaSmith-service) · [Content catalog](https://github.com/SagaSmithAI/SagaSmith-dnd-content-library)
 
 The local authoritative MCP server for SagaSmithAI's Call of Cthulhu 7e stack. It combines campaign persistence, branch-aware memory, per-actor knowledge, snapshots, module retrieval, and unified Content Packs from `sagasmith-core` with CoC d100, sanity, combat, chase, and replayable random-stream mechanics from `sagasmith-coc`.
